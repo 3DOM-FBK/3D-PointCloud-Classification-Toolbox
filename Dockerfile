@@ -1,9 +1,17 @@
+# ── Seleziona base image in base all'architettura target ───
+# amd64 → CUDA 11.8 full stack  |  arm64 → Ubuntu base (no CUDA)
+# Docker buildx imposta automaticamente TARGETARCH (amd64 / arm64).
+# Per build normali senza --platform il default è amd64.
+ARG TARGETARCH=amd64
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS builder-amd64
+FROM ubuntu:22.04                                 AS builder-arm64
+
 # ============================================================
 # STAGE 1 — builder
 # Compila GDAL, PDAL, LASzip, laz-perf da sorgente.
 # Questa immagine NON finisce in produzione.
 # ============================================================
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS builder
+FROM builder-${TARGETARCH} AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 ARG NUM_THREADS=8
@@ -19,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-dev libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev \
     wget curl unzip \
     libgomp1 libomp-dev liblaszip-dev \
+    libtbb-dev \
     # Solo i moduli Boost necessari a GDAL/PDAL
     libboost-filesystem-dev libboost-iostreams-dev \
     libboost-program-options-dev libboost-system-dev \
@@ -60,11 +69,26 @@ RUN git clone --depth 1 --branch 2.7.1 https://github.com/PDAL/PDAL.git /tmp/PDA
     ninja -C /tmp/PDAL/build -j${NUM_THREADS} install && \
     rm -rf /tmp/PDAL
 
+# PotreeConverter 2.1.1 — compilato da sorgente (unico modo per arm64)
+# Il risultato viene copiato nel runtime stage tramite COPY --from=builder.
+RUN git clone --depth 1 --branch 2.1.1 https://github.com/potree/PotreeConverter.git /tmp/PotreeConverter && \
+    cmake -S /tmp/PotreeConverter -B /tmp/PotreeConverter/build \
+        -DCMAKE_BUILD_TYPE=Release && \
+    make -C /tmp/PotreeConverter/build -j${NUM_THREADS} && \
+    mkdir -p /opt/potree && \
+    cp /tmp/PotreeConverter/build/PotreeConverter /opt/potree/ && \
+    rm -rf /tmp/PotreeConverter
+
 # ============================================================
 # STAGE 2 — runtime finale
 # Base runtime (no compiler), copia solo i binari compilati.
 # ============================================================
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS runtime-amd64
+FROM ubuntu:22.04                                   AS runtime-arm64
+FROM runtime-${TARGETARCH}
+
+# ARG deve essere re-dichiarato dentro ogni stage per essere usabile nei RUN
+ARG TARGETARCH=amd64
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -130,18 +154,26 @@ COPY requirements.txt /app/
 # via apt/distutils (es. blinker 1.4) che pip non può disinstallare.
 RUN python3 -m pip install --no-cache-dir --ignore-installed -r /app/requirements.txt
 
-# ── STEP 2: PyTorch con indice dedicato ───────────────────
-RUN python3 -m pip install --no-cache-dir \
-    torch==2.3.0+cu118 \
-    torchvision==0.18.0+cu118 \
-    --index-url https://download.pytorch.org/whl/cu118
+# ── STEP 2: PyTorch (CUDA su amd64, CPU-only su arm64) ────
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        python3 -m pip install --no-cache-dir \
+            torch==2.3.0+cu118 \
+            torchvision==0.18.0+cu118 \
+            --index-url https://download.pytorch.org/whl/cu118; \
+    else \
+        python3 -m pip install --no-cache-dir \
+            torch==2.3.0 \
+            torchvision==0.18.0; \
+    fi
 
-# ── STEP 3: CuPy e RAPIDS (indice Anaconda) ───────────────
+# ── STEP 3: CuPy e RAPIDS (solo amd64/CUDA, non disponibili su arm64) ──
 # Separato da Torch per evitare conflitti di risoluzione delle dipendenze.
-RUN python3 -m pip install --no-cache-dir \
-    cupy-cuda11x \
-    cuml-cu11 \
-    --extra-index-url https://pypi.anaconda.org/rapidsai-wheels-nightly/simple
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        python3 -m pip install --no-cache-dir \
+            cupy-cuda11x \
+            cuml-cu11 \
+            --extra-index-url https://pypi.anaconda.org/rapidsai-wheels-nightly/simple; \
+    fi
 
 # Pulisce cache bytecode
 RUN find /usr/local/lib/python3.10 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -149,13 +181,19 @@ RUN find /usr/local/lib/python3.10 -type d -name "__pycache__" -exec rm -rf {} +
 # Aggiorna cache librerie dinamiche
 # Rimuoviamo la liblaszip custom (manda in crash Potree) e usiamo quella di sistema
 RUN rm -f /usr/local/lib/liblaszip* && \
-    ln -s /usr/lib/x86_64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        ln -s /usr/lib/x86_64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so; \
+    else \
+        ln -s /usr/lib/aarch64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so; \
+    fi && \
     echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
 
-# ── Open3D precompilata ────────────────────────────────────
-RUN wget -q https://github.com/isl-org/Open3D/releases/download/v0.19.0/open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
-    tar -xf open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
-    rm    open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz
+# ── Open3D precompilata (solo amd64, nessun prebuilt ufficiale per arm64) ──
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        wget -q https://github.com/isl-org/Open3D/releases/download/v0.19.0/open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
+        tar -xf open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
+        rm    open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz; \
+    fi
 
 # ── tinygltf / stb headers ─────────────────────────────────
 RUN mkdir -p /app/tinygltf && \
@@ -164,11 +202,10 @@ RUN mkdir -p /app/tinygltf && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image.h       -O /app/tinygltf/stb_image.h && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h -O /app/tinygltf/stb_image_write.h
 
-# ── PotreeConverter ────────────────────────────────────────
-RUN wget -q https://github.com/potree/PotreeConverter/releases/download/2.1.1/PotreeConverter_2.1.1_x64_linux.zip && \
-    unzip -q PotreeConverter_2.1.1_x64_linux.zip && \
-    rm       PotreeConverter_2.1.1_x64_linux.zip && \
-    chmod +x PotreeConverter_linux_x64/PotreeConverter
+# ── PotreeConverter — copiato dal builder (compilato da sorgente per entrambe le arch)
+# Il percorso finale replica quello del prebuilt x64 per compatibilità con il codice Python.
+COPY --from=builder /opt/potree/PotreeConverter /app/PotreeConverter_linux_x64/PotreeConverter
+RUN chmod +x /app/PotreeConverter_linux_x64/PotreeConverter
 
 # Aggiorna cache librerie dinamiche
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
