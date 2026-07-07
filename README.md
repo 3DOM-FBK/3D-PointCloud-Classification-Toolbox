@@ -1,5 +1,7 @@
 # 3D PointCloud Classification Toolbox
 
+<video src="docs/images/3DPointCloudClassificationToolbox.webm" controls autoplay loop muted playsinline style="width: 100%; max-width: 100%; height: auto; display: block;"></video>
+
 A web-based application for interactive visualization and supervised classification of
 3D point clouds. It combines a Django REST backend, a BabylonJS + Potree 2.0 frontend,
 and a GPU-accelerated C++ processing pipeline to support the full workflow — from raw
@@ -100,7 +102,7 @@ Mounting the source directory enables live code reloading without rebuilding the
 ## Project Structure
 
 ```
-3d-classify-viewer/
+3D-PointCloud-Classification-Toolbox/
 ├── Dockerfile                      # Multi-stage build: CUDA 11.8 builder → runtime image
 ├── requirements.txt                # Python dependencies
 ├── classifyViewer/
