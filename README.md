@@ -1,6 +1,6 @@
 # 3D PointCloud Classification Toolbox
 
-<video src="docs/images/3DPointCloudClassificationToolbox_preview.webm" controls autoplay loop muted playsinline style="width: 100%; max-width: 100%; height: auto; display: block;"></video>
+<img src="docs/images/3DPointCloudClassificationToolbox_img.jpg" alt="3D PointCloud Classification Toolbox" style="width: 100%; max-width: 100%; height: auto; display: block;" />
 
 A web-based application for interactive visualization and supervised classification of
 3D point clouds. It combines a Django REST backend, a BabylonJS + Potree 2.0 frontend,
