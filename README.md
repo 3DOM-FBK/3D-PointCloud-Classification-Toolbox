@@ -1,12 +1,13 @@
 # 3D PointCloud Classification Toolbox
 
-<img src="docs/images/3DPointCloudClassificationToolbox_img.jpg" alt="3D PointCloud Classification Toolbox" style="width: 100%; max-width: 100%; height: auto; display: block;" />
+[3DPointcloudClassificationToolbox.webm](https://github.com/user-attachments/assets/db06b846-2902-48cd-986e-8798f9dd2e43)
 
 A web-based application for interactive visualization and supervised classification of
 3D point clouds. It combines a Django REST backend, a BabylonJS + Potree 2.0 frontend,
 and a GPU-accelerated C++ processing pipeline to support the full workflow — from raw
 3D data upload to labeling, feature extraction, Random Forest training, and classified
 output export.
+
 
 ## Key Features
 
