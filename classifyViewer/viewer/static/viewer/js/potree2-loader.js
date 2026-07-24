@@ -57,6 +57,17 @@ function createChildAABB(parentBB, childIndex) {
 const FEATURE_MISSING_SENTINEL = -1e38;
 const FEATURE_MISSING_COLOR = 0.8;
 
+// ---- Sentinels for the canonical point_id → segmentId map (_pointSegmentMap) ----
+// The map is a Uint16Array, so it cannot store the negative _deletedSegmentId (-1)
+// nor an "unknown" state: both need out-of-band values.
+//   SEG_UNRESOLVED — this point has never been resolved to a segment. The geometry
+//                    replay in _createMeshFromBuffer decides (and then freezes) it.
+//   SEG_DELETED    — this point lives in the internal hidden "deleted" segment.
+// Uint16 leaves room for 65534 user segments, which also removes the 253-segment
+// ceiling an 8-bit map would have imposed.
+const SEG_UNRESOLVED = 0xFFFF;
+const SEG_DELETED = 0xFFFE;
+
 
 /**
  * Potree 2.0 Loader for BabylonJS
@@ -230,6 +241,24 @@ export class Potree2Loader {
         console.log("   Offset:", this.metadata.offset);
 
         this._parseAttributes();
+
+        // Canonical point_id → segmentId map, indexed by the POINT_ID attribute.
+        // This is the source of truth for segment membership: it survives LOD
+        // unload/reload cycles, so a point keeps the segment it was assigned to
+        // even when its octree node is dropped by cleanup() and fetched again.
+        // Without it every reload re-derives membership from the 2D selection
+        // replay, which is not equivalent to the original assignment (different
+        // tie-breaking on overlaps) and makes hidden segments pop back in blocks.
+        const hasPointId = this.attributes.some(a => {
+            const n = a.name.toLowerCase();
+            return n === "point_id" || n === "pointid";
+        });
+        if (hasPointId && this.metadata.points > 0) {
+            this._pointSegmentMap = new Uint16Array(this.metadata.points).fill(SEG_UNRESOLVED);
+        } else {
+            this._pointSegmentMap = null;
+            console.warn("⚠️ No POINT_ID attribute: segment membership will be re-derived geometrically on every LOD load.");
+        }
 
         // Load the complete hierarchy.bin in one request.
         // hierarchy.bin contains ALL hierarchy chunks for the entire octree.
@@ -1365,6 +1394,7 @@ export class Potree2Loader {
         // Apply existing cut segments
         const segmentIds = new Int32Array(numPoints); // 0 = main cloud
         if (this.cutHistory.length > 0 || !this.mainCloudVisible) {
+            const chronologicalCuts = this._getChronologicalCuts();
             for (let j = 0; j < numPoints; j++) {
                 const pid = pointIds[j];
                 let resolvedSegId = -1; // -1 = not resolved yet
@@ -1372,12 +1402,8 @@ export class Potree2Loader {
                 // 1. Canonical map lookup (source of truth for points seen at cut time).
                 //    Preserved across LOD unload/reload cycles — prevents the geometry-
                 //    based fallback from re-assigning overlap points to a newer segment.
-                if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                    const stored = this._pointSegmentMap[pid];
-                    if (stored !== 0xFF) {
-                        resolvedSegId = (stored === 0xFE) ? this._deletedSegmentId : stored;
-                    }
-                }
+                const canonical = this._readPointSegment(pid);
+                if (canonical !== null) resolvedSegId = canonical;
 
                 if (resolvedSegId !== -1) {
                     segmentIds[j] = resolvedSegId;
@@ -1396,13 +1422,19 @@ export class Potree2Loader {
                         positions[3 * j + 2] = NaN;
                     }
                 } else {
-                    // 2. Geometry fallback for points not loaded at cut time.
-                    //    Oldest-first so the earlier cut wins on geometric overlaps,
-                    //    consistent with cutSelection() NaN-guard behaviour.
+                    // 2. Geometry fallback for points not loaded at cut time: replay the
+                    //    whole history in order, honouring what was visible at each step.
+                    //    The outcome is frozen into the canonical map so this point is
+                    //    never re-derived again: replaying the 2D regions on a later
+                    //    reload can pick a different segment on overlaps, which is what
+                    //    made hidden segments reappear in blocks while navigating.
+                    //    Only a positive match is frozen — points that match no region
+                    //    stay SEG_UNRESOLVED so a future cut can still claim them.
                     tmpVec.set(positions[3 * j], positions[3 * j + 1], positions[3 * j + 2]);
-                    const seg = this._getPointSegmentOldestFirst(tmpVec);
+                    const seg = this._resolvePointSegment(tmpVec, chronologicalCuts);
                     if (seg !== null) {
                         segmentIds[j] = seg.segmentId;
+                        this._writePointSegment(pid, seg.segmentId);
                         if (!seg.visible) {
                             positions[3 * j] = NaN;
                             positions[3 * j + 1] = NaN;
@@ -1558,7 +1590,7 @@ export class Potree2Loader {
         let finalCls = null;
 
         // Determine point's segment once per vector
-        const pointSeg = this._getPointSegment(localVector);
+        const pointSeg = this._resolvePointSegment(localVector);
         const pointSegId = pointSeg ? pointSeg.segmentId : 0;
 
         // Iterate from oldest to newest (later entries override earlier ones)
@@ -1733,7 +1765,7 @@ export class Potree2Loader {
                 if (c.visible) visibleSegmentIds.push(c.segmentId);
             });
 
-            const margin = 0.05;
+            const margin = this._getAabbMargin();
             this.classificationHistory.push({
                 classId, r, g, b,
                 inverted: this.selectionInverted,
@@ -1961,6 +1993,7 @@ export class Potree2Loader {
         }
 
         const segmentId = this._segmentIdCounter++;
+        const visibleSegmentIdsAtCut = this._currentVisibleSegmentIds();
         let total = 0;
         let minX = Infinity, minY = Infinity, minZ = Infinity;
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -1995,9 +2028,7 @@ export class Potree2Loader {
 
                 if (isInside) {
                     const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
-                    if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                        this._pointSegmentMap[pid] = segmentId;
-                    }
+                    this._writePointSegment(pid, segmentId);
 
                     segmentIds[i] = segmentId;
                     assigned++;
@@ -2037,12 +2068,16 @@ export class Potree2Loader {
         });
 
         if (anyAssigned) {
-            const margin = 0.05;
+            const margin = this._getAabbMargin();
             this.cutHistory.push({
                 segmentId,
                 visible: false, // Hidden by default upon cut
                 inverted: this.selectionInverted,
                 creationOrder: this._cutCreationCounter++,
+                // Which segments were on screen when this cut ran — the loop above
+                // only captured visible (non-NaN) points, and the LOD replay has to
+                // reproduce that same restriction.
+                visibleSegmentIds: visibleSegmentIdsAtCut,
                 minX: minX - margin, minY: minY - margin, minZ: minZ - margin,
                 maxX: maxX + margin, maxY: maxY + margin, maxZ: maxZ + margin,
                 selections: this.selectionHistory.map(s => ({ ...s, transformMatrix: s.transformMatrix.clone() })),
@@ -2129,6 +2164,57 @@ export class Potree2Loader {
     }
 
     /**
+     * Slack added around the 3D AABB stored with every cut/classification entry.
+     *
+     * That AABB is built from the points present when the action ran, i.e. from a
+     * coarse LOD sample, and is the ONLY depth bound the 2D-region replay has when
+     * a finer node loads later. It must therefore cover the sampling error between
+     * levels — roughly the root spacing — and nothing more.
+     *
+     * This used to be a hard-coded 0.05 in world units. On a cloud only 0.13 units
+     * across that inflates every box by ~40% of the whole model, so the prune never
+     * rejects anything and the replay degenerates into an unbounded prism; on a
+     * cloud tens of metres wide the same constant is far too tight. Deriving it
+     * from metadata.spacing makes it correct at any scale.
+     */
+    _getAabbMargin() {
+        if (this._aabbMargin === undefined) {
+            const spacing = this.metadata?.spacing;
+            if (spacing > 0) {
+                this._aabbMargin = spacing * 2;
+            } else {
+                const bb = this.metadata?.boundingBox;
+                const diag = bb
+                    ? Math.hypot(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1], bb.max[2] - bb.min[2])
+                    : 1;
+                this._aabbMargin = diag * 0.005;
+            }
+        }
+        return this._aabbMargin;
+    }
+
+    /**
+     * Reads the canonical segment of a point from _pointSegmentMap.
+     * @returns {number|null} the segmentId, or null when the map is unavailable
+     *          or the point has never been resolved.
+     */
+    _readPointSegment(pid) {
+        if (!this._pointSegmentMap || pid < 0 || pid >= this._pointSegmentMap.length) return null;
+        const stored = this._pointSegmentMap[pid];
+        if (stored === SEG_UNRESOLVED) return null;
+        return (stored === SEG_DELETED) ? this._deletedSegmentId : stored;
+    }
+
+    /**
+     * Writes the canonical segment of a point into _pointSegmentMap.
+     * Negative ids (the internal deleted segment) are stored as SEG_DELETED.
+     */
+    _writePointSegment(pid, segmentId) {
+        if (!this._pointSegmentMap || pid < 0 || pid >= this._pointSegmentMap.length) return;
+        this._pointSegmentMap[pid] = (segmentId === this._deletedSegmentId) ? SEG_DELETED : segmentId;
+    }
+
+    /**
      * Re-applies NaN / position-restore to a single mesh based on the current
      * mainCloudVisible and cutHistory states.  Called when a node re-enters
      * the LOD view so the outline hide/show state is honoured on fresh nodes.
@@ -2152,12 +2238,10 @@ export class Potree2Loader {
             let resolved = false;
 
             // 1. Canonical map lookup
-            if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                const stored = this._pointSegmentMap[pid];
-                if (stored !== 0xFF) {
-                    pointSeg = (stored === 0xFE) ? this._deletedSegmentId : stored;
-                    resolved = true;
-                }
+            const canonical = this._readPointSegment(pid);
+            if (canonical !== null) {
+                pointSeg = canonical;
+                resolved = true;
             }
 
             // 2. Fallback to mesh metadata
@@ -2194,48 +2278,79 @@ export class Potree2Loader {
     }
 
     /**
-     * Returns { segmentId, visible } for the cut segment a point belongs to, or null.
-     * Iterates newest-to-oldest (used when the canonical map is available).
+     * Snapshot of which segments are on screen right now (0 = main cloud).
+     * Stored on every cut/assign entry so _resolvePointSegment can tell whether a
+     * point was even selectable when that action ran. Must be taken BEFORE the new
+     * entry is pushed — the segment being created does not exist yet.
      */
-    _getPointSegment(localVector) {
-        if (this.cutHistory.length === 0) return null;
-        const x = localVector.x, y = localVector.y, z = localVector.z;
-
-        for (let c = this.cutHistory.length - 1; c >= 0; c--) {
-            const entry = this.cutHistory[c];
-            if (x < entry.minX || x > entry.maxX ||
-                y < entry.minY || y > entry.maxY ||
-                z < entry.minZ || z > entry.maxZ) continue;
-
-            if (this._matchesSelectionEntry(localVector, entry.selections, entry.deselections, entry.inverted)) {
-                return { segmentId: entry.segmentId, visible: entry.visible };
-            }
-        }
-        return null;
+    _currentVisibleSegmentIds() {
+        const ids = [];
+        if (this.mainCloudVisible) ids.push(0);
+        this.cutHistory.forEach(c => { if (c.visible) ids.push(c.segmentId); });
+        return ids;
     }
 
     /**
-     * Returns { segmentId, visible } iterating oldest-to-newest.
-     * Used as geometry fallback in _createMeshFromBuffer for points that had no
-     * canonical _pointSegmentMap entry (i.e. the LOD node was not in memory when
-     * the cut happened). Oldest-first ensures the earlier cut wins on overlapping
-     * areas, matching the NaN-guard behaviour of cutSelection().
+     * cutHistory sorted by the order the actions actually happened.
+     * cutHistory is push-ordered, but mergeSegments() can append a target entry
+     * carrying an older creationOrder, so replaying the array as-is would apply
+     * the actions out of sequence.
      */
-    _getPointSegmentOldestFirst(localVector) {
-        if (this.cutHistory.length === 0) return null;
-        const x = localVector.x, y = localVector.y, z = localVector.z;
+    _getChronologicalCuts() {
+        return this.cutHistory
+            .slice()
+            .sort((a, b) => (a.creationOrder ?? 0) - (b.creationOrder ?? 0));
+    }
 
-        for (let c = 0; c < this.cutHistory.length; c++) {
-            const entry = this.cutHistory[c];
+    /**
+     * Replays the whole cut history for one point and returns the segment it ends
+     * up in: { segmentId, visible }, or null when it never left the main cloud.
+     *
+     * This is a CHRONOLOGICAL SIMULATION, and it has to be, because cutSelection()
+     * and assignSelectionToSegment() only ever capture points that are *currently
+     * visible* (they skip NaN-masked ones). So whether a cut claims a point depends
+     * on which segment the point was in at that moment and whether that segment was
+     * on screen — which is exactly what entry.visibleSegmentIds records.
+     *
+     * The previous oldest-first scan ignored this and returned the first region that
+     * geometrically contained the point. With a single cut the two agree, but from
+     * the second cut on they diverge: cutting into a segment the user had toggled
+     * back on moves those points to the newer (hidden) segment, while the old scan
+     * kept handing them to the older — often visible — one. Every LOD node loaded
+     * afterwards then resurrected that geometry in blocks.
+     *
+     * Entries with no visibleSegmentIds (older sessions) are treated as
+     * "everything was visible", which reproduces the previous behaviour for them.
+     */
+    _resolvePointSegment(localVector, cuts) {
+        const chronological = cuts || this._getChronologicalCuts();
+        if (chronological.length === 0) return null;
+
+        const x = localVector.x, y = localVector.y, z = localVector.z;
+        let segmentId = 0;
+        let entryOfSegment = null;
+
+        for (let c = 0; c < chronological.length; c++) {
+            const entry = chronological[c];
+
+            // Could this point be picked at all when the action ran? It had to be
+            // visible, i.e. sitting in a segment that was on screen at that time.
+            const visibleThen = entry.visibleSegmentIds;
+            if (visibleThen && !visibleThen.includes(segmentId)) continue;
+
+            // Cheap AABB reject before the projection test.
             if (x < entry.minX || x > entry.maxX ||
                 y < entry.minY || y > entry.maxY ||
                 z < entry.minZ || z > entry.maxZ) continue;
 
             if (this._matchesSelectionEntry(localVector, entry.selections, entry.deselections, entry.inverted)) {
-                return { segmentId: entry.segmentId, visible: entry.visible };
+                segmentId = entry.segmentId;
+                entryOfSegment = entry;
             }
         }
-        return null;
+
+        if (segmentId === 0) return null;
+        return { segmentId, visible: entryOfSegment ? !!entryOfSegment.visible : true };
     }
 
     /**
@@ -2458,6 +2573,13 @@ export class Potree2Loader {
             let modified = false;
 
             for (let i = 0; i < segmentIds.length; i++) {
+                // Skip points that are currently hidden, exactly like cutSelection() does.
+                // A 2D selection region is a depth-unbounded prism: without this guard a
+                // small on-screen rectangle also captures everything occluded behind it,
+                // including the hidden main cloud, and assigning to a visible group makes
+                // all of it pop back into view. You can only assign what you can see.
+                if (isNaN(positions[i * 3])) continue;
+
                 tmpVec.set(originalPositions[i * 3], originalPositions[i * 3 + 1], originalPositions[i * 3 + 2]);
                 let isInside = false;
                 for (const sel of this.selectionHistory) {
@@ -2487,9 +2609,7 @@ export class Potree2Loader {
 
                 if (isInside) {
                     const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
-                    if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                        this._pointSegmentMap[pid] = (segmentId === this._deletedSegmentId) ? 0xFE : segmentId;
-                    }
+                    this._writePointSegment(pid, segmentId);
 
                     segmentIds[i] = segmentId;
                     totalAssigned++;
@@ -2514,7 +2634,7 @@ export class Potree2Loader {
         });
 
         if (anyPoints) {
-            const margin = 0.05;
+            const margin = this._getAabbMargin();
             const cloneRegions = (regions) => regions.map(r => ({
                 ...r,
                 transformMatrix: r.transformMatrix?.clone ? r.transformMatrix.clone() : r.transformMatrix
@@ -2551,6 +2671,16 @@ export class Potree2Loader {
                 targetEntry.visible = isVisible;
                 if (!Array.isArray(targetEntry.selections)) targetEntry.selections = [];
                 if (!Array.isArray(targetEntry.deselections)) targetEntry.deselections = [];
+
+                // An entry accumulates several assign actions, each taken under its own
+                // visibility state, but carries a single snapshot. Union them: a segment
+                // that was visible for any of those actions stays selectable during the
+                // replay. Union is the permissive choice, so this can only fail towards
+                // the old behaviour, never towards hiding something the user still has.
+                const visibleNow = this._currentVisibleSegmentIds();
+                targetEntry.visibleSegmentIds = Array.isArray(targetEntry.visibleSegmentIds)
+                    ? [...new Set([...targetEntry.visibleSegmentIds, ...visibleNow])]
+                    : visibleNow;
 
                 targetEntry.minX = Math.min(targetEntry.minX ?? Infinity, minX - margin);
                 targetEntry.minY = Math.min(targetEntry.minY ?? Infinity, minY - margin);
@@ -2663,15 +2793,17 @@ export class Potree2Loader {
 
                         // Use canonical maps if available
                         if (this._pointSegmentMap && pid < this._pointSegmentMap.length) {
-                            const stored = this._pointSegmentMap[pid];
-                            if (stored !== 0xFF) {
-                                finalSegId = (stored === 0xFE) ? this._deletedSegmentId : stored;
+                            const canonical = this._readPointSegment(pid);
+                            if (canonical !== null) {
+                                finalSegId = canonical;
                             } else {
-                                // Fallback to projection if not yet evaluated
-                                const seg = this._getPointSegment(p.pos);
+                                // Fallback to projection if not yet evaluated — same
+                                // chronological replay the LOD path uses, so the export
+                                // agrees with what the user sees on screen.
+                                const seg = this._resolvePointSegment(p.pos);
                                 finalSegId = seg ? seg.segmentId : 0;
                                 // Cache it
-                                this._pointSegmentMap[pid] = (finalSegId === this._deletedSegmentId) ? 0xFE : finalSegId;
+                                this._writePointSegment(pid, finalSegId);
                             }
                         }
 
@@ -2882,9 +3014,7 @@ export class Potree2Loader {
 
                 if (isInside) {
                     const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
-                    if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                        this._pointSegmentMap[pid] = 0;
-                    }
+                    this._writePointSegment(pid, 0);
 
                     segmentIds[i] = 0;
                     totalRemoved++;
@@ -2925,6 +3055,7 @@ export class Potree2Loader {
         if (this.selectionHistory.length === 0) return 0;
 
         const deletedSegmentId = this._deletedSegmentId;
+        const visibleSegmentIdsAtDelete = this._currentVisibleSegmentIds();
         let total = 0;
         let minX = Infinity, minY = Infinity, minZ = Infinity;
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -2955,9 +3086,7 @@ export class Potree2Loader {
                 if (!isInside) continue;
 
                 const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
-                if (this._pointSegmentMap && pid >= 0 && pid < this._pointSegmentMap.length) {
-                    this._pointSegmentMap[pid] = 0xFE;
-                }
+                this._writePointSegment(pid, deletedSegmentId);
 
                 segmentIds[i] = deletedSegmentId;
                 total++;
@@ -2981,12 +3110,13 @@ export class Potree2Loader {
         });
 
         if (anyAssigned) {
-            const margin = 0.05;
+            const margin = this._getAabbMargin();
             this.cutHistory.push({
                 segmentId: deletedSegmentId,
                 visible: false,
                 inverted: this.selectionInverted,
                 creationOrder: this._cutCreationCounter++,
+                visibleSegmentIds: visibleSegmentIdsAtDelete,
                 minX: minX - margin, minY: minY - margin, minZ: minZ - margin,
                 maxX: maxX + margin, maxY: maxY + margin, maxZ: maxZ + margin,
                 selections: this.selectionHistory.map(s => ({ ...s, transformMatrix: s.transformMatrix.clone() })),
@@ -3011,7 +3141,7 @@ export class Potree2Loader {
 
         if (this._pointSegmentMap) {
             for (let pid = 0; pid < this._pointSegmentMap.length; pid++) {
-                if (this._pointSegmentMap[pid] === 0xFE) {
+                if (this._pointSegmentMap[pid] === SEG_DELETED) {
                     this._pointSegmentMap[pid] = 0;
                 }
             }
@@ -3068,13 +3198,14 @@ export class Potree2Loader {
         if (sources.length === 0) return { movedPoints: 0, mergedSegments: 0 };
 
         const sourceSet = new Set(sources);
-        const storeTarget = (targetSegmentId === this._deletedSegmentId) ? 0xFE : targetSegmentId;
+        const storeTarget = (targetSegmentId === this._deletedSegmentId) ? SEG_DELETED : targetSegmentId;
 
         if (this._pointSegmentMap) {
             for (let pid = 0; pid < this._pointSegmentMap.length; pid++) {
                 const stored = this._pointSegmentMap[pid];
-                // Treat 0xFE as deletedSegmentId
-                const actualStored = (stored === 0xFE) ? this._deletedSegmentId : stored;
+                if (stored === SEG_UNRESOLVED) continue;
+                // Treat SEG_DELETED as deletedSegmentId
+                const actualStored = (stored === SEG_DELETED) ? this._deletedSegmentId : stored;
                 if (sourceSet.has(actualStored)) {
                     this._pointSegmentMap[pid] = storeTarget;
                 }
