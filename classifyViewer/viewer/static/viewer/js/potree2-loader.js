@@ -169,6 +169,17 @@ export class Potree2Loader {
         this._pointClassMap = null;
         this._pointSegmentMap = null;
 
+        // Opt-in diagnostics for tracking segment state across LOD eviction/reload.
+        // Enable from the loader options or at runtime with setSegmentationDebug().
+        this.debugSegmentation = options.debugSegmentation === true;
+        this.debugWatchPointId = Number.isInteger(options.debugWatchPointId)
+            ? options.debugWatchPointId : null;
+        this._segmentRevision = 0;
+
+        // Diagnostic toggle: keep disabled by default to isolate CUT behavior
+        // from dispose/reload side effects during segmentation debugging.
+        this.autoCleanupEnabled = options.autoCleanupEnabled === true;
+
         // Runtime handles that must be cleaned on dispose() to avoid stale callbacks
         // after Reset Scene / re-import.
         this._cameraForObserver = null;
@@ -223,22 +234,9 @@ export class Potree2Loader {
     // ========== PUBLIC API ==========
 
     async load() {
-        console.log("🌲 Potree2Loader: Loading from", this.baseUrl);
-
         const metaResponse = await fetch(`${this.baseUrl}/metadata.json`);
         if (!metaResponse.ok) throw new Error(`Failed to load metadata.json: ${metaResponse.status}`);
         this.metadata = await metaResponse.json();
-
-        console.log("📊 Metadata:");
-        console.log("   Version:", this.metadata.version);
-        console.log("   Points:", this.metadata.points.toLocaleString());
-        console.log("   Spacing:", this.metadata.spacing);
-        console.log("   Hierarchy depth:", this.metadata.hierarchy.depth);
-        console.log("   Encoding:", this.metadata.encoding);
-        console.log("   BoundingBox min:", this.metadata.boundingBox.min);
-        console.log("   BoundingBox max:", this.metadata.boundingBox.max);
-        console.log("   Scale:", this.metadata.scale);
-        console.log("   Offset:", this.metadata.offset);
 
         this._parseAttributes();
 
@@ -269,7 +267,6 @@ export class Potree2Loader {
         const hierResponse = await fetch(hierUrl);
         if (!hierResponse.ok) throw new Error(`Failed to load hierarchy.bin: ${hierResponse.status}`);
         this.hierarchyBuffer = await hierResponse.arrayBuffer();
-        console.log(`   hierarchy.bin loaded: ${this.hierarchyBuffer.byteLength.toLocaleString()} bytes (full file)`);
 
         const bbMin = this.metadata.boundingBox.min;
         const bbMax = this.metadata.boundingBox.max;
@@ -366,6 +363,7 @@ export class Potree2Loader {
 
         this.loadingNodes.add(node.name);
         this.stats.loadingNodes = this.loadingNodes.size;
+        this._debugSegment('node-load-start', { node: node.name, level: node.level, expectedPoints: node.numPoints });
 
         try {
             const buffer = await this._fetchRange("octree.bin", node.byteOffset, node.byteSize);
@@ -381,6 +379,7 @@ export class Potree2Loader {
 
             this._createMeshFromBuffer(node, buffer);
             this.stats.loadedNodes++;
+            this._debugSegment('node-load-complete', { node: node.name, level: node.level, points: node.numPoints });
 
             // if (this.stats.loadedNodes <= 30 || this.stats.loadedNodes % 50 === 0) {
             //     console.log(`   ✅ Node ${node.name} (L${node.level}): ${node.numPoints.toLocaleString()} pts`);
@@ -508,6 +507,11 @@ export class Potree2Loader {
             if (mesh.isVisible !== targetVisible) mesh.isVisible = targetVisible;
 
             if (targetVisible && wasHidden) {
+                this._debugSegment('node-visible', {
+                    node: name,
+                    meshRevision: mesh.metadata?.segmentRevision,
+                    currentRevision: this._segmentRevision
+                });
                 this._applyColorModeToMesh(mesh);
                 this._applySegmentVisibilityToMesh(mesh);
             }
@@ -587,7 +591,6 @@ export class Potree2Loader {
      *   Record size = F*4 + 8
      */
     async loadPcBin(url) {
-        console.log("Loading .pcbin store: " + url);
         const response = await fetch(url);
         if (!response.ok) throw new Error("Failed to fetch .pcbin: " + response.status);
         const buffer = await response.arrayBuffer();
@@ -641,8 +644,6 @@ export class Potree2Loader {
         const dvUint8 = new Uint8Array(buffer, 0);
         this.featureBin = { N, F, names, vmin, vmax, bpf, dv, dvFloat, dvUint8, offset, recSize };
         this.pcbinAnnotations = { segIds, classIds, predIds, confidence };
-
-        console.log(".pcbin loaded: F=" + F + ", N=" + N);
         return names;
     }
 
@@ -1344,6 +1345,15 @@ export class Potree2Loader {
         // only the real point cloud colors.
         const originalColors = new Float32Array(colors);
 
+        const segmentDebug = {
+            canonicalRestored: 0,
+            fallbackResolved: 0,
+            unresolved: 0,
+            invalidPointIds: 0,
+            hidden: 0,
+            segmentCounts: {}
+        };
+
         const tmpVec = new BABYLON.Vector3();
 
         // Apply persistent selection highlight AFTER saving originalColors
@@ -1399,11 +1409,21 @@ export class Potree2Loader {
                 const pid = pointIds[j];
                 let resolvedSegId = -1; // -1 = not resolved yet
 
+                if (this._pointSegmentMap && (pid < 0 || pid >= this._pointSegmentMap.length)) {
+                    segmentDebug.invalidPointIds++;
+                }
+
                 // 1. Canonical map lookup (source of truth for points seen at cut time).
                 //    Preserved across LOD unload/reload cycles — prevents the geometry-
                 //    based fallback from re-assigning overlap points to a newer segment.
                 const canonical = this._readPointSegment(pid);
-                if (canonical !== null) resolvedSegId = canonical;
+                if (canonical !== null) {
+                    resolvedSegId = canonical;
+                    segmentDebug.canonicalRestored++;
+                    if (pid === this.debugWatchPointId) {
+                        this._debugSegment('watch-node-restore', { node: node.name, pid, segmentId: resolvedSegId, source: 'canonical' });
+                    }
+                }
 
                 if (resolvedSegId !== -1) {
                     segmentIds[j] = resolvedSegId;
@@ -1420,6 +1440,7 @@ export class Potree2Loader {
                         positions[3 * j] = NaN;
                         positions[3 * j + 1] = NaN;
                         positions[3 * j + 2] = NaN;
+                        segmentDebug.hidden++;
                     }
                 } else {
                     // 2. Geometry fallback for points not loaded at cut time: replay the
@@ -1435,22 +1456,60 @@ export class Potree2Loader {
                     if (seg !== null) {
                         segmentIds[j] = seg.segmentId;
                         this._writePointSegment(pid, seg.segmentId);
+                        segmentDebug.fallbackResolved++;
+                        if (pid === this.debugWatchPointId) {
+                            this._debugSegment('watch-node-restore', { node: node.name, pid, segmentId: seg.segmentId, source: 'geometry-fallback' });
+                        }
                         if (!seg.visible) {
                             positions[3 * j] = NaN;
                             positions[3 * j + 1] = NaN;
                             positions[3 * j + 2] = NaN;
+                            segmentDebug.hidden++;
                         }
                     } else {
                         segmentIds[j] = 0;
+                        segmentDebug.unresolved++;
                         if (!this.mainCloudVisible) {
                             positions[3 * j] = NaN;
                             positions[3 * j + 1] = NaN;
                             positions[3 * j + 2] = NaN;
+                            segmentDebug.hidden++;
                         }
                     }
                 }
+                const key = String(segmentIds[j]);
+                segmentDebug.segmentCounts[key] = (segmentDebug.segmentCounts[key] || 0) + 1;
             }
         }
+
+        // With no cut history, all points are implicitly in the main segment.
+        if (Object.keys(segmentDebug.segmentCounts).length === 0) {
+            segmentDebug.segmentCounts['0'] = numPoints;
+        }
+
+        // Verify the CPU-side visibility mask before it is uploaded to Babylon.
+        // A non-zero value proves that the inconsistency exists before rendering.
+        segmentDebug.maskMismatches = 0;
+        if (this.debugSegmentation) {
+            for (let j = 0; j < numPoints; j++) {
+                const pointSeg = segmentIds[j] || 0;
+                const entry = this.cutHistory.find(e => e.segmentId === pointSeg);
+                const shouldHide = pointSeg === 0 ? !this.mainCloudVisible
+                    : pointSeg === this._deletedSegmentId ? true
+                        : entry ? !entry.visible : false;
+                const isHidden = Number.isNaN(positions[j * 3]);
+                if (isHidden !== shouldHide) segmentDebug.maskMismatches++;
+            }
+        }
+
+        this._debugSegment('node-ready', {
+            node: node.name,
+            level: node.level,
+            points: numPoints,
+            ...segmentDebug,
+            mainCloudVisible: this.mainCloudVisible,
+            visibleSegments: this._currentVisibleSegmentIds()
+        });
 
         // Create BabylonJS mesh
         const mesh = new BABYLON.Mesh(`potree2_${node.name}`, this.scene);
@@ -1488,7 +1547,8 @@ export class Potree2Loader {
             potree2Node: true,
             // Used by update() to compute per-node projected point size (spacing-based LOD).
             nodeSpacing: node.spacing,
-            nodeBoundingBox: node.boundingBox
+            nodeBoundingBox: node.boundingBox,
+            segmentRevision: this._segmentRevision
         };
 
         this.loadedNodes.set(node.name, mesh);
@@ -1520,7 +1580,18 @@ export class Potree2Loader {
             this.stats.loadedNodes--;
         }
 
-        if (toRemove.length > 0) console.log(`🧹 Cleaned up ${toRemove.length} nodes`);
+    }
+
+    startAutoCleanup(intervalMs = 30000, keepCount = 200) {
+        this.stopAutoCleanup();
+        this._cleanupIntervalId = window.setInterval(() => this.cleanup(keepCount), intervalMs);
+    }
+
+    stopAutoCleanup() {
+        if (this._cleanupIntervalId !== null) {
+            window.clearInterval(this._cleanupIntervalId);
+            this._cleanupIntervalId = null;
+        }
     }
 
     // ========== SELECTION ==========
@@ -2089,11 +2160,24 @@ export class Potree2Loader {
         this.deselectionHistory = [];
 
         // console.log(`✂️ Cut segment ${segmentId}: ${total.toLocaleString()} points assigned.`);
+        if (anyAssigned) this._bumpSegmentRevision('cut', { segmentId, assigned: total });
         return anyAssigned ? { segmentId, count: total } : null;
     }
 
     _setMeshPositionsAndNotify(mesh, positions) {
-        mesh.setVerticesData(BABYLON.VertexBuffer.PositionKind, positions);
+        // VertexData.applyToMesh(mesh, true) creates an updatable position buffer.
+        // Update that existing GPU buffer instead of replacing its vertex data on
+        // every CUT/LOD visibility change; replacement can leave a stale buffer
+        // bound for a render pass while meshes are rapidly toggled by the LOD loop.
+        if (typeof mesh.updateVerticesData === 'function') {
+            mesh.updateVerticesData(BABYLON.VertexBuffer.PositionKind, positions, false, false);
+        } else {
+            mesh.setVerticesData(BABYLON.VertexBuffer.PositionKind, positions, true);
+        }
+        this._debugSegment('gpu-position-upload', {
+            node: mesh.metadata?.nodeInfo?.name,
+            points: positions.length / 3
+        });
         if (mesh.refreshBoundingInfo) mesh.refreshBoundingInfo();
         mesh.computeWorldMatrix(true);
 
@@ -2160,6 +2244,7 @@ export class Potree2Loader {
             }
         });
 
+        this._bumpSegmentRevision('visibility', { segmentId, visible });
         // console.log(`👁️ Segment ${segmentId} → ${visible ? "visible" : "hidden"}`);
     }
 
@@ -2193,6 +2278,25 @@ export class Potree2Loader {
         return this._aabbMargin;
     }
 
+    /** Enable concise, structured segmentation diagnostics at runtime. */
+    setSegmentationDebug(enabled = true, watchPointId = null) {
+        this.debugSegmentation = !!enabled;
+        this.debugWatchPointId = Number.isInteger(watchPointId) ? watchPointId : null;
+    }
+
+    _debugSegment(event, details = {}) {
+        if (!this.debugSegmentation) return;
+        // Segmentation diagnostics are intentionally silenced by default.
+        // Toggle behavior can be reintroduced here if needed in future.
+        void event;
+        void details;
+    }
+
+    _bumpSegmentRevision(operation, details = {}) {
+        this._segmentRevision++;
+        this._debugSegment('state-change', { operation, ...details });
+    }
+
     /**
      * Reads the canonical segment of a point from _pointSegmentMap.
      * @returns {number|null} the segmentId, or null when the map is unavailable
@@ -2210,8 +2314,15 @@ export class Potree2Loader {
      * Negative ids (the internal deleted segment) are stored as SEG_DELETED.
      */
     _writePointSegment(pid, segmentId) {
-        if (!this._pointSegmentMap || pid < 0 || pid >= this._pointSegmentMap.length) return;
+        if (!this._pointSegmentMap) return;
+        if (pid < 0 || pid >= this._pointSegmentMap.length) {
+            this._debugSegment('invalid-point-id', { pid, segmentId, mapLength: this._pointSegmentMap?.length ?? 0 });
+            return;
+        }
         this._pointSegmentMap[pid] = (segmentId === this._deletedSegmentId) ? SEG_DELETED : segmentId;
+        if (pid === this.debugWatchPointId) {
+            this._debugSegment('watch-write', { pid, segmentId });
+        }
     }
 
     /**
@@ -2704,6 +2815,7 @@ export class Potree2Loader {
 
         this.selectionHistory = [];
         this.deselectionHistory = [];
+        if (totalAssigned > 0) this._bumpSegmentRevision('assign', { segmentId, assigned: totalAssigned });
         return totalAssigned;
     }
 
@@ -2835,28 +2947,7 @@ export class Potree2Loader {
             }
         };
 
-        // Diagnostic: check if POINT_ID attribute exists in the Potree octree
-        const hasPointIdAttr = this.attributes.some(a => {
-            const low = a.name.toLowerCase();
-            return low === "point_id" || low === "pointid";
-        });
-        console.log(`[Diag] POINT_ID attribute in Potree metadata: ${hasPointIdAttr}`);
-        console.log(`[Diag] Attributes: ${this.attributes.map(a => a.name).join(", ")}`);
-        console.log(`[Diag] totalPoints (metadata.points): ${totalPoints}`);
-
-        console.log("🚀 Starting global octree traversal (2-Channel Binary Mode)...");
         await traverse(this.root);
-        console.log(`✅ Global traversal finished.`);
-        console.log(`   - Total points in octree nodes: ${totalProcessed.toLocaleString()}`);
-        console.log(`   - Unique points assigned in buffer: ${seenIds.size.toLocaleString()}`);
-        console.log(`   - Points skipped: ${skippedNoId.toLocaleString()} (no ID), ${duplicates.toLocaleString()} (duplicates)`);
-
-        // Diagnostic: sample first 20 assigned PIDs
-        const samplePids = [];
-        for (let k = 0; k < totalPoints && samplePids.length < 20; k++) {
-            if (buffer[k * 2] !== 0) samplePids.push({ pid: k, seg: buffer[k * 2] - 1, cls: buffer[k * 2 + 1] });
-        }
-        console.log(`[Diag] Sample annotated PIDs:`, samplePids);
 
         return {
             buffer: buffer,
@@ -3043,6 +3134,7 @@ export class Potree2Loader {
 
         this.selectionHistory = [];
         this.deselectionHistory = [];
+        if (totalRemoved > 0) this._bumpSegmentRevision('remove-from-segment', { segmentId, removed: totalRemoved });
         return totalRemoved;
     }
 
@@ -3126,6 +3218,7 @@ export class Potree2Loader {
 
         this.selectionHistory = [];
         this.deselectionHistory = [];
+        if (anyAssigned) this._bumpSegmentRevision('delete', { deleted: total });
         return total;
     }
 
@@ -3180,6 +3273,7 @@ export class Potree2Loader {
                 this._resetSelectionColors(mesh);
             }
         });
+        if (restored > 0) this._bumpSegmentRevision('restore-deleted', { restored });
         return restored;
     }
 
@@ -3271,6 +3365,7 @@ export class Potree2Loader {
             this.cutHistory = this.cutHistory.filter(c => !sourceSet.has(c.segmentId));
         }
 
+        this._bumpSegmentRevision('merge', { targetSegmentId, sourceSegmentIds: sources, movedPoints });
         return {
             movedPoints,
             mergedSegments: sources.length
@@ -3363,7 +3458,11 @@ export async function loadPotree2PointCloud(basePath, scene, options = {}) {
             }
         });
 
-        loader._cleanupIntervalId = window.setInterval(() => loader.cleanup(200), 30000);
+        if (loader.autoCleanupEnabled) {
+            loader.startAutoCleanup(30000, 200);
+        } else {
+            loader.stopAutoCleanup();
+        }
     }
 
     scene.potree2Loader = loader;
