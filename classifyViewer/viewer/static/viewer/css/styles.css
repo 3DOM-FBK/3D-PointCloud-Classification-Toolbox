@@ -4,6 +4,7 @@
     --panel-bg: #1e1e20;
     --border-color: #2d2d30;
     --accent-blue: #3b82f6;
+    --accent-orange: #f59e0b;
     --text-primary: #e1e1e6;
     --text-muted: #8d8d99;
     --header-height: 40px;
@@ -1091,6 +1092,15 @@ select.property-input option {
 
 .outline-visibility-btn.off {
     opacity: 0.3;
+}
+
+.outline-visibility-btn:not(.off) {
+    opacity: 0.95;
+}
+
+.outline-visibility-btn:not(.off) .outline-visibility-icon {
+    /* Bright orange tint for active/visible segment eye icon. */
+    filter: brightness(0) saturate(100%) invert(72%) sepia(95%) saturate(3327%) hue-rotate(351deg) brightness(108%) contrast(104%) drop-shadow(0 0 1px rgba(255, 176, 64, 0.55));
 }
 
 .outline-visibility-icon {
