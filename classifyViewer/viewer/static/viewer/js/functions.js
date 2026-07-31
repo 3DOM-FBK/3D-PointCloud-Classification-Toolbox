@@ -1990,7 +1990,7 @@ export function showLoadModal() {
             meshPointsInput = document.createElement('input');
             meshPointsInput.type = "number";
             meshPointsInput.classList.add('property-input');
-            meshPointsInput.value = "5000000";
+            meshPointsInput.value = "10000000";
             meshPointsInput.step = "100000";
             meshPointsInput.min = "10000";
             meshPointsInput.style.width = "100px";
@@ -2210,7 +2210,7 @@ export function showLoadModal() {
                         console.log("✅ PLY converted to LAS");
                     } else if (extension === 'glb') {
                         console.log("🔄 Step 3: Converting GLB to LAS...");
-                        let numPoints = 5000000;
+                        let numPoints = 10000000;
                         if (meshPointsInput && meshPointsInput.value) numPoints = parseInt(meshPointsInput.value, 10);
                         const meshResponse = await fetch('/mesh2pc/', {
                             method: 'POST',
