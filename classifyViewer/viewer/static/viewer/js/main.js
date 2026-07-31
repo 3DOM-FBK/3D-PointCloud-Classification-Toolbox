@@ -1518,6 +1518,8 @@ camera.attachControl(canvas, true);
 camera.wheelDeltaPercentage = 0.05;
 camera.inertia = 0.8;
 camera.panningSensibility = 250;
+// Blender-like pan feel: no momentum/lag while dragging.
+camera.panningInertia = 0;
 
 const ORTHO_NEAR_MIN = 0.0001;
 const ORTHO_FAR_MIN = 100;
@@ -1528,11 +1530,20 @@ const ORTHO_MIN_DISTANCE = 1.0;
 const ORTHO_ZOOM_WHEEL_SENSITIVITY = 0.0015;
 const ORTHO_ZOOM_MIN = 0.01;
 const ORTHO_ZOOM_MAX = 100000;
-// Blender-like pan tuning: sensibility follows visible world scale on screen.
-const PAN_GAIN = 0.9;
-const PAN_EXPONENT = 1.35;
-const PAN_MIN_SENSIBILITY = 12;
-const PAN_MAX_SENSIBILITY = 260000;
+// Perspective navigation tuning: adapt controls to object scale and zoom depth.
+const PERSPECTIVE_WHEEL_MIN = 0.004;
+const PERSPECTIVE_WHEEL_MAX = 0.03;
+// Blender-style "grab" panning: the point under the cursor tracks the cursor while
+// dragging, regardless of object scale or current zoom level. GAIN=1 gives exact
+// 1:1 tracking; values GREATER than 1 slow panning down uniformly while keeping it
+// adaptive to scale. The min/max below are only numeric safety rails (not tuning knobs) so
+// they must stay extremely wide, otherwise they silently override the adaptive
+// formula at scale extremes (which caused "slow on big objects / fast on tiny
+// objects" before).
+const PERSPECTIVE_PAN_GAIN = 1.4;
+const PAN_MIN_SENSIBILITY = 1e-4;
+const PAN_MAX_SENSIBILITY = 1e12;
+const MIN_FOCUS_RADIUS = 1e-4;
 const orthoCameraState = {
     lastOrthoSize: null,
     lastAspect: null,
@@ -1624,6 +1635,33 @@ function _computeOrthoSafeDistance() {
     const targetToCenter = BABYLON.Vector3.Distance(target, bounds.center);
     const dist = targetToCenter + bounds.radius * ORTHO_DISTANCE_MARGIN;
     return Math.max(ORTHO_MIN_DISTANCE, dist);
+}
+
+function _computeFocusRadius() {
+    const bounds = _computePointCloudBounds();
+    if (bounds?.radius && Number.isFinite(bounds.radius) && bounds.radius > 0) {
+        return Math.max(bounds.radius, MIN_FOCUS_RADIUS);
+    }
+    return Math.max(camera.radius || 10, MIN_FOCUS_RADIUS);
+}
+
+function _syncPerspectiveNavigation() {
+    if (camera.mode !== BABYLON.Camera.PERSPECTIVE_CAMERA) return;
+
+    const focusRadius = _computeFocusRadius();
+    const dist = Math.max(BABYLON.Vector3.Distance(camera.position, camera.getTarget()), MIN_FOCUS_RADIUS);
+    const zoomRatio = BABYLON.Scalar.Clamp(dist / focusRadius, 0.05, 1000);
+
+    // Zoom faster when very close to tiny objects, slower when framing large areas.
+    camera.wheelDeltaPercentage = BABYLON.Scalar.Clamp(
+        0.02 + (0.06 / Math.sqrt(zoomRatio)),
+        PERSPECTIVE_WHEEL_MIN,
+        PERSPECTIVE_WHEEL_MAX
+    );
+
+    // Keep orbit limits proportional to current focus scale.
+    camera.lowerRadiusLimit = Math.max(focusRadius * 0.001, MIN_FOCUS_RADIUS);
+    camera.upperRadiusLimit = Math.max(focusRadius * 5000, 50);
 }
 
 function _computeCameraClipRange(radius, isOrtho) {
@@ -1723,6 +1761,7 @@ scene.onPointerObservable.add((pointerInfo) => {
             return;
         }
 
+        _syncPerspectiveNavigation();
         syncOrthoCamera(true);
     }
 });
@@ -1745,12 +1784,13 @@ scene.onBeforeRenderObservable.add(() => {
     }
 
     const pixelsPerWorldUnit = viewportHeight / visibleWorldHeight;
-    const curved = Math.pow(Math.max(pixelsPerWorldUnit, 1e-6), PAN_EXPONENT);
     camera.panningSensibility = BABYLON.Scalar.Clamp(
-        curved * PAN_GAIN,
+        pixelsPerWorldUnit * PERSPECTIVE_PAN_GAIN,
         PAN_MIN_SENSIBILITY,
         PAN_MAX_SENSIBILITY
     );
+
+    _syncPerspectiveNavigation();
 
     // Keep orthographic extents and clip planes aligned with inertia-based zoom.
     syncOrthoCamera(false);
