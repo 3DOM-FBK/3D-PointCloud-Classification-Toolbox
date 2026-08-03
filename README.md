@@ -60,7 +60,7 @@ A pre-built Docker image is available on Docker Hub and can be used directly wit
 compiling from source:
 
 ```bash
-docker pull 3domfbk/3d-classify-viewer:v1.0.0-beta.9
+docker pull 3domfbk/3d-classify-viewer:v1.0.0-beta.10
 ```
 
 ### 1. Build the Docker image
@@ -79,7 +79,7 @@ docker build --build-arg NUM_THREADS=16 -t 3d-classify-viewer .
 
 ### 2. Run in production
 
-Replace `3d-classify-viewer` with `3domfbk/3d-classify-viewer:v1.0.0-beta.9` if using
+Replace `3d-classify-viewer` with `3domfbk/3d-classify-viewer:v1.0.0-beta.10` if using
 the pre-built image.
 
 ```bash
