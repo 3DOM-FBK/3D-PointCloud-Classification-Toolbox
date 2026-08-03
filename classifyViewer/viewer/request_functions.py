@@ -1028,6 +1028,7 @@ def package_download_view(request):
             selected_models   = data.get('models', [])    # list of model names
             project_las       = data.get('las_path')      # e.g. viewer/static/.../features.las
             project_bin       = data.get('bin_path')      # labels_TIMESTAMP.bin from /api/start-training/
+            project_name      = data.get('project_name')  # source point cloud base name
             # Convert relative paths to absolute if needed
             if project_las and not os.path.isabs(project_las):
                 project_las = os.path.join(settings.BASE_DIR, project_las)
@@ -1144,7 +1145,8 @@ def package_download_view(request):
 
             zip_buffer.seek(0)
             response = HttpResponse(zip_buffer.read(), content_type='application/zip')
-            response['Content-Disposition'] = 'attachment; filename="download_package.zip"'
+            safe_project_name = re.sub(r'[^A-Za-z0-9_\-]+', '_', (project_name or '')).strip('_') or 'download'
+            response['Content-Disposition'] = f'attachment; filename="{safe_project_name}_package.zip"'
             print(f"Prepared ZIP with {len(items_to_zip)} items ( {len(selected_point_cloud_files)} segments, {len(selected_models)} models )")
             return response
 

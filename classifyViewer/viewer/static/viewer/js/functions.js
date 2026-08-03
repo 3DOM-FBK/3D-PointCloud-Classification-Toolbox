@@ -1518,6 +1518,7 @@ export function showResetSceneModal() {
                     resetClassRegistry();
                     window.__currentProjectLAS = null;
                     window.__currentProjectBIN = null;
+                    window.__currentProjectName = null;
                     window.__selectedModelPath = null;
                     window.dispatchEvent(new CustomEvent('scene-reset'));
                     completeStep(currentStep);
@@ -1571,6 +1572,12 @@ export function showResetSceneModal() {
 }
 
 export function showDownloadModal() {
+    const projectName = (window.__currentProjectName || 'point_cloud')
+        .toString()
+        .trim()
+        .replace(/[^a-zA-Z0-9_\-]+/g, '_')
+        .replace(/^_+|_+$/g, '') || 'point_cloud';
+
     createModal(
         "Download Data",
         (body) => {
@@ -1604,21 +1611,22 @@ export function showDownloadModal() {
             (async () => {
                 const loading = document.createElement('div');
                 loading.style.cssText = 'font-size:0.78rem; color:var(--text-muted); padding:8px 4px;';
-                loading.textContent = 'Checking predicted output…';
+                loading.textContent = `Checking ${projectName}_predicted output…`; 
                 segScroll.appendChild(loading);
 
                 const candidates = [];
                 const seen = new Set();
                 const addCandidate = (modelName) => {
                     if (!modelName) return;
-                    const relPath = _runtimePath('working', modelName, 'predicted.las');
-                    const publicUrl = _runtimeUrl('working', modelName, 'predicted.las');
+                    const predictedName = `${projectName}_predicted.las`;
+                    const relPath = _runtimePath('working', modelName, predictedName);
+                    const publicUrl = _runtimeUrl('working', modelName, predictedName);
                     if (seen.has(relPath)) return;
                     seen.add(relPath);
                     candidates.push({
                         path: relPath,
                         publicUrl,
-                        label: 'predicted.las',
+                        label: predictedName,
                         modelName,
                     });
                 };
@@ -1657,7 +1665,7 @@ export function showDownloadModal() {
                 if (availableFiles.length === 0) {
                     const empty = document.createElement('div');
                     empty.style.cssText = 'font-size:0.78rem; color:var(--text-muted); padding:8px 4px;';
-                    empty.textContent = 'No predicted.las found.';
+                    empty.textContent = `No ${projectName}_predicted.las found.`;
                     segScroll.appendChild(empty);
                     return;
                 }
@@ -1783,7 +1791,8 @@ export function showDownloadModal() {
                             segments: [],
                             point_cloud_files: pointCloudFiles,
                             models,
-                            las_path: window.__currentProjectLAS
+                            las_path: window.__currentProjectLAS,
+                            project_name: projectName
                         })
                     });
 
@@ -1798,7 +1807,7 @@ export function showDownloadModal() {
 
                     // Extract filename from Content-Disposition if present
                     const disposition = response.headers.get('Content-Disposition');
-                    let filename = 'download_package.zip';
+                    let filename = `${projectName}_package.zip`;
                     if (disposition && disposition.includes('filename=')) {
                         filename = disposition.split('filename=')[1]
                             .split(';')[0]
@@ -2169,6 +2178,7 @@ export function showLoadModal() {
                     activateStep(2);
                     const filename = file.name;
                     const extension = filename.split('.').pop().toLowerCase();
+                    const projectBaseName = filename.replace(/\.[^.]+$/, '') || filename;
                     const inputPath = _runtimePath('working', filename);
                     let lasPath = _runtimePath('working', 'features.las');
                     const subsampleEnabled = Boolean(subToggle?.checked) && extension !== 'glb';
@@ -2335,6 +2345,7 @@ export function showLoadModal() {
                     resetClassRegistry();
                     window.__currentProjectLAS = null;
                     window.__currentProjectBIN = null;
+                    window.__currentProjectName = null;
                     window.__selectedModelPath = null;
                     window.dispatchEvent(new CustomEvent('scene-reset'));
 
@@ -2353,6 +2364,7 @@ export function showLoadModal() {
                     // Store for download logic
                     window.__currentProjectLAS = _runtimePath('working', 'features.las');
                     window.__currentProjectBIN = _runtimePath('working', 'features.pcbin');
+                    window.__currentProjectName = projectBaseName;
 
                     // Load feature bin if available (populated by Calculate Features)
                     try {
@@ -4783,7 +4795,12 @@ export async function showClassifyModal(scene) {
                 const modelDir = modelPath.replace(/\/model\.pkl$/, '');
                 const modelName = modelDir.split('/').pop();
                 const classifyWorkingDir = _runtimePath('working', modelName, 'classify_working/');
-                const outputClassifyName = _runtimePath('working', modelName, 'predicted.las');
+                const projectName = (window.__currentProjectName || 'point_cloud')
+                    .toString()
+                    .trim()
+                    .replace(/[^a-zA-Z0-9_\-]+/g, '_')
+                    .replace(/^_+|_+$/g, '') || 'point_cloud';
+                const outputClassifyName = _runtimePath('working', modelName, `${projectName}_predicted.las`);
                 const needsSplit = splitValue !== '__full__';
 
                 // ── Read model metadata to get the feature list ────────────────
