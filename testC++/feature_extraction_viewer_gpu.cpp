@@ -347,6 +347,7 @@ int main(int argc, char** argv)
 
     // Decode all raw points
     std::vector<RawPoint> allPoints(N);
+    std::vector<double> allXYZ((size_t)N * 3);
 
     bool isNewFormat = (hdr.point_fmt >= 6);
     bool hasRGB = (hdr.point_fmt == 2 || hdr.point_fmt == 3 || hdr.point_fmt == 5 ||
@@ -425,6 +426,10 @@ int main(int argc, char** argv)
         rp.y = iy * hdr.scaleY + hdr.offY;
         rp.z = iz * hdr.scaleZ + hdr.offZ;
 
+        allXYZ[(size_t)pi * 3 + 0] = rp.x;
+        allXYZ[(size_t)pi * 3 + 1] = rp.y;
+        allXYZ[(size_t)pi * 3 + 2] = rp.z;
+
         uint16_t rawIntensity;
         std::memcpy(&rawIntensity, rec + 12, 2);
         rp.intensity = (float)rawIntensity;
@@ -478,6 +483,16 @@ int main(int argc, char** argv)
 
     std::cout << "Decode + distribute: " << elapsed(t_decode) << "s" << std::endl;
 
+    std::cout << "Uploading XYZ cloud to GPU..." << std::flush;
+    auto t_upload_gpu = now_t();
+    if (initGpuPointCloud(allXYZ.data(), N) != 0) {
+        std::cerr << " failed." << std::endl;
+        return 1;
+    }
+    std::cout << " done (" << elapsed(t_upload_gpu) << "s)" << std::endl;
+    allXYZ.clear();
+    allXYZ.shrink_to_fit();
+
     // Free raw binary data
     rawData.clear();
     rawData.shrink_to_fit();
@@ -502,34 +517,12 @@ int main(int argc, char** argv)
 
             int tileN = (int)indices.size();
 
-            // Prepare GPU input arrays
-            std::vector<double> h_xyz(tileN * 3);
             std::vector<int>   h_isCore(tileN, 0);
             int coreCount = 0;
 
-            for (int j = 0; j < tileN; j++) {
-                const RawPoint& rp = allPoints[indices[j]];
-                // Use absolute coordinates in double precision
-                h_xyz[j * 3 + 0] = rp.x;
-                h_xyz[j * 3 + 1] = rp.y;
-                h_xyz[j * 3 + 2] = rp.z;
-
-                bool isLastX = (tix == gnx - 1);
-                bool isLastY = (tiy == gny - 1);
-                bool inX = (rp.x >= tx0 && (isLastX ? rp.x <= tx1 + 1e-9 : rp.x < tx1));
-                bool inY = (rp.y >= ty0 && (isLastY ? rp.y <= ty1 + 1e-9 : rp.y < ty1));
-
-                if (inX && inY) {
-                    h_isCore[j] = 1;
-                    coreCount++;
-                }
-            }
-
-            if (coreCount == 0) continue;
-
-            tilesProcessed++;
-            std::cout << "Tile [" << tix << "," << tiy << "] "
-                      << coreCount << " core / " << tileN << " total" << std::flush;
+            int tileProgress = tix * gny + tiy + 1;  // 1..numTiles
+            // std::cout << "\rTile [" << tileProgress << "/" << numTiles << "] "
+            //         << tileN << " total" << std::flush;
 
             // Allocate feature output
             size_t featureSize = (size_t)GPU_F_COUNT * scalesCount * tileN;
@@ -543,8 +536,30 @@ int main(int argc, char** argv)
             params.gridCellSize = maxScale;
 
             auto t_gpu = now_t();
-            int gpuErr = computeFeaturesGPU(h_xyz.data(), h_isCore.data(), params, h_features.data());
+            int gpuErr = computeFeaturesGPUFromTileIndices(
+                indices.data(),
+                tileN,
+                tix,
+                tiy,
+                gnx,
+                gny,
+                tx0,
+                tx1,
+                ty0,
+                ty1,
+                params,
+                h_isCore.data(),
+                &coreCount,
+                h_features.data()
+            );
             double gpuTime = elapsed(t_gpu);
+
+            if (coreCount == 0) continue;
+
+            tilesProcessed++;
+
+            std::cout << "\rTile [" << tileProgress << "/" << numTiles << "] "
+                      << coreCount << " core / " << tileN << " total" << std::flush;
 
             if (gpuErr != 0) {
                 std::cerr << " GPU ERROR! Skipping tile." << std::endl;
@@ -608,6 +623,8 @@ int main(int argc, char** argv)
             indices.shrink_to_fit();
         }
     }
+
+    releaseGpuPointCloud();
 
     std::cout << "Compute + write: " << elapsed(t_compute) << "s" << std::endl;
 

@@ -229,16 +229,16 @@ void computeShapeFeatures(int pt_idx,
             kdTree->nearestKSearch(pcl_in->points[pt_idx], (int)(scales[i] * 8), neighborsIndices, neighborsDistances);
 
         if (neighborsIndices.size() >= 3) {
-            float zMin = pcl_in->points[neighborsIndices[0]].z;
-            float zMax = zMin;
+            float yMin = pcl_in->points[neighborsIndices[0]].y;
+            float yMax = yMin;
             for (size_t n = 1; n < neighborsIndices.size(); ++n) {
-                float zz = pcl_in->points[neighborsIndices[n]].z;
-                if (zz < zMin) zMin = zz;
-                if (zz > zMax) zMax = zz;
+                float yy = pcl_in->points[neighborsIndices[n]].y;
+                if (yy < yMin) yMin = yy;
+                if (yy > yMax) yMax = yy;
             }
-            pcl_in->points[pt_idx].verticalRange[i] = zMax - zMin;
-            pcl_in->points[pt_idx].heightAbove[i]   = zMax - pcl_in->points[pt_idx].z;
-            pcl_in->points[pt_idx].heightBelow[i]   = pcl_in->points[pt_idx].z - zMin;
+            pcl_in->points[pt_idx].verticalRange[i] = yMax - yMin;
+            pcl_in->points[pt_idx].heightAbove[i]   = yMax - pcl_in->points[pt_idx].y;
+            pcl_in->points[pt_idx].heightBelow[i]   = pcl_in->points[pt_idx].y - yMin;
 
             PCA.setIndices(std::make_shared<std::vector<int>>(neighborsIndices));
             eigenvalues  = PCA.getEigenValues();
@@ -254,9 +254,9 @@ void computeShapeFeatures(int pt_idx,
             pcl_in->points[pt_idx].anisotropy[i]        = (e0 - e2) / e0;
             pcl_in->points[pt_idx].sphericity[i]        = e2 / e0;
 
-            Eigen::Vector3d Z(0.0, 0.0, 1.0), e3;
+            Eigen::Vector3d Y(0.0, 1.0, 0.0), e3;
             GetEigenVector(eigenvectors, 2, e3.data());
-            pcl_in->points[pt_idx].verticality[i] = 1.0 - std::abs(Z.dot(e3));
+            pcl_in->points[pt_idx].verticality[i] = 1.0 - std::abs(Y.dot(e3));
         }
     }
 }

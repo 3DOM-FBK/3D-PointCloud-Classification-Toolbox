@@ -9,6 +9,21 @@
 #include <thrust/transform.h>
 #include <thrust/functional.h>
 
+// Persistent point cloud buffers used by the tile-index workflow.
+static double* s_d_all_xyz = nullptr;
+static uint64_t s_total_points = 0;
+
+struct TilePrepParams {
+    int tix;
+    int tiy;
+    int gnx;
+    int gny;
+    double tx0;
+    double tx1;
+    double ty0;
+    double ty1;
+};
+
 // ============================================================
 // Error checking macro
 // ============================================================
@@ -159,6 +174,55 @@ __global__ void findCellBoundsKernel(
     }
 }
 
+// Kernel: reorder xyz using sorted indices (fully on GPU).
+__global__ void reorderXyzKernel(
+    const double* __restrict__ xyzIn,
+    const int* __restrict__ sortedIdx,
+    int N,
+    double* __restrict__ xyzOut)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    int src = sortedIdx[idx];
+    xyzOut[idx * 3 + 0] = xyzIn[src * 3 + 0];
+    xyzOut[idx * 3 + 1] = xyzIn[src * 3 + 1];
+    xyzOut[idx * 3 + 2] = xyzIn[src * 3 + 2];
+}
+
+// Kernel: gather tile-local xyz from global point cloud and mark core points.
+__global__ void prepareTileInputsKernel(
+    const double* __restrict__ all_xyz,
+    const uint64_t* __restrict__ tileIndices,
+    int tileN,
+    TilePrepParams tp,
+    double* __restrict__ tile_xyz,
+    int* __restrict__ tile_isCore,
+    int* __restrict__ coreCount)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= tileN) return;
+
+    uint64_t pi = tileIndices[j];
+    double x = all_xyz[pi * 3 + 0];
+    double y = all_xyz[pi * 3 + 1];
+    double z = all_xyz[pi * 3 + 2];
+
+    tile_xyz[j * 3 + 0] = x;
+    tile_xyz[j * 3 + 1] = y;
+    tile_xyz[j * 3 + 2] = z;
+
+    bool isLastX = (tp.tix == tp.gnx - 1);
+    bool isLastY = (tp.tiy == tp.gny - 1);
+    bool inX = (x >= tp.tx0 && (isLastX ? x <= tp.tx1 + 1e-9 : x < tp.tx1));
+    bool inY = (y >= tp.ty0 && (isLastY ? y <= tp.ty1 + 1e-9 : y < tp.ty1));
+    int core = (inX && inY) ? 1 : 0;
+    tile_isCore[j] = core;
+
+    if (core) {
+        atomicAdd(coreCount, 1);
+    }
+}
+
 // ============================================================
 // Main feature computation kernel
 // ============================================================
@@ -204,7 +268,7 @@ __global__ void computeFeaturesKernel(
         double sumX = 0, sumY = 0, sumZ = 0;
         double sumXX = 0, sumXY = 0, sumXZ = 0;
         double sumYY = 0, sumYZ = 0, sumZZ = 0;
-        double zMin = pz, zMax = pz;
+        double yMin = py, yMax = py;
         int count = 0;
 
         for (int dz = -cellRange; dz <= cellRange; dz++) {
@@ -239,8 +303,8 @@ __global__ void computeFeaturesKernel(
                             sumX += dx_rel; sumY += dy_rel; sumZ += dz_rel;
                             sumXX += dx_rel*dx_rel; sumXY += dx_rel*dy_rel; sumXZ += dx_rel*dz_rel;
                             sumYY += dy_rel*dy_rel; sumYZ += dy_rel*dz_rel; sumZZ += dz_rel*dz_rel;
-                            if (qz < zMin) zMin = qz;
-                            if (qz > zMax) zMax = qz;
+                            if (qy < yMin) yMin = qy;
+                            if (qy > yMax) yMax = qy;
                             count++;
                         }
                     }
@@ -261,9 +325,9 @@ __global__ void computeFeaturesKernel(
         }
 
         // Vertical stats
-        features[GPU_F_VERTICAL_RANGE * numScales * N + base] = (float)(zMax - zMin);
-        features[GPU_F_HEIGHT_ABOVE   * numScales * N + base] = (float)(zMax - pz);
-        features[GPU_F_HEIGHT_BELOW   * numScales * N + base] = (float)(pz - zMin);
+        features[GPU_F_VERTICAL_RANGE * numScales * N + base] = (float)(yMax - yMin);
+        features[GPU_F_HEIGHT_ABOVE   * numScales * N + base] = (float)(yMax - py);
+        features[GPU_F_HEIGHT_BELOW   * numScales * N + base] = (float)(py - yMin);
 
         // Covariance matrix
         double inv_n = 1.0 / (double)count;
@@ -293,31 +357,33 @@ __global__ void computeFeaturesKernel(
         features[GPU_F_ANISOTROPY        * numScales * N + base] = (float)((e0 - e2) / e0);
         features[GPU_F_SPHERICITY        * numScales * N + base] = (float)(e2 / e0);
 
-        // Verticality: 1 - |Z · e3|  where e3 is smallest eigenvector
-        features[GPU_F_VERTICALITY * numScales * N + base] = (float)(1.0 - fabs(v2z));
+        // Verticality (Y-up): 1 - |Y · e3| where e3 is smallest eigenvector
+        features[GPU_F_VERTICALITY * numScales * N + base] = (float)(1.0 - fabs(v2y));
     }
 }
 
 
-// ============================================================
-// Host function: computeFeaturesGPU
-// ============================================================
-int computeFeaturesGPU(
-    const double* h_xyz,
-    const int*    h_isCore,
+static int runFeaturePipelineFromDeviceInputs(
+    const double* d_xyz,
+    const int* d_isCore,
     const GpuFeatureParams& params,
-    float*        h_features)
+    float* h_features)
 {
-    // Clear any stale CUDA error from previous calls in the same process.
-    (void)cudaGetLastError();
-
     int N = params.numPoints;
     if (N == 0) return 0;
 
     int numScales = params.numScales;
+    if (numScales <= 0 || numScales > 10) {
+        fprintf(stderr, "Invalid numScales: %d\n", numScales);
+        return -1;
+    }
+
     size_t featureSize = (size_t)GPU_F_COUNT * numScales * N;
 
-    // ---- Compute grid dimensions ----
+    // Bounding box on host from device xyz (one copy per tile).
+    std::vector<double> h_xyz_local((size_t)N * 3);
+    CUDA_CHECK(cudaMemcpy(h_xyz_local.data(), d_xyz, (size_t)N * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+
     float maxScale = 0;
     float minScale = params.scales[0];
     for (int i = 0; i < numScales; i++) {
@@ -325,19 +391,16 @@ int computeFeaturesGPU(
         minScale = fminf(minScale, params.scales[i]);
     }
 
-    // Use the smallest scale as cell size so that cellRange = ceil(radius / cellSize)
-    // gives the correct number of cells to search for every scale.
-    // Using maxScale here caused cellRange = 1 for all smaller scales, making the
-    // effective search radius up to 2*maxScale instead of the requested radius.
     double cellSize = (double)minScale;
     double invCell = 1.0 / cellSize;
 
-    // Find bounding box
-    double minX = h_xyz[0], maxX = h_xyz[0];
-    double minY = h_xyz[1], maxY = h_xyz[1];
-    double minZ = h_xyz[2], maxZ = h_xyz[2];
+    double minX = h_xyz_local[0], maxX = h_xyz_local[0];
+    double minY = h_xyz_local[1], maxY = h_xyz_local[1];
+    double minZ = h_xyz_local[2], maxZ = h_xyz_local[2];
     for (int i = 0; i < N; i++) {
-        double x = h_xyz[i*3+0], y = h_xyz[i*3+1], z = h_xyz[i*3+2];
+        double x = h_xyz_local[i * 3 + 0];
+        double y = h_xyz_local[i * 3 + 1];
+        double z = h_xyz_local[i * 3 + 2];
         minX = fmin(minX, x); maxX = fmax(maxX, x);
         minY = fmin(minY, y); maxY = fmax(maxY, y);
         minZ = fmin(minZ, z); maxZ = fmax(maxZ, z);
@@ -346,8 +409,6 @@ int computeFeaturesGPU(
     GridParams gp;
     gp.cellSize = cellSize;
     gp.invCellSize = invCell;
-    // Increase padding to ensure points at the very edge are not subject to rounding issues
-    // into invalid cells. We use 2*cellSize padding.
     gp.minX = minX - 2.0 * cellSize;
     gp.minY = minY - 2.0 * cellSize;
     gp.minZ = minZ - 2.0 * cellSize;
@@ -356,48 +417,38 @@ int computeFeaturesGPU(
     gp.gridDimZ = (int)ceil((maxZ - gp.minZ) / cellSize) + 3;
     gp.totalCells = gp.gridDimX * gp.gridDimY * gp.gridDimZ;
 
-    // Cap grid cells to prevent OOM (if point cloud is very tall/wide)
     if (gp.totalCells > 50000000) {
         fprintf(stderr, "GPU grid too large (%d cells). Increase cell size.\n", gp.totalCells);
         return -1;
     }
 
-    // ---- Allocate GPU memory ----
-    double* d_xyz = nullptr;
-    int*   d_isCore = nullptr;
-    int*   d_cellIds = nullptr;
-    int*   d_sortedIdx = nullptr;
-    int*   d_cellStart = nullptr;
-    int*   d_cellEnd = nullptr;
+    int* d_cellIds = nullptr;
+    int* d_sortedIdx = nullptr;
+    int* d_cellStart = nullptr;
+    int* d_cellEnd = nullptr;
     float* d_scales = nullptr;
     float* d_features = nullptr;
+    double* d_xyz_sorted = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_xyz,       N * 3 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_isCore,    N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_cellIds,   N * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_cellIds, N * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_sortedIdx, N * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_cellStart, gp.totalCells * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_cellEnd,   gp.totalCells * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_scales,    numScales * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_features,  featureSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_cellStart, (size_t)gp.totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_cellEnd, (size_t)gp.totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_scales, numScales * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_features, featureSize * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_xyz_sorted, (size_t)N * 3 * sizeof(double)));
 
-    // ---- Copy data to GPU ----
-    CUDA_CHECK(cudaMemcpy(d_xyz,    h_xyz,         N * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_isCore, h_isCore,      N * sizeof(int),      cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_scales, params.scales,  numScales * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_features,  0, featureSize * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_cellStart, 0xFF, gp.totalCells * sizeof(int))); // -1 sentinel
-    CUDA_CHECK(cudaMemset(d_cellEnd,   0,    gp.totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_scales, params.scales, numScales * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_features, 0, featureSize * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_cellStart, 0xFF, (size_t)gp.totalCells * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_cellEnd, 0, (size_t)gp.totalCells * sizeof(int)));
 
-    int blockSize = 256;
-    int gridSize = (N + blockSize - 1) / blockSize;
+    const int blockSize = 256;
+    const int gridSize = (N + blockSize - 1) / blockSize;
 
-    // ---- Step 1: Compute cell IDs ----
     calcCellIdsKernel<<<gridSize, blockSize>>>(d_xyz, N, gp, d_cellIds);
     CUDA_CHECK(cudaGetLastError());
 
-    // ---- Step 2: Sort points by cell ID ----
-    // Create index array
     {
         thrust::device_ptr<int> dp_cellIds(d_cellIds);
         thrust::device_ptr<int> dp_sortedIdx(d_sortedIdx);
@@ -405,30 +456,12 @@ int computeFeaturesGPU(
         thrust::sort_by_key(dp_cellIds, dp_cellIds + N, dp_sortedIdx);
     }
 
-    // Step 2b: Reorder xyz by sorted index (Host-side fallback for simplicity/portability)
-    double* d_xyz_sorted = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_xyz_sorted, N * 3 * sizeof(double)));
-    {
-        std::vector<double> h_xyz_copy(N * 3);
-        std::vector<int>   h_sorted_idx(N);
-        CUDA_CHECK(cudaMemcpy(h_xyz_copy.data(), d_xyz, N * 3 * sizeof(double), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_sorted_idx.data(), d_sortedIdx, N * sizeof(int), cudaMemcpyDeviceToHost));
+    reorderXyzKernel<<<gridSize, blockSize>>>(d_xyz, d_sortedIdx, N, d_xyz_sorted);
+    CUDA_CHECK(cudaGetLastError());
 
-        std::vector<double> h_xyz_sorted(N * 3);
-        for (int i = 0; i < N; i++) {
-            int si = h_sorted_idx[i];
-            h_xyz_sorted[i * 3 + 0] = h_xyz_copy[si * 3 + 0];
-            h_xyz_sorted[i * 3 + 1] = h_xyz_copy[si * 3 + 1];
-            h_xyz_sorted[i * 3 + 2] = h_xyz_copy[si * 3 + 2];
-        }
-        CUDA_CHECK(cudaMemcpy(d_xyz_sorted, h_xyz_sorted.data(), N * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    }
-
-    // ---- Step 3: Find cell boundaries ----
     findCellBoundsKernel<<<gridSize, blockSize>>>(d_cellIds, N, d_cellStart, d_cellEnd);
     CUDA_CHECK(cudaGetLastError());
 
-    // ---- Step 4: Compute features ----
     computeFeaturesKernel<<<gridSize, blockSize>>>(
         d_xyz_sorted, d_sortedIdx, d_isCore, N,
         numScales, d_scales, gp,
@@ -437,19 +470,154 @@ int computeFeaturesGPU(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // ---- Copy results back ----
     CUDA_CHECK(cudaMemcpy(h_features, d_features, featureSize * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // ---- Cleanup ----
-    cudaFree(d_xyz);
-    cudaFree(d_xyz_sorted);
-    cudaFree(d_isCore);
     cudaFree(d_cellIds);
     cudaFree(d_sortedIdx);
     cudaFree(d_cellStart);
     cudaFree(d_cellEnd);
     cudaFree(d_scales);
     cudaFree(d_features);
-
+    cudaFree(d_xyz_sorted);
     return 0;
+}
+
+int initGpuPointCloud(const double* h_all_xyz, uint64_t totalPoints)
+{
+    releaseGpuPointCloud();
+    if (!h_all_xyz || totalPoints == 0) return -1;
+    if (totalPoints > (uint64_t)INT32_MAX) {
+        fprintf(stderr, "Point count too large for current GPU path: %llu\n", (unsigned long long)totalPoints);
+        return -1;
+    }
+
+    const size_t bytes = (size_t)totalPoints * 3 * sizeof(double);
+    CUDA_CHECK(cudaMalloc(&s_d_all_xyz, bytes));
+    CUDA_CHECK(cudaMemcpy(s_d_all_xyz, h_all_xyz, bytes, cudaMemcpyHostToDevice));
+    s_total_points = totalPoints;
+    return 0;
+}
+
+void releaseGpuPointCloud()
+{
+    if (s_d_all_xyz) {
+        cudaFree(s_d_all_xyz);
+        s_d_all_xyz = nullptr;
+    }
+    s_total_points = 0;
+}
+
+int computeFeaturesGPUFromTileIndices(
+    const uint64_t* h_indices,
+    int tilePointCount,
+    int tix,
+    int tiy,
+    int gnx,
+    int gny,
+    double tx0,
+    double tx1,
+    double ty0,
+    double ty1,
+    const GpuFeatureParams& params,
+    int* h_isCore_out,
+    int* outCoreCount,
+    float* h_features)
+{
+    (void)cudaGetLastError();
+
+    if (!s_d_all_xyz || s_total_points == 0) {
+        fprintf(stderr, "GPU point cloud not initialized. Call initGpuPointCloud first.\n");
+        return -1;
+    }
+    if (!h_indices || tilePointCount <= 0 || !h_isCore_out || !outCoreCount || !h_features) {
+        return -1;
+    }
+
+    uint64_t* d_indices = nullptr;
+    double* d_tile_xyz = nullptr;
+    int* d_tile_isCore = nullptr;
+    int* d_coreCount = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_indices, (size_t)tilePointCount * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_tile_xyz, (size_t)tilePointCount * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_tile_isCore, (size_t)tilePointCount * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_coreCount, sizeof(int)));
+
+    CUDA_CHECK(cudaMemcpy(d_indices, h_indices, (size_t)tilePointCount * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_tile_isCore, 0, (size_t)tilePointCount * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_coreCount, 0, sizeof(int)));
+
+    TilePrepParams tp;
+    tp.tix = tix;
+    tp.tiy = tiy;
+    tp.gnx = gnx;
+    tp.gny = gny;
+    tp.tx0 = tx0;
+    tp.tx1 = tx1;
+    tp.ty0 = ty0;
+    tp.ty1 = ty1;
+
+    const int blockSize = 256;
+    const int gridSize = (tilePointCount + blockSize - 1) / blockSize;
+    prepareTileInputsKernel<<<gridSize, blockSize>>>(
+        s_d_all_xyz,
+        d_indices,
+        tilePointCount,
+        tp,
+        d_tile_xyz,
+        d_tile_isCore,
+        d_coreCount);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(outCoreCount, d_coreCount, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_isCore_out, d_tile_isCore, (size_t)tilePointCount * sizeof(int), cudaMemcpyDeviceToHost));
+
+    if (*outCoreCount == 0) {
+        cudaFree(d_indices);
+        cudaFree(d_tile_xyz);
+        cudaFree(d_tile_isCore);
+        cudaFree(d_coreCount);
+        return 0;
+    }
+
+    GpuFeatureParams tileParams = params;
+    tileParams.numPoints = tilePointCount;
+    int rc = runFeaturePipelineFromDeviceInputs(d_tile_xyz, d_tile_isCore, tileParams, h_features);
+
+    cudaFree(d_indices);
+    cudaFree(d_tile_xyz);
+    cudaFree(d_tile_isCore);
+    cudaFree(d_coreCount);
+    return rc;
+}
+
+// ============================================================
+// Backward-compatible API: host-prepared xyz/isCore
+// ============================================================
+int computeFeaturesGPU(
+    const double* h_xyz,
+    const int*    h_isCore,
+    const GpuFeatureParams& params,
+    float*        h_features)
+{
+    (void)cudaGetLastError();
+
+    int N = params.numPoints;
+    if (N == 0) return 0;
+    if (!h_xyz || !h_isCore || !h_features) return -1;
+
+    double* d_xyz = nullptr;
+    int* d_isCore = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_xyz, (size_t)N * 3 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_isCore, (size_t)N * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_xyz, h_xyz, (size_t)N * 3 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_isCore, h_isCore, (size_t)N * sizeof(int), cudaMemcpyHostToDevice));
+
+    int rc = runFeaturePipelineFromDeviceInputs(d_xyz, d_isCore, params, h_features);
+
+    cudaFree(d_xyz);
+    cudaFree(d_isCore);
+    return rc;
 }

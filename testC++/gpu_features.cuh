@@ -43,3 +43,34 @@ int computeFeaturesGPU(
     const GpuFeatureParams& params,
     float*        h_features
 );
+
+// Upload full point cloud XYZ once and keep it resident on GPU.
+// h_all_xyz layout: [x0,y0,z0, x1,y1,z1, ...], size = 3 * totalPoints
+// Returns 0 on success, non-zero on error.
+int initGpuPointCloud(const double* h_all_xyz, uint64_t totalPoints);
+
+// Release persistent GPU point cloud buffers allocated by initGpuPointCloud().
+void releaseGpuPointCloud();
+
+// Build tile-local xyz/core arrays on GPU from tile indices, then compute features on GPU.
+// h_indices: tile-local list of global point indices (size tilePointCount)
+// h_isCore_out: output mask per tile point (1 core, 0 buffer-only), size tilePointCount
+// outCoreCount: number of core points in the tile
+// h_features: output host array, size = GPU_F_COUNT * numScales * tilePointCount
+// Returns 0 on success, non-zero on error.
+int computeFeaturesGPUFromTileIndices(
+    const uint64_t* h_indices,
+    int tilePointCount,
+    int tix,
+    int tiy,
+    int gnx,
+    int gny,
+    double tx0,
+    double tx1,
+    double ty0,
+    double ty1,
+    const GpuFeatureParams& params,
+    int* h_isCore_out,
+    int* outCoreCount,
+    float* h_features
+);
