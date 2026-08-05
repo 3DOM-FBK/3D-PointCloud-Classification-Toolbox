@@ -583,7 +583,7 @@ int main(int argc, char** argv)
             int coreCount = 0;
 
             int tileProgress = tix * gny + tiy + 1;  // 1..numTiles
-            std::cout << "\rTile [" << tileProgress << "/" << numTiles << "]:   " << std::flush;
+            std::cout << "\nTile [ " << tileProgress << " / " << numTiles << " ]:" << std::endl;
 
             // Allocate feature output
             size_t featureSize = (size_t)GPU_F_COUNT * scalesCount * tileN;
@@ -616,19 +616,19 @@ int main(int argc, char** argv)
             double gpuTime = elapsed(t_gpu);
 
             if (coreCount == 0) {
-                std::cout << "0 core / " << tileN << " total (buffer-only, skipped)" << std::endl;
+                std::cout << "- 0 core / " << tileN << " total (buffer-only, skipped)" << std::endl;
                 continue;
             }
 
 
             if (gpuErr != 0) {
-                std::cerr << coreCount << " core / " << tileN << " total GPU ERROR! Skipping tile." << std::endl;
+                std::cerr << "- " << coreCount << " core / " << tileN << " total GPU ERROR! Skipping tile." << std::endl;
                 continue;
             }
 
             tilesProcessed++;
 
-            std::cout << coreCount << " core / " << tileN << " total GPU: " << gpuTime << "s" << std::endl;
+            std::cout << "- " << coreCount << " core / " << tileN << " total, GPU time: " << gpuTime << "s" << std::endl;
 
             // Write core points to output
             std::vector<uint8_t> rec_buf(REC_LEN, 0);
