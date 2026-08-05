@@ -35,6 +35,10 @@ float color_bitter = 256.0f / 65536.0f;
 // Tiling settings
 double TILE_SIZE   = 50.0;
 double BUFFER_SIZE = 4.0;
+int TARGET_TILES   = 16;
+
+struct LasHeaderInfo;
+static double computeDynamicTileSizeFromBbox(const LasHeaderInfo& hdr, double bufferSize, int targetTiles);
 
 // ============================================================
 // Feature definitions
@@ -94,6 +98,34 @@ struct LasHeaderInfo {
     double   minx = 0, maxx = 0, miny = 0, maxy = 0, minz = 0, maxz = 0;
     int      base_size = 0;
 };
+
+static double computeDynamicTileSizeFromBbox(const LasHeaderInfo& hdr, double bufferSize, int targetTiles)
+{
+    double spanX = std::max(0.0, hdr.maxx - hdr.minx);
+    double spanY = std::max(0.0, hdr.maxy - hdr.miny);
+
+    if (spanX == 0.0 && spanY == 0.0) {
+        return std::max(1.0, 2.0 * bufferSize);
+    }
+
+    if (targetTiles < 1) targetTiles = 1;
+
+    double safeSpanX = std::max(spanX, 1e-9);
+    double safeSpanY = std::max(spanY, 1e-9);
+    double aspect = safeSpanX / safeSpanY;
+
+    int targetNx = std::max(1, (int)std::round(std::sqrt((double)targetTiles * aspect)));
+    int targetNy = std::max(1, (int)std::ceil((double)targetTiles / targetNx));
+
+    double tileSizeX = safeSpanX / targetNx;
+    double tileSizeY = safeSpanY / targetNy;
+    double tileSize = std::max(tileSizeX, tileSizeY);
+
+    // Keep a soft lower bound only to avoid pathological tiny tiles.
+    // Using a strict bound tied to buffer can collapse small models to 1x1.
+    double minTileSize = std::max(0.25, 0.5 * bufferSize);
+    return std::max(tileSize, minTileSize);
+}
 
 static const int kLasBaseSizes[] = { 20, 28, 26, 34, 57, 63, 30, 36, 38, 59, 67 };
 
@@ -183,7 +215,8 @@ int main(int argc, char** argv)
         std::cout << "\nUsage: " << argv[0] << " <input_file> <output_file> [options]\n"
                   << "Options:\n"
                   << "  --features f1,f2,...    Comma-separated list of features\n"
-                  << "  --tile_size S           Tile size in meters (default 50)\n"
+                  << "  --tile_size S           Tile size in meters (manual override)\n"
+                  << "  --target_tiles N        Auto-tiling target tile count (default 16)\n"
                   << "  --buffer B              Buffer in meters (default 4)\n"
                   << "  --radius r1,r2,...      Radius scales (default 0.8,1.2,2.0,3.0)\n";
         return 0;
@@ -193,6 +226,7 @@ int main(int argc, char** argv)
     const std::string outputFile = argv[2];
     std::set<std::string> requestedFeatures;
     bool useAllFeatures = true;
+    bool manualTileSize = false;
 
     for (int a = 3; a < argc; a++) {
         std::string arg(argv[a]);
@@ -202,6 +236,9 @@ int main(int argc, char** argv)
             useAllFeatures = false;
         } else if (arg == "--tile_size" && a + 1 < argc) {
             TILE_SIZE = std::stod(argv[++a]);
+            manualTileSize = true;
+        } else if (arg == "--target_tiles" && a + 1 < argc) {
+            TARGET_TILES = std::max(1, std::stoi(argv[++a]));
         } else if (arg == "--buffer" && a + 1 < argc) {
             BUFFER_SIZE = std::stod(argv[++a]);
         } else if (arg == "--radius" && a + 1 < argc) {
@@ -237,6 +274,12 @@ int main(int argc, char** argv)
     std::cout << "Bounds: X[" << hdr.minx << ", " << hdr.maxx << "] Y["
               << hdr.miny << ", " << hdr.maxy << "] Z["
               << hdr.minz << ", " << hdr.maxz << "]" << std::endl;
+
+    if (!manualTileSize) {
+        TILE_SIZE = computeDynamicTileSizeFromBbox(hdr, BUFFER_SIZE, TARGET_TILES);
+        std::cout << "Auto tile size from bbox: " << TILE_SIZE
+                  << " (target tiles: " << TARGET_TILES << ")" << std::endl;
+    }
 
     // ------------------------------------------------------------------
     // 2. Build output feature layout (pre-computed offsets)
@@ -338,9 +381,28 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------
     auto t_decode = now_t();
 
-    int gnx = (int)std::ceil((hdr.maxx - hdr.minx) / TILE_SIZE);
-    int gny = (int)std::ceil((hdr.maxy - hdr.miny) / TILE_SIZE);
+    double spanX = std::max(0.0, hdr.maxx - hdr.minx);
+    double spanY = std::max(0.0, hdr.maxy - hdr.miny);
+    int gnx = std::max(1, (int)std::ceil(spanX / TILE_SIZE));
+    int gny = std::max(1, (int)std::ceil(spanY / TILE_SIZE));
     int numTiles = gnx * gny;
+
+    // In auto mode, ensure we don't stay at 1 tile when a multi-tile target is requested.
+    if (!manualTileSize && numTiles == 1 && TARGET_TILES > 1 && (spanX > 0.0 || spanY > 0.0)) {
+        double safeSpanX = std::max(spanX, 1e-9);
+        double safeSpanY = std::max(spanY, 1e-9);
+        double aspect = safeSpanX / safeSpanY;
+
+        int targetNx = std::max(1, (int)std::round(std::sqrt((double)TARGET_TILES * aspect)));
+        int targetNy = std::max(1, (int)std::ceil((double)TARGET_TILES / targetNx));
+
+        gnx = std::max(1, targetNx);
+        gny = std::max(1, targetNy);
+        numTiles = gnx * gny;
+
+        std::cout << "Auto fallback grid override: " << gnx << " x " << gny
+                  << " (target tiles: " << TARGET_TILES << ")" << std::endl;
+    }
     std::cout << "Grid: " << gnx << " x " << gny << " = " << numTiles << " tiles" << std::endl;
 
     std::vector<std::vector<uint64_t>> tileIndices(numTiles);
@@ -521,8 +583,7 @@ int main(int argc, char** argv)
             int coreCount = 0;
 
             int tileProgress = tix * gny + tiy + 1;  // 1..numTiles
-            // std::cout << "\rTile [" << tileProgress << "/" << numTiles << "] "
-            //         << tileN << " total" << std::flush;
+            std::cout << "\rTile [" << tileProgress << "/" << numTiles << "]:   " << std::flush;
 
             // Allocate feature output
             size_t featureSize = (size_t)GPU_F_COUNT * scalesCount * tileN;
@@ -554,19 +615,20 @@ int main(int argc, char** argv)
             );
             double gpuTime = elapsed(t_gpu);
 
-            if (coreCount == 0) continue;
-
-            tilesProcessed++;
-
-            std::cout << "\rTile [" << tileProgress << "/" << numTiles << "] "
-                      << coreCount << " core / " << tileN << " total" << std::flush;
-
-            if (gpuErr != 0) {
-                std::cerr << " GPU ERROR! Skipping tile." << std::endl;
+            if (coreCount == 0) {
+                std::cout << "0 core / " << tileN << " total (buffer-only, skipped)" << std::endl;
                 continue;
             }
 
-            std::cout << " GPU: " << gpuTime << "s" << std::endl;
+
+            if (gpuErr != 0) {
+                std::cerr << coreCount << " core / " << tileN << " total GPU ERROR! Skipping tile." << std::endl;
+                continue;
+            }
+
+            tilesProcessed++;
+
+            std::cout << coreCount << " core / " << tileN << " total GPU: " << gpuTime << "s" << std::endl;
 
             // Write core points to output
             std::vector<uint8_t> rec_buf(REC_LEN, 0);
@@ -626,7 +688,7 @@ int main(int argc, char** argv)
 
     releaseGpuPointCloud();
 
-    std::cout << "Compute + write: " << elapsed(t_compute) << "s" << std::endl;
+    // std::cout << "Compute + write: " << elapsed(t_compute) << "s" << std::endl;
 
     // ------------------------------------------------------------------
     // 7. Patch point count
