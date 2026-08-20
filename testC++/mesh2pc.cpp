@@ -9,6 +9,7 @@
 #include <cstring>
 #include <random>
 #include <unordered_map>
+#include <numeric>
 // CGAL
 #include <CGAL/Simple_cartesian.h>
 #include <CGAL/AABB_tree.h>
@@ -111,6 +112,12 @@ void write_las(const std::string& out_file,
         qmin_z = std::min(qmin_z, qz); qmax_z = std::max(qmax_z, qz);
     }
 
+    // Margine di sicurezza: assorbe il rumore in virgola mobile che PotreeConverter
+    // introduce ricalcolando le coordinate dagli int32, evitando "point outside bounding box".
+    qmin_x -= scale_xyz; qmax_x += scale_xyz;
+    qmin_y -= scale_xyz; qmax_y += scale_xyz;
+    qmin_z -= scale_xyz; qmax_z += scale_xyz;
+
     // Extra bytes: 3 normali + POINT_ID
     uint32_t extra_bytes_payload = 3 * 192 + 192;
     uint16_t header_size    = 227;
@@ -198,6 +205,7 @@ struct GLBMesh {
     std::vector<std::array<int,3>>   faces;
     std::vector<std::array<float,2>> uvs;
     bool has_uvs = false;
+    bool is_point_cloud = false;  // primitive senza triangoli/edge: nuvola di punti gia' pronta
     std::vector<std::array<float,4>> vertex_colors;
     int texture_index = -1;
     std::array<float,3> base_color = {1.0f, 1.0f, 1.0f};
@@ -444,7 +452,13 @@ bool load_glb(const std::string& path,
                 const float* pd = reinterpret_cast<const float*>(pbase + i * pos_stride);
                 m.vertices[i] = transform_position(world_transform, {pd[0], pd[1], pd[2]});
             }
-            if (prim.indices >= 0) {
+
+            int prim_mode = (prim.mode < 0) ? TINYGLTF_MODE_TRIANGLES : prim.mode;
+            m.is_point_cloud = (prim_mode == TINYGLTF_MODE_POINTS);
+
+            if (m.is_point_cloud) {
+                // Nessun triangolo/edge: i vertici sono gia' una nuvola di punti, niente sampling.
+            } else if (prim.indices >= 0) {
                 auto& ia = model.accessors[prim.indices];
                 auto& ibv = model.bufferViews[ia.bufferView];
                 const uint8_t* ibase = model.buffers[ibv.buffer].data.data() + ibv.byteOffset + ia.byteOffset;
@@ -598,6 +612,35 @@ bool load_glb(const std::string& path,
     return true;
 }
 
+// Sceglie k punti senza reinserimento tramite Fisher-Yates parziale; se k >= n restituisce tutto.
+void subsample_points(const std::vector<std::array<double,3>>& pts,
+                       const std::vector<std::array<double,3>>& cols,
+                       size_t k,
+                       std::vector<std::array<double,3>>& out_pts,
+                       std::vector<std::array<double,3>>& out_cols)
+{
+    size_t n = pts.size();
+    if (k >= n) {
+        out_pts = pts;
+        out_cols = cols;
+        return;
+    }
+    std::vector<size_t> idx(n);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::mt19937_64 rng(1234567ULL);
+    for (size_t i = 0; i < k; ++i) {
+        std::uniform_int_distribution<size_t> dist(i, n - 1);
+        size_t j = dist(rng);
+        std::swap(idx[i], idx[j]);
+    }
+    out_pts.resize(k);
+    out_cols.resize(k);
+    for (size_t i = 0; i < k; ++i) {
+        out_pts[i] = pts[idx[i]];
+        out_cols[i] = cols[idx[i]];
+    }
+}
+
 SubMeshResult process_submesh(
     int idx,
     const GLBMesh& mesh,
@@ -722,12 +765,32 @@ int main(int argc, char* argv[]) {
 
     if (!load_glb(mesh_path, meshes, textures, tex_sizes)) return 1;
     std::cout << "Load GLB from " << mesh_path << std::endl;
-    std::cout << "Iterate " << meshes.size()
-              << " submeshes, " << textures.size() << " textures" << std::endl;
+    
 
     if (textures.empty()) {
         textures.push_back({128, 128, 128, 255});
         tex_sizes.push_back({1, 1});
+    }
+
+    // Submesh gia' senza triangoli/edge: e' una nuvola di punti pronta, va copiata cosi' com'e'.
+    std::vector<std::array<double,3>> passthrough_points, passthrough_colors;
+    for (const auto& m : meshes) {
+        if (!m.is_point_cloud) continue;
+        for (size_t i = 0; i < m.vertices.size(); ++i) {
+            passthrough_points.push_back({m.vertices[i][0], m.vertices[i][1], m.vertices[i][2]});
+            if (!m.vertex_colors.empty()) {
+                passthrough_colors.push_back({m.vertex_colors[i][0], m.vertex_colors[i][1], m.vertex_colors[i][2]});
+            } else {
+                passthrough_colors.push_back({(double)m.base_color[0], (double)m.base_color[1], (double)m.base_color[2]});
+            }
+        }
+    }
+    if (!passthrough_points.empty()) {
+        std::cout << "Detected " << passthrough_points.size()
+                  << " points already in point-cloud form" << std::endl;
+    }else {
+        std::cout << "Iterate " << meshes.size() 
+                << " submeshes, " << textures.size() << " textures" << std::endl;
     }
 
     // Distribute samples proportionally to submesh area (only non-empty meshes).
@@ -737,6 +800,7 @@ int main(int argc, char* argv[]) {
     double total_area = 0.0;
     for (int i = 0; i < n_meshes; ++i) {
         const auto& m = meshes[i];
+        if (m.is_point_cloud) continue;
         double a_sum = 0.0;
         for (const auto& f : m.faces) {
             const auto& v0 = m.vertices[f[0]];
@@ -750,18 +814,26 @@ int main(int argc, char* argv[]) {
         total_area += a_sum;
     }
 
-    if (total_area <= 0.0) {
+    double passthrough_weight = (double)passthrough_points.size();
+    double total_weight = total_area + passthrough_weight;
+
+    if (total_weight <= 0.0) {
         std::cerr << "No valid mesh area found for sampling." << std::endl;
         return 1;
     }
 
+    // Il peso della point-cloud passthrough concorre proporzionalmente al target richiesto,
+    // cosi' il numero finale di punti rispetta num_points invece di copiare sempre tutto.
+    int passthrough_target = (int)std::llround((passthrough_weight / total_weight) * (double)num_points);
+    passthrough_target = std::clamp(passthrough_target, 0, (int)passthrough_points.size());
+
     std::vector<int> points_for_mesh(n_meshes, 0);
     std::vector<std::pair<double, int>> remainders;
     remainders.reserve(n_meshes);
-    int assigned = 0;
+    int assigned = passthrough_target;
     for (int i = 0; i < n_meshes; ++i) {
         if (mesh_areas[i] <= 0.0) continue;
-        double exact = (mesh_areas[i] / total_area) * (double)num_points;
+        double exact = (mesh_areas[i] / total_weight) * (double)num_points;
         int base = (int)std::floor(exact);
         points_for_mesh[i] = base;
         assigned += base;
@@ -775,11 +847,17 @@ int main(int argc, char* argv[]) {
         points_for_mesh[remainders[k].second]++;
     }
 
-    int total_assigned = 0;
-    for (int v : points_for_mesh) total_assigned += v;
-    std::cout << "Sampling target: " << num_points
-              << " points (assigned: " << total_assigned << ")" << std::endl;
+    if (passthrough_target < (int)passthrough_points.size()) {
+        std::vector<std::array<double,3>> sampled_points, sampled_colors;
+        std::cout << "Sampling the point-cloud to target: " << num_points << " points" << std::endl;
+        subsample_points(passthrough_points, passthrough_colors, (size_t)passthrough_target, sampled_points, sampled_colors);
+        passthrough_points = std::move(sampled_points);
+        passthrough_colors = std::move(sampled_colors);
+    }
 
+    int total_assigned = passthrough_target;
+    for (int v : points_for_mesh) total_assigned += v;
+   
     std::vector<SubMeshResult> results(n_meshes);
     int omp_threads = std::max(1, std::min(omp_get_max_threads(), n_meshes));
     #pragma omp parallel for num_threads(omp_threads)
@@ -789,8 +867,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "Merging submeshes into final point cloud" << std::endl;
+    if (passthrough_points.empty()) {
+        std::cout << "Merging submeshes into final point cloud" << std::endl;
+    }
     std::vector<std::array<double,3>> all_points, all_colors;
+    all_points.insert(all_points.end(), passthrough_points.begin(), passthrough_points.end());
+    all_colors.insert(all_colors.end(), passthrough_colors.begin(), passthrough_colors.end());
     for (auto& r : results) {
         all_points.insert(all_points.end(), r.points.begin(), r.points.end());
         all_colors.insert(all_colors.end(), r.colors.begin(), r.colors.end());
