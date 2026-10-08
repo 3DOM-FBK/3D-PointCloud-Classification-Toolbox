@@ -177,64 +177,35 @@ ply2las <input.ply> <output.las>
 ## `split_las_by_binary`
 
 **Purpose:** Split a feature LAS file into multiple per-segment output LAS files based
-on annotation data stored in a `.pcbin` binary store. Used to prepare training and
+on annotation data stored in `annotations.bin`. Used to prepare training and
 validation sets.
 
-**Input:** LAS + `.pcbin` annotation store  
+**Input:** LAS + `annotations.bin` (raw buffer, 2 bytes per `POINT_ID`: `segment_id + 1`, `class_id`; see [ARCHITECTURE.md](ARCHITECTURE.md#annotationsbin-format))  
 **Output:** Multiple LAS files (`segment_1.las`, `segment_2.las`, …)
 
 **CLI:**
 
 ```
-split_las_by_binary <features.las> <features.pcbin> <output_dir> [--exclude_unclassified]
+split_las_by_binary <features.las> <annotations.bin> <output_dir> [--exclude-unclassified]
+split_las_by_binary <features.las> <annotations.bin> --extract-segment <seg_id> <out_path>
 ```
 
 | Argument | Description |
 |---|---|
 | `output_dir` | Directory where per-segment LAS files are written |
-| `--exclude_unclassified` | If set, points with no segment assignment (segment_id = 0xFF) are omitted from output |
+| `--exclude-unclassified` | If set, annotated points with no class (class_id = 0) are omitted from output |
+| `--extract-segment <seg_id> <out_path>` | Write only the points of one segment into a single LAS (no `labels` dimension) |
 
 **Example:**
 
 ```bash
 /webapp/opt/split_las_by_binary \
   runtime_data/working/features.las \
-  runtime_data/working/features.pcbin \
+  runtime_data/working/annotations.bin \
   runtime_data/working/segments
 ```
 
 **Dependencies:** PDAL, PCL, OpenMP.
-
----
-
-## `las_to_feature_bin`
-
-**Purpose:** Pack a feature LAS file (with Extra Bytes) into the compact `.pcbin`
-binary format used by the browser viewer and the annotation store. Reduces disk
-I/O compared to LAS with float32 features (approximately 70% smaller for version-2
-uint8 quantized encoding).
-
-**Input:** LAS with Extra Bytes  
-**Output:** `.pcbin` (version 1: float32 features, or version 2: uint8 quantized)
-
-**CLI:**
-
-```
-las_to_feature_bin <features.las> <output.pcbin>
-```
-
-**Example:**
-
-```bash
-/webapp/opt/las_to_feature_bin \
-  runtime_data/working/features.las \
-  runtime_data/working/features.pcbin
-```
-
-**Dependencies:** PDAL, PCL, OpenMP.
-
-For a description of the `.pcbin` binary format, see
-[ARCHITECTURE.md — `.pcbin` binary format](ARCHITECTURE.md#pcbin-binary-format).
 
 ---
 
@@ -262,3 +233,40 @@ check_point_id <input.las> <output.las>
 ```
 
 **Dependencies:** Open3D 0.19.0.
+
+
+---
+
+## `las2pc`
+
+**Purpose:** Convert the canonical `features.las` into the chunked point cloud geometry
+read by the viewer (`geom.bin`, `point_order.bin`, `meta.json`, see
+[POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)). Runs once at import (and again only if the
+number of points changes). The attribute columns are written afterwards by
+`viewer/utils_functions/pc_columns.py`.
+
+**Input:** LAS 1.x, uncompressed, any point format; `POINT_ID` Extra Byte (uint32) expected  
+**Output:** folder with `geom.bin` (20 B/point), `point_order.bin`, `meta.json` (no columns)
+
+**CLI:**
+
+```
+las2pc --input <features.las> --output <out_dir>
+    [--max-chunk 250000] [--base 3] [--levels 6]
+    [--head-budget 1000000] [--seed 12345]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--max-chunk` | 250000 | Maximum points of a spatial chunk (leaf of the implicit octree) |
+| `--base` | 3 | Level 0 uses a `2^base` grid per side inside the chunk cube |
+| `--levels` | 6 | Number of stratified levels (a last "remainder" level is added) |
+| `--head-budget` | 1000000 | Points of the overview block that is fetched with one Range request |
+| `--seed` | 12345 | Seed of the per-chunk shuffle: the output is deterministic |
+
+**Notes:** the conversion is done in memory (about 32 bytes per point); if it does not fit
+in the available RAM it stops with an explicit error (out-of-core conversion is not
+implemented). The Django backend writes into `pc_tmp/` and swaps it atomically with `pc/`.
+On the 5 M point test cloud it takes about 0.4 s with 8 threads.
+
+**Dependencies:** OpenMP only (no PCL/PDAL/Open3D).

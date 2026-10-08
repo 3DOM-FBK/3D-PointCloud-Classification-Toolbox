@@ -12,12 +12,15 @@ that hosts the Django 3D Classify Viewer application.
 bind = "0.0.0.0:8000"
 
 # Number of worker processes handling requests
-# One worker for a lightweight configuration (development/testing)
+# MUST stay 1: functions.job (JobManager) is a per-process singleton that owns the running
+# subprocess, so /stop_process/ has to reach the same process that started the job.
 workers = 1
 
 # Number of threads per worker
-# 2 threads per worker to handle concurrent requests
-threads = 2
+# Calculation endpoints (feature extraction, RF, conversion) are synchronous and keep a thread busy
+# for the whole job, while the viewer streams the point cloud with up to 6 parallel Range requests
+# (Chrome's per-host limit). 8 threads keep the file serving responsive during long jobs.
+threads = 8
 
 # Request timeout in seconds (0 = disabled)
 # Useful for classification operations that may take a long time

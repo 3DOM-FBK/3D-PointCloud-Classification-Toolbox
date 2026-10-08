@@ -1,5 +1,5 @@
 /**
- * split_las_by_binary.cpp  (v3 — robust single-pass)
+ * split_las_by_binary.cpp  (v4 — annotations.bin, robust single-pass)
  *
  * Key improvements over original:
  * 1. O(N) single-pass: source LAS read once; all segments populated simultaneously.
@@ -139,80 +139,41 @@ static std::vector<ExtraBytesEntry> readExtraBytesVLR(const fs::path& las_path)
 //  Helpers & metadata
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct PointSegmentation {
-    uint32_t point_id;
-    uint8_t  segment_id;
-    uint8_t  class_id;
+// Annotation store (annotations.bin): raw buffer, 2 bytes per POINT_ID
+//   byte[2*pid]   = segment_id + 1   (0 = point not annotated)
+//   byte[2*pid+1] = class_id         (0 = no class assigned)
+struct AnnotationStore {
+    std::vector<uint8_t> raw;
+    uint32_t             pointCount = 0;   // number of POINT_ID slots (raw.size() / 2)
+    size_t               annotated  = 0;   // points with segment assigned
 };
 
-// Read annotation fields (segment_id, manual_class_id) from a .pcbin file.
-// Returns a sparse map keyed by point_id; only points with segment_id != 0xFF are included.
-static std::map<uint32_t, PointSegmentation> read_pcbin_annotations(const fs::path& path)
+// Read annotations.bin into a flat vector (O(1) lookup by POINT_ID).
+static AnnotationStore read_annotations_bin(const fs::path& path)
 {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open .pcbin: " + path.string());
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("Cannot open annotations.bin: " + path.string());
 
-    // ── Read header ───────────────────────────────────────────────────────────
-    char magic[4] = {};
-    f.read(magic, 4);
-    if (std::string(magic, 4) != "PCBN")
-        throw std::runtime_error("Invalid .pcbin magic in: " + path.string());
+    const std::streamsize size = f.tellg();
+    if (size <= 0 || (size % 2) != 0)
+        throw std::runtime_error("Invalid annotations.bin size (" + std::to_string(size) +
+                                 " bytes, expected 2 bytes per point) in: " + path.string());
+    f.seekg(0, std::ios::beg);
 
-    uint8_t  version  = 0;
-    uint8_t  hdr5     = 0;   // byte [5]: bpf for v2, reserved for v1
-    uint8_t  hdr67[2] = {};
-    f.read(reinterpret_cast<char*>(&version), 1);
-    f.read(reinterpret_cast<char*>(&hdr5),    1);
-    f.read(reinterpret_cast<char*>(hdr67),    2);
+    AnnotationStore store;
+    store.raw.resize(static_cast<size_t>(size));
+    f.read(reinterpret_cast<char*>(store.raw.data()), size);
+    if (!f) throw std::runtime_error("Failed reading annotations.bin: " + path.string());
 
-    uint8_t bpf;
-    if (version == 1) {
-        bpf = 4;
-    } else if (version == 2) {
-        bpf = hdr5;
-        if (bpf != 1 && bpf != 4)
-            throw std::runtime_error("Unsupported bytes_per_feature=" +
-                                     std::to_string(bpf) + " in: " + path.string());
-    } else {
-        throw std::runtime_error("Unsupported .pcbin version=" +
-                                 std::to_string(version) + " in: " + path.string());
-    }
+    store.pointCount = static_cast<uint32_t>(store.raw.size() / 2);
+    for (uint32_t pid = 0; pid < store.pointCount; ++pid)
+        if (store.raw[2 * static_cast<size_t>(pid)] != 0) ++store.annotated;
 
-    uint32_t point_count   = 0;
-    uint32_t feature_count = 0;
-    f.read(reinterpret_cast<char*>(&point_count),   4);
-    f.read(reinterpret_cast<char*>(&feature_count), 4);
-
-    const uint32_t F = feature_count;
-    // Skip feature_names (F×32), vmin (F×4), vmax (F×4)
-    f.seekg(static_cast<std::streamoff>(F) * 40, std::ios::cur);
-
-    // ── Read records ──────────────────────────────────────────────────────────
-    // Record layout: F*bpf feature bytes | segment_id | manual_class_id | predicted_class_id | padding | confidence
-    std::map<uint32_t, PointSegmentation> result;
-
-    for (uint32_t pid = 0; pid < point_count; ++pid) {
-        // Skip features (F*bpf bytes)
-        f.seekg(static_cast<std::streamoff>(F) * bpf, std::ios::cur);
-
-        uint8_t seg_id = 0, class_id = 0, pred_id = 0, pad = 0;
-        f.read(reinterpret_cast<char*>(&seg_id),   1);
-        f.read(reinterpret_cast<char*>(&class_id), 1);
-        f.read(reinterpret_cast<char*>(&pred_id),  1);
-        f.read(reinterpret_cast<char*>(&pad),      1);
-        // Skip confidence float (4 bytes)
-        f.seekg(4, std::ios::cur);
-
-        if (!f) break;
-        // Only include points that have been assigned to a segment
-        if (seg_id != 0xFF) {
-            result[pid] = {pid, seg_id, class_id};
-        }
-    }
-
-    std::cout << "  Loaded " << result.size() << " annotated points from .pcbin (N=" << point_count << ", F=" << F << ").\n";
-    return result;
+    std::cout << "  Loaded " << store.annotated << " annotated points from annotations.bin (N="
+              << store.pointCount << ").\n";
+    return store;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Type-safe field copy  (native type preserved — no intermediate double cast)
@@ -479,23 +440,23 @@ static void writeOutput(SegmentOutput& out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Core: single-pass O(N) distribution using pcbin annotations
+//  Core: single-pass O(N) distribution using annotations.bin
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void processPointsFromMapping(
         const pdal::PointViewPtr&                         srcView,
-        const std::map<uint32_t, PointSegmentation>&      mapping,
+        const AnnotationStore&                            annotations,
         std::map<int, std::unique_ptr<SegmentOutput>>&    outputs,
         bool                                              addLabels,
         bool                                              excludeUnclassified = false)
 {
     const size_t nPts = srcView->size();
-    pdal::PointId skipped = 0;
     pdal::PointId unmapped = 0;
+    pdal::PointId outOfRange = 0;
     pdal::PointId unclassified_filtered = 0;
 
-    // The .pcbin annotation map is keyed by POINT_ID value — not by PDAL
-    // read-order index. We must read the POINT_ID attribute from each point.
+    // annotations.bin is indexed by POINT_ID value — not by PDAL read-order index.
+    // We must read the POINT_ID attribute from each point.
     // Using sequential index `i` is wrong: PDAL may reorder points and, even
     // when it doesn't, POINT_ID values may not start at 0 or be contiguous.
     const pdal::Dimension::Id pidSrc = outputs.empty()
@@ -521,28 +482,31 @@ static void processPointsFromMapping(
     }
 
     for (pdal::PointId i = 0; i < (pdal::PointId)nPts; ++i) {
-        // Read POINT_ID attribute → key into pcbin annotation map
+        // Read POINT_ID attribute → index into annotations.bin
         uint32_t pid = srcView->getFieldAs<uint32_t>(pidSrc, i);
 
-        // Look up segmentation from mapping
-        auto it = mapping.find(pid);
-        if (it == mapping.end()) {
+        if (pid >= annotations.pointCount) {
+            ++outOfRange;
+            continue;
+        }
+
+        const uint8_t segBuf = annotations.raw[2 * static_cast<size_t>(pid)];
+        if (segBuf == 0) {
             ++unmapped;
             continue;  // Point not annotated → skip
         }
 
-        const PointSegmentation& ps = it->second;
+        // 0 = no class assigned → keep the historical 0xFF "no class" label
+        const uint8_t rawClass = annotations.raw[2 * static_cast<size_t>(pid) + 1];
 
         // Skip points without manual class assignment (if requested)
-        // class_id == 0   → no class assigned (JS default, Int32Array initialised to 0)
-        // class_id == 0xFF → no class assigned (pcbin format sentinel)
-        if (excludeUnclassified && (ps.class_id == 0 || ps.class_id == 0xFF)) {
+        if (excludeUnclassified && rawClass == 0) {
             ++unclassified_filtered;
             continue;
         }
 
-        int segId = static_cast<int>(ps.segment_id);
-        uint8_t classId = ps.class_id;
+        int segId = static_cast<int>(segBuf) - 1;
+        uint8_t classId = (rawClass == 0) ? 0xFF : rawClass;
 
         auto out_it = outputs.find(segId);
         if (out_it == outputs.end()) continue;  // segment not in requested output list
@@ -567,18 +531,22 @@ static void processPointsFromMapping(
 
     if (unmapped > 0)
         std::cerr << "INFO: " << unmapped
-                  << " points not found in mapping (unclassified/filtered).\n";
+                  << " points not annotated (skipped).\n";
+    if (outOfRange > 0)
+        std::cerr << "WARNING: " << outOfRange
+                  << " points have POINT_ID >= annotations.bin point count (" << annotations.pointCount
+                  << "); the annotations file does not match this LAS.\n";
     if (unclassified_filtered > 0)
         std::cerr << "INFO: " << unclassified_filtered
                   << " points with unclassified label excluded (--exclude-unclassified).\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Public entry point: split all annotated segments from a .pcbin store
+//  Public entry point: split all annotated segments from an annotations.bin store
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void run_split_from_pcbin(const fs::path&                las_path,
-                                  const fs::path&                pcbin_path,
+static void run_split_from_annotations(const fs::path&                las_path,
+                                  const fs::path&                annotations_path,
                                   const std::map<int, fs::path>& output_map,
                                   bool                           addLabels,
                                   bool                           excludeUnclassified = false)
@@ -605,9 +573,9 @@ static void run_split_from_pcbin(const fs::path&                las_path,
     pdal::PointViewPtr srcView = *srcReader.execute(srcTable).begin();
     std::cout << "  Total points: " << srcView->size() << "\n";
 
-    // ── Read annotations from .pcbin ──────────────────────────────────────────
-    std::cout << "Loading .pcbin: " << pcbin_path << "\n";
-    auto mapping = read_pcbin_annotations(pcbin_path);
+    // ── Read annotations from annotations.bin ──────────────────────────────────────────
+    std::cout << "Loading annotations.bin: " << annotations_path << "\n";
+    auto mapping = read_annotations_bin(annotations_path);
 
     // ── Diagnostic: dump all PDAL dimension names ─────────────────────────────
     std::cout << "  PDAL dimensions (" << srcView->dims().size() << "):";
@@ -623,8 +591,8 @@ static void run_split_from_pcbin(const fs::path&                las_path,
     // ── Diagnostic: dump annotation breakdown per segment ─────────────────────
     {
         std::map<int, int> segCounts;
-        for (auto& [pid, ps] : mapping)
-            ++segCounts[static_cast<int>(ps.segment_id)];
+        for (size_t p = 0; p < mapping.raw.size(); p += 2)
+            if (mapping.raw[p] != 0) ++segCounts[static_cast<int>(mapping.raw[p]) - 1];
         std::cout << "  Annotation breakdown:";
         for (auto& [seg, cnt] : segCounts)
             std::cout << " seg" << seg << "=" << cnt;
@@ -638,7 +606,7 @@ static void run_split_from_pcbin(const fs::path&                las_path,
     }
 
     // ── Single-pass point distribution ───────────────────────────────────────
-    std::cout << "Distributing points from .pcbin annotations...\n";
+    std::cout << "Distributing points from annotations.bin...\n";
     processPointsFromMapping(srcView, mapping, outputs, addLabels, excludeUnclassified);
 
     // ── Write results ─────────────────────────────────────────────────────────
@@ -653,40 +621,40 @@ static void run_split_from_pcbin(const fs::path&                las_path,
 
 int main(int argc, char* argv[])
 {
-    // Usage modes (all use .pcbin for annotations):
-    // Mode 1: split_las_by_binary <las> <store.pcbin> <out_dir>
+    // Usage modes (all use annotations.bin for annotations):
+    // Mode 1: split_las_by_binary <las> <annotations.bin> <out_dir>
     //         Split all annotated segments into separate LAS files (addLabels=true)
-    // Mode 2: split_las_by_binary <las> <store.pcbin> --extract-segment <seg_id> <out_path>
+    // Mode 2: split_las_by_binary <las> <annotations.bin> --extract-segment <seg_id> <out_path>
     //         Extract a single segment's points into one LAS file (addLabels=false)
 
     try {
         // Mode 2: extract single segment
         if (argc >= 6 && std::string(argv[3]) == "--extract-segment") {
             fs::path las    = argv[1];
-            fs::path pcbin  = argv[2];
+            fs::path annotations  = argv[2];
             int      segId  = std::stoi(argv[4]);
             fs::path out    = argv[5];
 
-            if (!fs::exists(pcbin))
-                throw std::runtime_error(".pcbin file not found: " + pcbin.string());
+            if (!fs::exists(annotations))
+                throw std::runtime_error("annotations.bin file not found: " + annotations.string());
 
             fs::create_directories(out.parent_path());
-            std::cout << "Extract-segment mode: .pcbin annotations (segment " << segId << ")\n";
+            std::cout << "Extract-segment mode: annotations.bin (segment " << segId << ")\n";
 
             std::map<int, fs::path> m = {{segId, out}};
-            run_split_from_pcbin(las, pcbin, m, /*addLabels=*/false, /*excludeUnclassified=*/false);
+            run_split_from_annotations(las, annotations, m, /*addLabels=*/false, /*excludeUnclassified=*/false);
             return 0;
         }
 
         // Mode 1: split all segments
         if (argc >= 4) {
             fs::path las     = argv[1];
-            fs::path pcbin   = argv[2];
+            fs::path annotations   = argv[2];
             fs::path out_dir = argv[3];
             bool excludeUnclassified = (argc > 4 && std::string(argv[4]) == "--exclude-unclassified");
 
-            if (!fs::exists(pcbin))
-                throw std::runtime_error(".pcbin file not found: " + pcbin.string());
+            if (!fs::exists(annotations))
+                throw std::runtime_error("annotations.bin file not found: " + annotations.string());
 
             fs::create_directories(out_dir);
             std::cout << "Mode: Split all annotated segments";
@@ -698,16 +666,16 @@ int main(int argc, char* argv[])
             for (int sid = 0; sid < 255; ++sid)
                 out_map[sid] = out_dir / ("segment_" + std::to_string(sid) + ".las");
 
-            run_split_from_pcbin(las, pcbin, out_map, /*addLabels=*/true, excludeUnclassified);
+            run_split_from_annotations(las, annotations, out_map, /*addLabels=*/true, excludeUnclassified);
             std::cout << "\nProcess completed!\n";
             return 0;
         }
 
         std::cerr << "ERROR: Invalid arguments.\n\n"
                   << "Usage (split all segments):\n"
-                  << "  " << argv[0] << " <las_path> <store.pcbin> <output_dir> [--exclude-unclassified]\n\n"
+                  << "  " << argv[0] << " <las_path> <annotations.bin> <output_dir> [--exclude-unclassified]\n\n"
                   << "Usage (extract single segment):\n"
-                  << "  " << argv[0] << " <las_path> <store.pcbin> --extract-segment <seg_id> <out_path>\n";
+                  << "  " << argv[0] << " <las_path> <annotations.bin> --extract-segment <seg_id> <out_path>\n";
         return 1;
 
     } catch (const std::exception& e) {

@@ -110,19 +110,6 @@ target_link_libraries(split_las_by_binary
 )
 target_compile_options(split_las_by_binary PRIVATE ${OpenMP_CXX_FLAGS})
 
-# --- Las to Feature Bin ---
-add_executable(las_to_feature_bin las_to_feature_bin.cpp)
-target_include_directories(las_to_feature_bin PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    /app/PDAL/vendor/nlohmann
-)
-target_link_libraries(las_to_feature_bin PRIVATE
-    ${PCL_LIBRARIES}
-    ${PDAL_LIBRARIES}
-    OpenMP::OpenMP_CXX
-)
-target_compile_options(las_to_feature_bin PRIVATE ${OpenMP_CXX_FLAGS})
-
 # --- Check POINT ID ---
 add_executable(check_point_id check_point_id.cpp)
 target_link_libraries(check_point_id PRIVATE Open3D::Open3D)
@@ -130,4 +117,9 @@ set_target_properties(check_point_id PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "${open3d_lib_dir}"
     INSTALL_RPATH_USE_LINK_PATH TRUE
-)
+)
+
+# --- LAS -> chunked point cloud (no external dependencies besides OpenMP) ---
+add_executable(las2pc las2pc.cpp)
+target_link_libraries(las2pc PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(las2pc PRIVATE ${OpenMP_CXX_FLAGS})

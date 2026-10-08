@@ -19,7 +19,7 @@ processing pipeline, and ML subsystem.
 ## System Overview
 
 ```
-Browser (BabylonJS + Potree 2.0)
+Browser (BabylonJS + chunked point cloud loader)
         │  REST API calls
         ▼
 Django REST API (Python 3.10, Gunicorn)
@@ -55,18 +55,21 @@ Django REST API (Python 3.10, Gunicorn)
 
 | File | Role |
 |---|---|
-| `static/viewer/js/main.js` | Application controller (~1 000 lines): initializes the BabylonJS scene, Potree 2.0 loader, toolbar, and panels |
+| `static/viewer/js/main.js` | Application controller (~1 000 lines): initializes the BabylonJS scene, the point cloud loader, toolbar, and panels |
 | `static/viewer/js/functions.js` | UI and data logic (~4 700 lines): selection tools, class registry, REST API calls, colormap management, and dynamic modals |
-| `static/viewer/js/potree2-loader.js` | Potree 2.0 LOD loader with custom hooks for segment assignment |
+| `static/viewer/js/pointcloud-loader.js` | Chunked point cloud loader (LOD selection, memory budget, columns) with the selection / cut / class / segment logic |
+| `static/viewer/js/pointcloud-worker.js` | Module workers that fetch and decode `geom.bin` / column ranges off the main thread |
 | `templates/viewer/viewer_page.html` | Main HTML shell; injects `RUNTIME_DATA_URL` and `RUNTIME_DATA_PATH_PREFIX` from the Django template context |
 
 **Rendering stack:**
 
 - **BabylonJS** renders the 3D scene, manages the camera, lighting, and any additional
   mesh or annotation layers.
-- **Potree 2.0** streams the point cloud octree in chunks via HTTP Range requests
-  against the `/pointcloud-data/` endpoint, providing adaptive level-of-detail (LOD)
-  for large datasets.
+- The **chunked point cloud loader** streams the cloud (`geom.bin` and attribute columns)
+  with HTTP Range requests against the `/pointcloud-data/` endpoint. It picks the levels
+  of detail of every spatial chunk from the projected point spacing, culls chunks outside
+  the view frustum, keeps a point budget in memory with LRU eviction, and decodes data in
+  a pool of workers (format: [POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)).
 - **Selection tools** (rectangle, lasso, polygon) are implemented via mouse event
   listeners and an SVG overlay rendered on top of the 3D canvas.
 
@@ -93,7 +96,8 @@ client-side persistence — all data lives on the server under `runtime_data/`.
 | `ALLOWED_HOSTS` | `['0.0.0.0', 'localhost']` | Accepted hosts |
 | `RUNTIME_DATA_ROOT` | `BASE_DIR / 'runtime_data'` | Root directory for all runtime files |
 | `RUNTIME_DATA_URL` | `/runtime-data/` | URL prefix for runtime file serving |
-| `DATA_UPLOAD_MAX_MEMORY_SIZE` | 5 GB | Maximum multipart upload size |
+| `DATA_UPLOAD_MAX_MEMORY_SIZE` | 5 GB | Maximum non-file request body size |
+| `FILE_UPLOAD_MAX_MEMORY_SIZE` | 10 MB | Larger uploads are spooled to a temporary file instead of RAM |
 | Gunicorn `timeout` | `0` (disabled) | No timeout; required for long-running C++ operations |
 
 **Static files:** Collected at image build time via `collectstatic` and served by
@@ -105,7 +109,7 @@ WhiteNoise middleware without requiring a separate web server.
 /                         → viewer_page.html  (main application)
 /documentation/           → docs_page.html    (in-app documentation)
 /pointcloud-data/<path>   → HTTP Range-capable binary file server
-/runtime-data/<path>      → Runtime file server (LAS, JSON, pcbin)
+/runtime-data/<path>      → Runtime file server (LAS, JSON, annotations.bin)
 /api/*                    → REST API endpoints
 /<operation>/             → Processing pipeline endpoints
 ```
@@ -116,7 +120,7 @@ See [API_REFERENCE.md](API_REFERENCE.md) for full endpoint documentation.
 
 ## C++ Processing Pipeline
 
-Eight pre-compiled binaries are deployed to `/webapp/opt/` inside the container. They
+Seven pre-compiled binaries are deployed to `/webapp/opt/` inside the container. They
 are invoked from Python via `subprocess.Popen`, communicate through file paths and CLI
 arguments, and write all output to `runtime_data/working/`.
 
@@ -127,8 +131,7 @@ arguments, and write all output to `runtime_data/working/`.
 | `subsample_pc` | Voxel-grid downsampling | PLY / LAS | Subsampled file |
 | `mesh2pc` | Surface mesh → point cloud (uniform sampling) | GLB / GLTF / OBJ | LAS |
 | `ply2las` | PLY → LAS format conversion | PLY | LAS |
-| `split_las_by_binary` | Split LAS into per-segment files using `.pcbin` annotation store | LAS + `.pcbin` | Multiple LAS files |
-| `las_to_feature_bin` | Pack feature LAS into compact `.pcbin` binary store | LAS | `.pcbin` |
+| `split_las_by_binary` | Split LAS into per-segment files using the `annotations.bin` store | LAS + `annotations.bin` | Multiple LAS files |
 | `check_point_id` | Validate and normalize POINT_ID to canonical 0-based indexing | LAS | LAS (validated) |
 
 **Build dependencies:** PCL 1.9, PDAL 2.7.1, GDAL 3.6.2, Open3D 0.19.0, LASzip,
@@ -136,26 +139,87 @@ CGAL, Boost, CUDA 11.8 + Thrust (GPU binaries only).
 
 See [BINARIES.md](BINARIES.md) for full CLI reference per binary.
 
-### `.pcbin` binary format
+### `annotations.bin` format
 
-The `.pcbin` file is the unified binary store for features and per-point annotations.
+`annotations.bin` (`runtime_data/working/annotations.bin`) stores the user annotations
+(segments and classes). It is a raw buffer with **2 bytes per point, indexed by `POINT_ID`**
+(no header):
 
 ```
-Header  (16 + F×40 bytes):
-  [0–3]   magic    'PCBN'
-  [4]     version  1 = float32 features | 2 = uint8 quantized features
-  [5]     bpf      bytes per feature (1 or 4)
-  [6–7]   reserved
-  [8–11]  N        number of points (uint32 LE)
-  [12–15] F        number of features (uint32 LE)
-  [16…]   F × (32-byte name + 4-byte vmin + 4-byte vmax)
-
-Per-point record  (F×bpf + 8 bytes):
-  [0 … F×bpf-1]   feature values
-  [F×bpf]         segment_id   (uint8, 0-based; 0xFF = unassigned)
-  [F×bpf + 1]     class_id     (uint8; 0xFF = unassigned)
-  [F×bpf + 2–5]   confidence   (float32 LE)
+byte[2*pid]     segment_id + 1   (0 = point not annotated)
+byte[2*pid + 1] class_id         (0 = no class assigned)
 ```
+
+The browser builds the buffer (`ChunkedPointCloudLoader.exportAnnotations`), gzips it with
+`CompressionStream` when available and POSTs it to `/api/export-mapping/`. The server
+streams it to a temp file, patches the existing store with numpy (only points with
+`segment_id != 0` in the new buffer overwrite the stored ones, because the client only
+exports the requested segments) and moves it atomically into place.
+`split_las_by_binary` reads it with O(1) lookup per `POINT_ID`.
+
+There is no unified feature store: the per-point features are Extra Bytes of
+`features.las`, mirrored into per-attribute columns of the chunked point cloud (see
+[Visualization and the commit model](#visualization-and-the-commit-model)).
+
+### Visualization and the commit model
+
+`features.las` is the single source of truth. For the browser it is converted **once** (at
+import) by `las2pc` into the chunked point cloud `working/pc/` (full description in
+[POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)):
+
+- `geom.bin` — 20 B/point (quantized XYZ, RGB, `POINT_ID`), grouped in spatial chunks of at
+  most 250 000 points; inside each chunk the points are ordered by stratified levels of detail
+  (a random subsample of any level prefix is uniform). The first Range request of a cloud is
+  the whole overview (`head` block), then the loader asks one contiguous range per chunk for
+  the missing levels.
+- `col/<name>.bin` — one column per attribute (features, `prediction`) in the same point
+  order; `meta.json` holds their `min`/`max` and a `version`. The loader downloads only the
+  column of the feature being displayed, for the meshes it has loaded.
+
+**Commit model.** Selections, cuts and manual classifications are client-side (history and
+per-`POINT_ID` maps). The operations that change `features.las` no longer rebuild or reload
+the cloud, they only rewrite columns (`pc_columns.py`, joined by `POINT_ID`):
+
+| Operation | Server | Browser |
+|---|---|---|
+| Import | `las2pc` + all columns, atomic swap `pc_tmp` → `pc` | `loadPointCloud` |
+| Feature calculation | `/feature_extraction/`, then the new columns (`only`, `prune`) | `refreshColumns()` |
+| RF classification | `--prediction <classified.las>` → `prediction` column (255 = no prediction) | `refreshColumns()` |
+| Backup restore | `--drop-all` + columns of the backup (rebuild only if the point count differs) | `refreshColumns()` |
+
+`ChunkedPointCloudLoader.refreshColumns()` re-reads `meta.json`, updates the feature list,
+invalidates the columns whose `version` changed and re-downloads the active one. The loader
+is not disposed: selections, cuts, classes, colormap and camera stay as they are. The
+geometry is rebuilt (and the loader reloaded with `reloadPointCloudPreservingState`) only if
+its point count or build changes. `POINT_ID` is the only join key between a LAS and the
+geometry — the GPU feature extractor rewrites the records tile by tile, so the position in
+the file means nothing.
+
+**Atomic updates.** The geometry is built in `working/pc_tmp/` and swapped with `pc/` only on
+success (`functions.build_pointcloud`); a column is written to `col/<name>.bin.tmp` and moved
+with `os.replace`, then `meta.json` is replaced the same way. The geometry `version` and every
+column `version` go in the URL as `?v=<token>`, which makes the Range responses immutable and
+cacheable for a year; `meta.json` is always fetched with `cache: 'no-store'`.
+
+**Classification fallback.** If the classified LAS has no `POINT_ID` belonging to the current
+cloud (the column writer answers `409`), the classified LAS is converted into its own
+`working/pc_classified/` and loaded with `reloadPointCloudPreservingState(scene, version,
+'pc_classified')`, as the former pipeline did.
+
+**State preservation.** `reloadPointCloudPreservingState(scene, version)` builds the new
+loader with the old loader's `exportState()` (cut/classification/selection history,
+per-point segment and class maps, segment visibility, colour mode, point size, colormap,
+feature range, ...), applied before the first nodes are created, and disposes the old
+loader only when the new one is ready. Outline entries, class registry and camera are
+untouched. Limits: if the new point cloud has a different `boundingBox` only the AABB
+histories are translated (screen-space selections cannot be); if the point count differs
+(classified segment or sampled cloud) the per-point maps are not transferred.
+
+**Server throughput.** `serve_range_file` positions a `FileResponse` at the requested byte
+and sets `Content-Length` to the slice length, so Gunicorn serves it with `sendfile()`
+(zero copy); `gunicorn.conf.py` runs 1 worker (the `JobManager` singleton must be reachable by
+`/stop_process/`) with 8 threads, because long calculation endpoints keep a thread busy while the
+viewer needs up to 6 parallel Range requests.
 
 ---
 
@@ -186,7 +250,7 @@ feature extraction or model training.
 ### Training (`utils_functions/RF_training.py`)
 
 1. Reads `features.las` (LAS with Extra Bytes) and the binary annotation buffer
-   (`labels_TIMESTAMP.bin`, one byte per point).
+   (`annotations.bin`, 2 bytes per point).
 2. Extracts feature column names from LAS VLR Extra Bytes metadata.
 3. Splits annotated points into training and validation sets by segment ID.
 4. Trains a Random Forest classifier using RAPIDS `cuRF` (GPU) if available, with
@@ -202,7 +266,7 @@ feature extraction or model training.
 3. Runs `predict` and `predict_proba` to obtain per-point class labels and confidence
    scores.
 4. Writes predictions and confidence values back to the LAS file as Extra Bytes.
-5. Converts the updated LAS to `.pcbin` format for visualization in the browser.
+5. The viewer does not reload anything: the `prediction` column of the current point cloud is written from the classified LAS (joined by `POINT_ID`, `255` = no prediction) and the loader picks it up as a feature. `POINT_ID` is read and written as uint32 separately from the float32 feature matrix, so ids above 16 777 216 survive.
 
 **GPU acceleration:** cuML's `RandomForestClassifier` is a drop-in replacement for
 scikit-learn's. Both training and inference attempt GPU execution first; any import
@@ -220,14 +284,14 @@ runtime_data/
 ├── working/
 │   ├── <uploaded_file>.*           Original uploaded file
 │   ├── features.las                Canonical feature LAS (source of truth for the pipeline)
-│   ├── features.pcbin              Binary feature + annotation store
+│   ├── annotations.bin             User annotations (2 bytes per POINT_ID: segment+1, class)
 │   ├── pointcloud_backup.las       Backup copy before feature re-extraction
-│   ├── labels_TIMESTAMP.bin        Binary annotation buffer (one byte per point)
-│   ├── meta_TIMESTAMP.json         Segment → class name metadata
-│   └── potree_output/              Potree 2.0 octree files for LOD streaming
-│       ├── metadata.json
-│       ├── octree.bin
-│       └── hierarchy.bin
+│   ├── pc/                         Chunked point cloud (see POINTCLOUD_FORMAT.md), swapped atomically
+│   │   ├── meta.json
+│   │   ├── geom.bin                20 B/point: quantized XYZ, RGB, POINT_ID
+│   │   ├── point_order.bin         POINT_ID in geom.bin order
+│   │   └── col/<name>.bin          One column per feature / prediction
+│   └── pc_classified/              Only if a classified LAS does not match pc/ (fallback)
 └── models/
     └── <model_name>/
         ├── model.pkl               Serialized Random Forest model

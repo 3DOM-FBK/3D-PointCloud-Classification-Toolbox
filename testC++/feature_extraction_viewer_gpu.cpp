@@ -166,20 +166,30 @@ LasHeaderInfo readLasHeader(const std::string& fileName)
     if (h.minx == 0 && h.maxx == 0 && h.miny == 0 && h.maxy == 0) {
         std::cout << "Header bounds are zero — scanning points..." << std::endl;
         const uint64_t STEP = h.point_count > 2000000UL ? h.point_count / 2000000UL : 1UL;
+        // Sampled scan over large sequential blocks. Seeking before every sampled point costs one
+        // syscall per point, which takes minutes on network or bind-mounted file systems.
+        const uint64_t rec = h.point_record_length;
+        const uint64_t blockRecs = std::max<uint64_t>(1, (64ULL << 20) / rec);
+        std::vector<char> blk(blockRecs * rec);
         bool first = true;
-        for (uint64_t i = 0; i < h.point_count; i += STEP) {
-            f.seekg(h.offset_to_data + i * h.point_record_length);
-            int32_t ix, iy, iz;
-            f.read((char*)&ix, 4); f.read((char*)&iy, 4); f.read((char*)&iz, 4);
+        for (uint64_t b0 = 0; b0 < h.point_count; b0 += blockRecs) {
+            const uint64_t cnt = std::min<uint64_t>(blockRecs, h.point_count - b0);
+            f.seekg(h.offset_to_data + b0 * rec);
+            f.read(blk.data(), cnt * rec);
             if (!f) break;
-            double x = ix * h.scaleX + h.offX;
-            double y = iy * h.scaleY + h.offY;
-            double z = iz * h.scaleZ + h.offZ;
-            if (first) { h.minx=h.maxx=x; h.miny=h.maxy=y; h.minz=h.maxz=z; first=false; }
-            else {
-                h.minx=std::min(h.minx,x); h.maxx=std::max(h.maxx,x);
-                h.miny=std::min(h.miny,y); h.maxy=std::max(h.maxy,y);
-                h.minz=std::min(h.minz,z); h.maxz=std::max(h.maxz,z);
+            // First sampled index (multiple of STEP) that falls inside this block
+            for (uint64_t i = ((b0 + STEP - 1) / STEP) * STEP; i < b0 + cnt; i += STEP) {
+                int32_t xyz[3];
+                std::memcpy(xyz, &blk[(i - b0) * rec], 12);
+                double x = xyz[0] * h.scaleX + h.offX;
+                double y = xyz[1] * h.scaleY + h.offY;
+                double z = xyz[2] * h.scaleZ + h.offZ;
+                if (first) { h.minx=h.maxx=x; h.miny=h.maxy=y; h.minz=h.maxz=z; first=false; }
+                else {
+                    h.minx=std::min(h.minx,x); h.maxx=std::max(h.maxx,x);
+                    h.miny=std::min(h.miny,y); h.maxy=std::max(h.maxy,y);
+                    h.minz=std::min(h.minz,z); h.maxz=std::max(h.maxz,z);
+                }
             }
         }
         double mx=(h.maxx-h.minx)*0.001, my=(h.maxy-h.miny)*0.001;

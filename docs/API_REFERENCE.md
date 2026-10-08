@@ -95,8 +95,11 @@ working directory.
 
 ### `POST /api/restore-pointcloud-backup/`
 
-Restore `features.las` from `pointcloud_backup.las` and regenerate
-`features.pcbin`.
+Restore `features.las` from `pointcloud_backup.las` and delete the stored `annotations.bin`.
+The geometry of the chunked point cloud (`working/pc`) and the `POINT_ID`s are the same as in
+the backup, so the geometry is **not** rebuilt: every column is dropped and rewritten from the
+backup (normally only the normals). If the number of points differs from the current cloud
+the geometry is rebuilt with `las2pc` (`rebuilt: true`).
 
 **Response:**
 
@@ -104,8 +107,9 @@ Restore `features.las` from `pointcloud_backup.las` and regenerate
 {
   "status": "success",
   "message": "Point cloud restored from backup",
-  "las_path":   "runtime_data/working/features.las",
-  "pcbin_path": "runtime_data/working/features.pcbin"
+  "las_path": "runtime_data/working/features.las",
+  "version":  "1760000000000",
+  "rebuilt": false
 }
 ```
 
@@ -266,38 +270,80 @@ by default; falls back to the CPU binary when `use_gpu` is `false`.
 
 ---
 
-### `POST /potree_converter/`
+### `POST /api/build-pointcloud/`
 
-Convert a feature LAS file to Potree 2.0 octree format for LOD streaming.
+Convert a LAS file into the chunked point cloud format (see
+[POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)): `las2pc` builds the geometry and
+`pc_columns.py` writes one column per LAS Extra Byte. Everything is written into
+`<output_filepath>_tmp`; on success the folder is swapped atomically with `<output_filepath>`
+(on failure or user stop the previous point cloud is left untouched). The viewer uses
+`runtime_data/working/pc`. This is needed at import (and when the number of points changes);
+features and classification only rewrite columns.
 
 **Request body:**
 
 ```json
 {
   "input_filepath":  "runtime_data/working/features.las",
-  "output_filepath": "runtime_data/working/potree_output"
+  "output_filepath": "runtime_data/working/pc"
 }
 ```
 
 **Response:**
 
 ```json
-{ "status": "success", "message": "Potree conversion completed." }
+{ "status": "success", "message": "Point cloud built.", "version": "1760000000000" }
 ```
+
+`version` is the geometry token. The client appends it as `?v=<version>` to the `geom.bin`
+URL (every column has its own version in `meta.json`) so cached Range responses are never stale.
+
+---
+
+### `POST /api/update-pointcloud-columns/`
+
+Rewrite attribute columns of an existing chunked point cloud without touching its geometry
+(about 0.1 s per float32 column on a 5 M point cloud). The LAS is joined to the geometry by
+`POINT_ID`, so the order of its records does not matter and points missing from it keep the
+"missing" value (`NaN`; `255` for `prediction`).
+
+**Request body** (all fields optional, at least one action is required):
+
+```json
+{
+  "pc_dir":              "runtime_data/working/pc",
+  "las_filepath":        "runtime_data/working/features.las",
+  "only":                ["planarity_0_8"],
+  "prune":               true,
+  "prediction_filepath": "runtime_data/working/classify/classified.las",
+  "drop_all":            false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `las_filepath` (+ `only`) | Write the Extra Bytes of the LAS: all of them, or the names in `only` (Extra Bytes unknown to the cloud are always added) |
+| `prune` | With `las_filepath`: drop the columns that are no longer Extra Bytes of the LAS |
+| `prediction_filepath` | Write the `prediction` (uint8) column from a classified LAS; it may be a subset of the points (the others stay `255`). RF class ids must be `< 255` |
+| `drop_all` | Delete every column first (applied before the other actions) |
+
+**Response:** `{ "status": "success", "message": "Point cloud columns updated." }`.
+If the classified LAS has no `POINT_ID` that belongs to the point cloud the answer is
+`409 { "status": "mismatch", "message": "..." }` and nothing is written.
 
 ---
 
 ### `POST /split_las_by_binary/`
 
-Split a LAS file into per-segment LAS files based on annotations stored in a
-`.pcbin` binary store.
+Split a LAS file into per-segment LAS files based on annotations stored in `annotations.bin`
+(2 bytes per `POINT_ID`: `segment_id + 1`, `class_id`; see ARCHITECTURE.md).
 
 **Request body:**
 
 ```json
 {
   "las_path":              "runtime_data/working/features.las",
-  "pcbin_path":            "runtime_data/working/features.pcbin",
+  "annotations_path":      "runtime_data/working/annotations.bin",
   "output_dir":            "runtime_data/working/segments",
   "exclude_unclassified":  false,
   "segment_names":         { "1": "training", "2": "validation" }
@@ -306,34 +352,14 @@ Split a LAS file into per-segment LAS files based on annotations stored in a
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `exclude_unclassified` | `bool` | `false` | Omit points with no segment assignment |
+| `annotations_path` | `string` | `runtime_data/working/annotations.bin` | Annotation store (error if missing) |
+| `exclude_unclassified` | `bool` | `false` | Omit points with no class assigned |
 | `segment_names` | `object` | `null` | Map segment IDs to output file names |
 
 **Response:**
 
 ```json
 { "status": "success", "message": "Split LAS completed." }
-```
-
----
-
-### `POST /las_to_feature_bin/`
-
-Convert a feature LAS file to the compact `.pcbin` binary format.
-
-**Request body:**
-
-```json
-{
-  "las_path":   "runtime_data/working/features.las",
-  "pcbin_path": "runtime_data/working/features.pcbin"
-}
-```
-
-**Response:**
-
-```json
-{ "status": "success", "message": "Features pcbin generated successfully." }
 ```
 
 ---
@@ -405,8 +431,7 @@ Run inference with a trained model on the current point cloud.
 {
   "model_dir":    "runtime_data/models/my_model",
   "features_las": "runtime_data/working/features.las",
-  "output_las":   "runtime_data/working/features.las",
-  "pcbin_path":   "runtime_data/working/features.pcbin"
+  "output_las":   "runtime_data/working/features.las"
 }
 ```
 
@@ -418,40 +443,14 @@ Run inference with a trained model on the current point cloud.
 
 ---
 
-### `POST /api/start-training/`
-
-Persist the per-point annotation buffer from the browser to the server before
-launching training.
-
-**Request:** `multipart/form-data`
-
-| Field | Type | Description |
-|---|---|---|
-| `labels` | JSON string | Map of `segmentId → segmentName` |
-| `buffer` | Binary file | One byte per point: label value (0 = unannotated) |
-
-**Response:**
-
-```json
-{
-  "message":        "Binary data saved successfully",
-  "filename":       "labels_20240101_120000.bin",
-  "labels_filename":"meta_20240101_120000.json",
-  "bin_path":       "/webapp/classifyViewer/runtime_data/working/labels_20240101_120000.bin",
-  "json_path":      "/webapp/classifyViewer/runtime_data/working/meta_20240101_120000.json",
-  "size_bytes":     1500000
-}
-```
-
----
-
 ## Annotation and Export
 
 ### `POST /api/export-mapping/`
 
-Persist point annotation data (segment IDs and class IDs) into the `.pcbin`
-binary store. If `features.pcbin` does not yet exist it is generated from
-`features.las` automatically.
+Persist point annotation data (segment IDs and class IDs) into
+`runtime_data/working/annotations.bin`. The buffer is streamed to disk (gunzipped on the fly when
+`encoding=gzip`) and merged into the stored file with numpy: only points with `segment_id != 0` in
+the buffer overwrite the stored ones. The final size must be `point_count * 2` bytes.
 
 **Request:** `multipart/form-data`
 
@@ -459,14 +458,14 @@ binary store. If `features.pcbin` does not yet exist it is generated from
 |---|---|---|
 | `buffer` | Binary blob | 2 bytes per point: `segment_id` (1-based, 0 = unannotated) + `class_id` |
 | `point_count` | Integer string | Total number of points |
-| `pcbin_path` | String | Relative path to the `.pcbin` file (default: `runtime_data/working/features.pcbin`) |
+| `encoding` | String | Optional: `gzip` if `buffer` is gzip-compressed |
 
 **Response:**
 
 ```json
 {
-  "pcbin_path":  "runtime_data/working/features.pcbin",
-  "point_count": 84230
+  "annotations_path": "runtime_data/working/annotations.bin",
+  "point_count":      84230
 }
 ```
 
@@ -481,7 +480,7 @@ Extract all points belonging to a single segment ID into a new LAS file.
 ```json
 {
   "las_path":   "runtime_data/working/features.las",
-  "pcbin_path": "runtime_data/working/features.pcbin",
+  "annotations_path": "runtime_data/working/annotations.bin",
   "seg_id":     1,
   "out_path":   "runtime_data/working/segment_1.las"
 }
@@ -514,7 +513,7 @@ deleted after the response is sent.
   ],
   "models":   ["my_model"],
   "las_path": "runtime_data/working/features.las",
-  "bin_path": "/abs/path/to/labels_TIMESTAMP.bin"
+  "bin_path": "runtime_data/working/annotations.bin"
 }
 ```
 
@@ -616,23 +615,27 @@ Upload an externally trained model file to `runtime_data/models/`.
 
 ### `GET /pointcloud-data/<path>`
 
-Serve binary Potree files (`octree.bin`, `hierarchy.bin`, `.pcbin`, `.json`)
-with HTTP Range request support. Potree 2.0 requires this to fetch arbitrary
-byte ranges from large octree files without downloading them in full.
+Serve the chunked point cloud files (`pc/geom.bin`, `pc/col/*.bin`, `pc/meta.json`, ...)
+with HTTP Range request support: the viewer fetches arbitrary byte ranges of multi-GB files
+without downloading them in full.
 
-- **Allowed extensions:** `.bin`, `.json`, `.pcbin`
+- **Allowed extensions:** `.bin`, `.json`
 - **Restricted to** `runtime_data/` (directory traversal is prevented)
-- Returns `206 Partial Content` for range requests; `200 OK` for full-file
-  requests
-- Files larger than 10 MB are streamed in 64 KB chunks
+- Returns `206 Partial Content` (with `Content-Range`) for range requests, `416` when the range is
+  outside the file, `200 OK` for full-file requests; suffix ranges (`bytes=-N`) are supported
+- The file is handed to the WSGI server through `FileResponse` positioned at the first byte and with
+  an explicit `Content-Length`, so Gunicorn serves the slice with `sendfile()` (zero copy, no Python
+  loop: about 4× the throughput of the former 64 KB generator)
+- With `?v=<token>` in the query the response carries
+  `Cache-Control: public, max-age=31536000, immutable`; otherwise `no-cache`
 
 ---
 
 ### `GET /runtime-data/<path>`
 
-Serve general runtime data files without Range support.
+Serve general runtime data files without Range support (streamed with `FileResponse`).
 
-- **Allowed extensions:** `.las`, `.bin`, `.json`, `.pcbin`, `.txt`
+- **Allowed extensions:** `.las`, `.bin`, `.json`, `.txt`
 - **Restricted to** `runtime_data/`
 
 ---

@@ -98,7 +98,7 @@ docker run -d \
   3d-classify-viewer
 ```
 
-The application is served by Gunicorn (1 worker, 2 threads, no timeout) on port **8000**.
+The application is served by Gunicorn (1 worker, 8 threads, no timeout) on port **8000**.
 Open `http://localhost:8000` in a browser.
 
 To **persist runtime data** (uploaded point clouds, trained models) between container
@@ -155,9 +155,9 @@ Expected: entries for `libgdal`, `libpdal_base`, `liblaszip`, and `libpcl_*`.
 docker exec classify-viewer ls -la /webapp/opt/
 ```
 
-Expected: eight executable files — `feature_extraction_viewer_gpu`,
+Expected: seven executable files — `feature_extraction_viewer_gpu`,
 `feature_extraction_viewer_cpu`, `subsample_pc`, `mesh2pc`, `ply2las`,
-`split_las_by_binary`, `las_to_feature_bin`, `check_point_id`.
+`split_las_by_binary`, `check_point_id`.
 
 ### Check Python / CUDA environment
 

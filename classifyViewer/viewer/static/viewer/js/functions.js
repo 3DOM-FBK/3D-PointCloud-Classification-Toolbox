@@ -1,7 +1,9 @@
 import {
-    loadPotree2PointCloud,
-    getPotree2Loader
-} from "./potree2-loader.js";
+    loadPointCloud,
+    getPointCloudLoader
+} from "./pointcloud-loader.js";
+
+export { loadPointCloud };
 
 // --- Runtime path helpers (read from Django-injected config) ---
 const _runtimeUrl = (...parts) => {
@@ -13,44 +15,146 @@ const _runtimePath = (...parts) => {
     return [prefix, ...parts].join('/');
 };
 
-// =====================================================================
-// UNIFIED POINT CLOUD LOADER - Auto-detects format
-// =====================================================================
-/**
- * Unified point cloud loader - loads Potree 2.0 format
- */
-export async function loadPointCloud(path, scene, options = {}) {
-    console.log("🔍 Loading Potree 2.0 point cloud...");
 
-    try {
-        // Try to load metadata.json to verify it's a valid Potree 2.0 folder
-        const metadataUrl = `${path}/metadata.json`;
-        const response = await fetch(metadataUrl);
+// Single chunked point cloud folder (runtime_data/working/pc). Keep in sync with PC_DIR in the backend.
+export const PC_DIR = 'pc';
+// Point cloud of a classified LAS that does not match the main one (fallback of the classification)
+export const PC_CLASSIFIED_DIR = 'pc_classified';
 
-        if (!response.ok) {
-            throw new Error("No metadata.json found at " + path);
-        }
-
-        const metadata = await response.json();
-
-        if (metadata.version !== "2.0") {
-            console.warn(`⚠️ Warning: Metadata version is ${metadata.version}, expected 2.0. Attempting to load anyway.`);
-        }
-
-        console.log("✅ Using Potree2Loader");
-        return await loadPotree2PointCloud(path, scene, options);
-
-    } catch (error) {
-        console.error("❌ Failed to load point cloud:", error);
-        throw error;
-    }
+/** Runtime-relative path of the folder of the point cloud currently loaded (pc or pc_classified). */
+function _activePcRuntimePath() {
+    const loader = window.__babylonScene ? getPointCloudLoader(window.__babylonScene) : null;
+    return loader ? _runtimePath(...loader.rangeBasePath.split('/')) : _runtimePath('working', PC_DIR);
 }
 
 /**
- * Get the active loader (Potree2)
+ * Builds the chunked point cloud (geometry + one column per LAS Extra Byte) from `lasPath`
+ * (atomic swap on the server) and returns its geometry `version`, to be used as ?v= cache buster
+ * when loading it. Only needed at import (or when the number of points changes): after that,
+ * features/classification only rewrite columns (see updatePointCloudColumns).
+ */
+export async function buildPointCloud(lasPath, dirName = PC_DIR) {
+    const response = await fetch('/api/build-pointcloud/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
+        body: JSON.stringify({
+            input_filepath: lasPath,
+            output_filepath: _runtimePath('working', dirName)
+        })
+    });
+    if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.message || errData.error || "Point cloud build failed");
+    }
+    const data = await response.json();
+    return data.version;
+}
+
+/**
+ * Rewrites columns of the current point cloud on the server (geometry untouched).
+ *   { las, only }   write the Extra Bytes of `las` (all of them, or just the names in `only`)
+ *   { prediction }  write the 'prediction' column from a classified LAS
+ *   { dropAll }     delete every column first (restore)
+ *   { prune }       with `las`: also drop the columns that are no longer Extra Bytes of the LAS
+ * Resolves to { ok: true } or { ok: false, mismatch: true } when the classified LAS does not
+ * belong to the point cloud (POINT_ID mismatch); rejects on any other error.
+ */
+export async function updatePointCloudColumns({ las = null, only = null, prediction = null, dropAll = false, prune = false } = {}) {
+    const response = await fetch('/api/update-pointcloud-columns/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
+        body: JSON.stringify({
+            pc_dir: _activePcRuntimePath(),
+            las_filepath: las,
+            only: only,
+            prediction_filepath: prediction,
+            drop_all: dropAll,
+            prune: prune
+        })
+    });
+    if (response.status === 409) return { ok: false, mismatch: true };
+    if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.message || errData.error || "Updating point cloud columns failed");
+    }
+    return { ok: true };
+}
+
+/**
+ * Makes the loader pick up the columns that changed on the server: no dispose, no geometry
+ * download, selections / cuts / classes / camera / colour mode stay as they are. Falls back to a
+ * full reload only if the geometry itself was rebuilt in the meantime.
+ */
+export async function refreshPointCloudColumns(scene) {
+    scene = scene || window.__babylonScene;
+    const loader = scene ? getPointCloudLoader(scene) : null;
+    if (!loader) return null;
+    const result = await loader.refreshColumns();
+    if (result.reloadNeeded) {
+        console.warn('Point cloud geometry changed on the server: reloading the loader.');
+        return await reloadPointCloudPreservingState(scene, undefined, loader.rangeBasePath.split('/').pop());
+    }
+    return loader;
+}
+
+/**
+ * Reloads the active point cloud (new geometry `version`) keeping all user state:
+ * cuts/segments, classes, selections, colour mode, ranges, point size, etc.
+ * The new loader is built first (it receives the old loader's exported state before its
+ * first nodes are created); the old one is disposed only once the new one is ready.
+ * Outline entries and the class registry are NOT touched and the camera stays where it is.
+ *
+ * Only needed when the geometry was rebuilt (different point count / build): column updates
+ * go through refreshPointCloudColumns(). If the point count changed the per-point
+ * segment/class maps are not transferred by the loader.
+ */
+export async function reloadPointCloudPreservingState(scene, version, dirName = PC_DIR) {
+    scene = scene || window.__babylonScene;
+    if (!scene) throw new Error('No scene available to reload the point cloud');
+
+    const oldLoader = getPointCloudLoader(scene);
+    const initialState = oldLoader ? oldLoader.exportState() : null;
+    const pcUrl = _runtimeUrl('working', dirName);
+
+    // Stop the old loader from fetching/updating while the new one loads
+    if (oldLoader) {
+        oldLoader.stopAutoCleanup();
+        if (oldLoader._cameraForObserver && oldLoader._cameraViewObserver) {
+            oldLoader._cameraForObserver.onViewMatrixChangedObservable.remove(oldLoader._cameraViewObserver);
+            oldLoader._cameraViewObserver = null;
+        }
+    }
+
+    let pc;
+    try {
+        pc = await loadPointCloud(pcUrl, scene, { version, initialState, preserveView: true });
+    } catch (err) {
+        // New loader failed: re-attach the old one so the viewer keeps working
+        if (oldLoader && oldLoader._cameraForObserver) {
+            oldLoader._cameraViewObserver = oldLoader._cameraForObserver.onViewMatrixChangedObservable.add(() => {
+                oldLoader.update(oldLoader._cameraForObserver);
+            });
+        }
+        scene.pointCloudLoader = oldLoader;
+        throw err;
+    }
+
+    // New loader is ready (loadPointCloud already set scene.pointCloudLoader): drop the old one
+    if (oldLoader && oldLoader !== scene.pointCloudLoader) oldLoader.dispose();
+
+    const newLoader = getPointCloudLoader(scene);
+    if (window.__sceneObjects) window.__sceneObjects.currentPointCloud = pc;
+
+    // Re-apply the restored colour mode (feature shader uniforms, LUT colours...)
+    if (newLoader && newLoader.colorMode) newLoader.setColorMode(newLoader.colorMode);
+    return newLoader;
+}
+
+/**
+ * Get the active loader
  */
 export function getLODLoader(scene) {
-    return getPotree2Loader(scene);
+    return getPointCloudLoader(scene);
 }
 
 /**
@@ -178,7 +282,7 @@ function hexToRgbFloat(hex) {
  * Assigns a class (id + color) to the currently selected points.
  *
  * Strategy:
- *  1. If the Potree2Loader exposes getSelectedPointsInfo(), use that for
+ *  1. If the PointCloudLoader exposes getSelectedPointsInfo(), use that for
  *     accurate per-point index tracking.
  *  2. Fallback: scan vertex colors for the red selection highlight [1, 0, 0]
  *     and tag those points.
@@ -188,10 +292,10 @@ function hexToRgbFloat(hex) {
  */
 export function applyClassToSelection(scene, classId, hexColor) {
     const [r, g, b] = hexToRgbFloat(hexColor);
-    const loader = getPotree2Loader(scene);
+    const loader = getPointCloudLoader(scene);
 
     if (!loader) {
-        console.warn("⚠️ Potree2 loader not found. Make sure a point cloud is loaded.");
+        console.warn("⚠️ Point cloud loader not found. Make sure a point cloud is loaded.");
         return;
     }
 
@@ -1021,8 +1125,8 @@ export function createOutlineItem(name, iconSrc, parent, segmentId, onVisibility
                 icon: `${iconBase}cursor.png`,
                 action: () => {
                     const scene = window.__babylonScene;
-                    if (scene && scene.potree2Loader) {
-                        const count = scene.potree2Loader.assignSelectionToSegment(segmentId);
+                    if (scene && scene.pointCloudLoader) {
+                        const count = scene.pointCloudLoader.assignSelectionToSegment(segmentId);
                         if (count > 0) console.log(`✅ Assigned ${count} points to ${nameInput.value}`);
                     }
                 }
@@ -1032,8 +1136,8 @@ export function createOutlineItem(name, iconSrc, parent, segmentId, onVisibility
                 icon: `${iconBase}trash.png`,
                 action: () => {
                     const scene = window.__babylonScene;
-                    if (scene && scene.potree2Loader) {
-                        const count = scene.potree2Loader.removeSelectionFromSegment(segmentId);
+                    if (scene && scene.pointCloudLoader) {
+                        const count = scene.pointCloudLoader.removeSelectionFromSegment(segmentId);
                         if (count > 0) console.log(`✅ Removed ${count} points from ${nameInput.value}`);
                     }
                 }
@@ -1047,9 +1151,9 @@ export function createOutlineItem(name, iconSrc, parent, segmentId, onVisibility
                 icon: `${iconBase}cursor.png`,
                 action: () => {
                     const scene = window.__babylonScene;
-                    if (!scene?.potree2Loader?.mergeSegments) return;
+                    if (!scene?.pointCloudLoader?.mergeSegments) return;
 
-                    const merged = scene.potree2Loader.mergeSegments(segmentId, mergeCandidates);
+                    const merged = scene.pointCloudLoader.mergeSegments(segmentId, mergeCandidates);
                     if (!merged || merged.mergedSegments <= 0) return;
 
                     // Remove merged source rows from outline, keep target row.
@@ -1138,8 +1242,8 @@ export function createClassItem(name, iconSrc, parent) {
 
             // Update points in the scene if loader is available
             const sceneRef = window.__babylonScene;
-            if (sceneRef && sceneRef.potree2Loader) {
-                sceneRef.potree2Loader.updateClassColor(classId, newColor);
+            if (sceneRef && sceneRef.pointCloudLoader) {
+                sceneRef.pointCloudLoader.updateClassColor(classId, newColor);
             }
         });
     });
@@ -1174,8 +1278,8 @@ export function createClassItem(name, iconSrc, parent) {
                 action: () => {
                     if (confirm(`Are you sure you want to delete the class "${nameInput.value}"?`)) {
                         const sceneRef = window.__babylonScene;
-                        if (sceneRef?.potree2Loader?.removeClass) {
-                            sceneRef.potree2Loader.removeClass(classId);
+                        if (sceneRef?.pointCloudLoader?.removeClass) {
+                            sceneRef.pointCloudLoader.removeClass(classId);
                         }
                         classRegistry.delete(classId);
                         row.remove();
@@ -1501,11 +1605,11 @@ export function showResetSceneModal() {
                     activateStep(currentStep);
                     const scene = window.__babylonScene;
                     if (scene) {
-                        const loader = scene.potree2Loader;
+                        const loader = scene.pointCloudLoader;
                         if (loader && typeof loader.dispose === 'function') {
                             loader.dispose();
                         }
-                        scene.potree2Loader = null;
+                        scene.pointCloudLoader = null;
                     }
                     const sceneObjects = window.__sceneObjects;
                     if (sceneObjects) {
@@ -1792,6 +1896,8 @@ export function showDownloadModal() {
                             point_cloud_files: pointCloudFiles,
                             models,
                             las_path: window.__currentProjectLAS,
+                            // annotations.bin (set after exportAnnotations); only used by the backend when segments are requested
+                            bin_path: window.__currentProjectBIN || undefined,
                             project_name: projectName
                         })
                     });
@@ -2077,7 +2183,7 @@ export function showLoadModal() {
                     "Clearing Workspace",
                     "Uploading File",
                     "Converting File",
-                    "Potree Converter",
+                    "Building Point Cloud",
                     "Loading Viewer"
                 ];
 
@@ -2300,40 +2406,29 @@ export function showLoadModal() {
                     console.log("✅ Point cloud backup saved");
                     completeStep(2);
 
-                    // STEP 4: PotreeConverter
+                    // STEP 4: build the chunked point cloud (las2pc + columns)
                     checkCancelled();
                     currentStepIdx = 3;
                     activateStep(3);
-                    console.log("🧠 Step 4: Starting Potree conversion...");
-                    const potreeResponse = await fetch('/potree_converter/', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
-                        body: JSON.stringify({
-                            input_filepath: lasPath,
-                            output_filepath: _runtimePath('working', 'clusters')
-                        })
-                    });
-                    if (!potreeResponse.ok) {
-                        const errData = await potreeResponse.json().catch(() => ({}));
-                        throw new Error(errData.message || errData.error || "Potree conversion failed");
-                    }
+                    console.log("🧠 Step 4: Building the point cloud...");
+                    const pcVersion = await buildPointCloud(lasPath);
                     completeStep(3);
-                    console.log("✅ Potree conversion completed");
+                    console.log("✅ Point cloud built");
 
                     // STEP 5: Final Loading in Babylon
                     checkCancelled();
                     currentStepIdx = 4;
                     activateStep(4);
-                    console.log("🏗️ Step 5: Loading Potree data from /data/clusters/...");
+                    console.log("🏗️ Step 5: Loading point cloud from working/pc/...");
                     const scene = window.__babylonScene;
                     const sceneObjects = window.__sceneObjects;
-                    // Dispose previous Potree2 loader and all its meshes
+                    // Dispose previous point cloud loader and all its meshes
                     if (scene) {
-                        const prevLoader = scene.potree2Loader;
+                        const prevLoader = scene.pointCloudLoader;
                         if (prevLoader && typeof prevLoader.dispose === 'function') {
                             prevLoader.dispose();
                         }
-                        scene.potree2Loader = null;
+                        scene.pointCloudLoader = null;
                     }
                     if (sceneObjects && sceneObjects.currentPointCloud) {
                         if (typeof sceneObjects.currentPointCloud.dispose === 'function') {
@@ -2349,8 +2444,8 @@ export function showLoadModal() {
                     window.__selectedModelPath = null;
                     window.dispatchEvent(new CustomEvent('scene-reset'));
 
-                    const pcPath = _runtimeUrl('working', 'clusters');
-                    const pc = await loadPointCloud(pcPath, scene);
+                    const pcPath = _runtimeUrl('working', PC_DIR);
+                    const pc = await loadPointCloud(pcPath, scene, { version: pcVersion });
                     if (pc) {
                         if (sceneObjects) sceneObjects.currentPointCloud = pc;
                         const pcLabel = filename || "Point Cloud";
@@ -2359,23 +2454,14 @@ export function showLoadModal() {
                         }
                     }
                     completeStep(4);
-                    console.log("✅ Process complete. Potree cloud loaded.");
+                    console.log("✅ Process complete. Point cloud loaded.");
 
                     // Store for download logic
                     window.__currentProjectLAS = _runtimePath('working', 'features.las');
-                    window.__currentProjectBIN = _runtimePath('working', 'features.pcbin');
+                    // annotations.bin only exists after the first exportAnnotations()
+                    window.__currentProjectBIN = null;
                     window.__currentProjectName = projectBaseName;
-
-                    // Load feature bin if available (populated by Calculate Features)
-                    try {
-                        const featureBinLoader = window.__babylonScene?.potree2Loader;
-                        if (featureBinLoader) {
-                            const featureNames = await featureBinLoader.loadPcBin(_runtimeUrl('working', 'features.pcbin'));
-                            window.dispatchEvent(new CustomEvent('feature-bin-loaded', { detail: { names: featureNames } }));
-                        }
-                    } catch (binErr) {
-                        console.warn("⚠️ .pcbin store not loaded:", binErr.message);
-                    }
+                    // Feature list: 'features-available' is emitted by loadPointCloud
 
                     await new Promise(r => setTimeout(r, 800));
                     if (!isCancelled) {
@@ -2926,7 +3012,7 @@ export function showTrainingModal(scene, onStart) {
             // Remove unused two-column containers, we'll build the matrix directly
             colsContainer.remove();
 
-            const loader = scene.potree2Loader;
+            const loader = scene.pointCloudLoader;
             const validFeatures = loader ? loader.getFeatureList() : [];
             const featureSwitches = {};
 
@@ -3276,7 +3362,7 @@ export function showTrainingModal(scene, onStart) {
                     ? [...selectedFeatures, 'red', 'green', 'blue']
                     : selectedFeatures;
                 // --- Validation: at least one feature must be selected ---
-                const loader = getPotree2Loader(scene) || scene?.potree2Loader;
+                const loader = getPointCloudLoader(scene) || scene?.pointCloudLoader;
                 const availableFeatures = loader ? loader.getFeatureList() : [];
                 const noFeaturesAvailable = availableFeatures.length === 0;
                 const noFeaturesSelected = selectedFeatures.length === 0 && !useRgb;
@@ -3403,20 +3489,21 @@ export function showTrainingModal(scene, onStart) {
                     });
                     const classMap = {};
                     classRegistry.forEach((val, id) => { classMap[id] = val.name; });
-                    const exportResult = await loader.exportAllTrainingDataAsMapping(segmentMap);
-                    if (!exportResult || !exportResult.mapping_path) {
+                    const exportResult = await loader.exportAnnotations(segmentMap);
+                    if (!exportResult || !exportResult.annotations_path) {
                         throw new Error('No points were identified in the selected regions.');
                     }
                     completeStep(0);
 
-                    // STEP 2: Mapping already saved by exportAllTrainingDataAsMapping
+                    // STEP 2: Annotations already saved by exportAnnotations
                     checkCancelled();
                     currentStepIdx = 1;
                     activateStep(1);
-                    const mappingPath = exportResult.mapping_path;
+                    const annotationsPath = exportResult.annotations_path;
+                    window.__currentProjectBIN = annotationsPath;
                     completeStep(1);
 
-                    // STEP 3: Split LAS by .pcbin annotations
+                    // STEP 3: Split LAS by annotations.bin
                     checkCancelled();
                     currentStepIdx = 2;
                     activateStep(2);
@@ -3429,7 +3516,7 @@ export function showTrainingModal(scene, onStart) {
                         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
                         body: JSON.stringify({
                             las_path: lasSourcePath,
-                            pcbin_path: _runtimePath('working', 'features.pcbin'),
+                            annotations_path: annotationsPath,
                             output_dir: workingDir,
                             segment_names: segmentNames,
                             exclude_unclassified: true
@@ -3975,7 +4062,7 @@ export function showTrainingModal(scene, onStart) {
  * Projects 3D points to screen space to check if they fall within the selection area.
  */
 export function deselectPoints(scene, type, area) {
-    const loader = getPotree2Loader(scene);
+    const loader = getPointCloudLoader(scene);
     if (loader && loader.removeSelection) {
         return loader.removeSelection(type, area);
     }
@@ -3988,8 +4075,8 @@ export function selectPoints(scene, pointCloudRoot, type, area, append = false) 
         return 0;
     }
 
-    // Check if we have a Potree2Loader for persistent selection across LOD levels
-    const loader = getPotree2Loader(scene);
+    // Check if we have a PointCloudLoader for persistent selection across LOD levels
+    const loader = getPointCloudLoader(scene);
     if (loader && loader.applySelection) {
         return loader.applySelection(type, area, append);
     }
@@ -4044,17 +4131,17 @@ export function selectPoints(scene, pointCloudRoot, type, area, append = false) 
 
 /**
  * Clear all point selections and reset colors to original.
- * Wrapper around Potree2Loader.clearSelection() for external use.
+ * Wrapper around PointCloudLoader.clearSelection() for external use.
  */
 export function clearSelection(scene) {
-    const loader = getPotree2Loader(scene);
+    const loader = getPointCloudLoader(scene);
     if (loader && loader.clearSelection) {
         loader.clearSelection();
         return;
     }
 
     // Fallback for simple meshes (non-LOD systems)
-    const root = scene.potree2Root;
+    const root = scene.pointCloudRoot;
     if (!root) return;
     const meshes = root.getChildMeshes ? root.getChildMeshes() : [root];
     meshes.forEach(mesh => {
@@ -4072,10 +4159,10 @@ export function clearSelection(scene) {
  * Invert the current point selection.
  * Points that were selected (red) become unselected (original color),
  * and unselected points become selected (red).
- * Works on all currently loaded nodes via Potree2Loader.
+ * Works on all currently loaded nodes via PointCloudLoader.
  */
 export function invertSelection(scene) {
-    const loader = getPotree2Loader(scene);
+    const loader = getPointCloudLoader(scene);
 
     if (loader && loader.invertSelection) {
         loader.invertSelection();
@@ -4083,7 +4170,7 @@ export function invertSelection(scene) {
     }
 
     // Fallback for simple meshes (non-LOD systems)
-    const root = scene.potree2Root;
+    const root = scene.pointCloudRoot;
     if (!root) return;
     const meshes = root.getChildMeshes ? root.getChildMeshes() : [root];
     meshes.forEach(mesh => {
@@ -4404,8 +4491,8 @@ export function showCalculateFeaturesModal(scene, onConfirm) {
 
                 const STEPS = [
                     "Feature Extraction",
-                    "Generating Feature Bin",
-                    "Loading Features"
+                    "Updating Point Cloud Columns",
+                    "Refreshing Viewer"
                 ];
 
                 // Build step list
@@ -4489,40 +4576,26 @@ export function showCalculateFeaturesModal(scene, onConfirm) {
                     completeStep(0);
                     console.log("✅ Feature extraction completed");
 
-                    // STEP 2: Generate Features pcbin
+                    // STEP 2: write the new feature columns (the geometry is NOT rebuilt)
                     checkCancelled();
                     currentStepIdx = 1;
                     activateStep(1);
-                    console.log("📦 Step 2: Generating features pcbin...");
-                    const binResponse = await fetch('/las_to_feature_bin/', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
-                        body: JSON.stringify({
-                            las_path: _runtimePath('working', 'features.las'),
-                            pcbin_path: _runtimePath('working', 'features.pcbin')
-                        })
-                    });
-                    if (!binResponse.ok) {
-                        const errData = await binResponse.json().catch(() => ({}));
-                        throw new Error(errData.message || errData.error || "Feature bin generation failed");
+                    console.log("📦 Step 2: Updating point cloud columns...");
+                    // Extra Byte names written by the extractor: <feature>_<radius, 1 decimal, '.' → '_'>
+                    const newColumns = [];
+                    for (const feat of selectedFeatures) {
+                        for (const r of radii) newColumns.push(`${feat}_${Number(r).toFixed(1).replace('.', '_')}`);
                     }
+                    await updatePointCloudColumns({ las: _runtimePath('working', 'features.las'), only: newColumns, prune: true });
                     completeStep(1);
-                    console.log("✅ Features pcbin generated");
+                    console.log("✅ Columns updated: " + newColumns.join(', '));
 
-                    // STEP 3: Load Features in Viewer
+                    // STEP 3: the loader picks the columns up, preserving everything else
                     checkCancelled();
                     currentStepIdx = 2;
                     activateStep(2);
-                    console.log("🏗️ Step 3: Loading features in viewer...");
-                    try {
-                        const featureBinLoader = window.__babylonScene?.potree2Loader;
-                        if (featureBinLoader) {
-                            const featureNames = await featureBinLoader.loadPcBin(_runtimeUrl('working', 'features.pcbin'));
-                            window.dispatchEvent(new CustomEvent('feature-bin-loaded', { detail: { names: featureNames } }));
-                        }
-                    } catch (binErr) {
-                        console.warn("⚠️ Feature bin not loaded in viewer:", binErr.message);
-                    }
+                    console.log("🏗️ Step 3: Refreshing features in the viewer...");
+                    await refreshPointCloudColumns(window.__babylonScene);
                     completeStep(2);
                     console.log("✅ Features loaded in viewer");
 
@@ -4866,7 +4939,7 @@ export async function showClassifyModal(scene) {
                 const STEP_PREPARE = needsSplit ? stepIdx++ : -1;
                 const STEP_FEAT_EXTRACT = stepIdx++;
                 const STEP_CLASSIFY = stepIdx++;
-                const STEP_POTREE = stepIdx++;
+                const STEP_PC_UPDATE = stepIdx++;
                 const STEP_RELOAD = stepIdx++;
 
                 // Build step list dynamically
@@ -4874,7 +4947,7 @@ export async function showClassifyModal(scene) {
                     ...(needsSplit ? ['Data Preparation'] : []),
                     'Feature Extraction',
                     'Point Cloud Classification',
-                    'Potree Conversion',
+                    'Updating Point Cloud',
                     'Visualization Update',
                 ];
 
@@ -4924,7 +4997,7 @@ export async function showClassifyModal(scene) {
                         currentStepIdx = STEP_PREPARE;
                         activateStep(currentStepIdx);
 
-                        const loader = scene.potree2Loader;
+                        const loader = scene.pointCloudLoader;
                         const segmentMap = {};
                         document.querySelectorAll('.outline-item[data-segment-id]').forEach(item => {
                             const segId = parseInt(item.dataset.segmentId, 10);
@@ -4933,44 +5006,28 @@ export async function showClassifyModal(scene) {
                         });
                         const classMap = {};
                         classRegistry.forEach((val, id) => { classMap[id] = val.name; });
-                        const exportResult = await loader.exportAllTrainingDataAsMapping(segmentMap);
-                        if (!exportResult || !exportResult.mapping_path)
+                        const exportResult = await loader.exportAnnotations(segmentMap);
+                        if (!exportResult || !exportResult.annotations_path)
                             throw new Error('No points found for the selected segment.');
 
-                        const mappingPath = exportResult.mapping_path;
-
-                        // Ensure features.pcbin exists — it is required by extract-segment-las.
-                        // If the user loaded a cloud without running feature calculation or
-                        // training, the file won't be present yet: generate it on-the-fly.
-                        const pcbinCheckRes = await fetch(_runtimeUrl('working', 'features.pcbin'), { method: 'HEAD' });
-                        if (!pcbinCheckRes.ok) {
-                            console.log('⚙️ features.pcbin not found — generating from features.las…');
-                            const binGenRes = await fetch('/las_to_feature_bin/', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
-                                body: JSON.stringify({
-                                    las_path: _runtimePath('working', 'features.las'),
-                                    pcbin_path: _runtimePath('working', 'features.pcbin')
-                                })
-                            });
-                            if (!binGenRes.ok) {
-                                const e = await binGenRes.json().catch(() => ({}));
-                                throw new Error(e.message || e.error || 'Failed to generate features.pcbin');
-                            }
-                            console.log('✅ features.pcbin generated');
-                        }
+                        const annotationsPath = exportResult.annotations_path;
+                        window.__currentProjectBIN = annotationsPath;
 
                         const segmentOutPath = `${classifyWorkingDir}segment_${splitValue}.las`;
-                        await fetch('/api/extract-segment-las/', {
+                        const extractRes = await fetch('/api/extract-segment-las/', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
                             body: JSON.stringify({
                                 las_path: _runtimePath('working', 'features.las'),
-                                pcbin_path: _runtimePath('working', 'features.pcbin'),
+                                annotations_path: annotationsPath,
                                 seg_id: parseInt(splitValue, 10),
                                 out_path: segmentOutPath,
                             })
                         });
+                        if (!extractRes.ok) {
+                            const e = await extractRes.json().catch(() => ({}));
+                            throw new Error(e.message || e.error || 'Failed to extract the selected segment');
+                        }
                         testFilepath = segmentOutPath;
                         completeStep(currentStepIdx);
                     }
@@ -5031,30 +5088,23 @@ export async function showClassifyModal(scene) {
                         throw new Error(e.message || e.error || 'Classification failed');
                     }
 
-                    await fetch('/las_to_feature_bin/', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
-                        body: JSON.stringify({
-                            las_path: outputClassifyName,
-                            pcbin_path: _runtimePath('working', 'features.pcbin'),
-                        })
-                    });
                     completeStep(currentStepIdx);
 
-                    // ── STEP: Potree Conversion ───────────────────────────────
+                    // ── STEP: Point cloud update (prediction column) ──────────
                     checkCancelled();
-                    currentStepIdx = STEP_POTREE;
+                    currentStepIdx = STEP_PC_UPDATE;
                     activateStep(currentStepIdx);
 
-                    const potreeRes = await fetch('/potree_converter/', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
-                        body: JSON.stringify({
-                            input_filepath: outputClassifyName,
-                            output_filepath: _runtimePath('working', 'potree/'),
-                        })
-                    });
-                    if (!potreeRes.ok) throw new Error("Potree conversion failed.");
+                    // The prediction becomes a column of the main point cloud (255 = no prediction,
+                    // e.g. outside the classified segment): no geometry conversion, no reload.
+                    const columnsRes = await updatePointCloudColumns({ prediction: outputClassifyName });
+                    let fallbackVersion = null;
+                    if (!columnsRes.ok && columnsRes.mismatch) {
+                        // The classified LAS has no POINT_ID that matches this cloud: build a point
+                        // cloud of its own and show that one instead.
+                        console.warn('⚠️ Classified LAS does not match the current point cloud: building pc_classified/');
+                        fallbackVersion = await buildPointCloud(outputClassifyName, PC_CLASSIFIED_DIR);
+                    }
                     completeStep(currentStepIdx);
 
                     // ── STEP: Visualization Update ────────────────────────────
@@ -5062,19 +5112,15 @@ export async function showClassifyModal(scene) {
                     currentStepIdx = STEP_RELOAD;
                     activateStep(currentStepIdx);
                     try {
-                        const featureBinLoader = window.__babylonScene?.potree2Loader;
-                        if (featureBinLoader) {
-                            // Reload features from bin
-                            const featureNames = await featureBinLoader.loadPcBin(_runtimeUrl('working', 'features.pcbin'));
-                            window.dispatchEvent(new CustomEvent('feature-bin-loaded', { detail: { names: featureNames } }));
-
-                            // Re-load the entire cloud points from new Potree output
-                            if (window.loadActiveCloud) {
-                                await window.loadActiveCloud(_runtimeUrl('working', 'potree', 'metadata.json'));
-                            }
+                        if (fallbackVersion !== null) {
+                            // State (segments, classes, history...) is preserved; the loader skips the
+                            // per-point maps by itself when the point count differs.
+                            await reloadPointCloudPreservingState(window.__babylonScene, fallbackVersion, PC_CLASSIFIED_DIR);
+                        } else {
+                            await refreshPointCloudColumns(window.__babylonScene);
                         }
-                    } catch (binErr) {
-                        console.warn('⚠️ Visualization update failed:', binErr.message);
+                    } catch (reloadErr) {
+                        console.warn('⚠️ Visualization update failed:', reloadErr.message);
                     }
                     completeStep(currentStepIdx);
 

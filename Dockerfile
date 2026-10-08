@@ -69,16 +69,6 @@ RUN git clone --depth 1 --branch 2.7.1 https://github.com/PDAL/PDAL.git /tmp/PDA
     ninja -C /tmp/PDAL/build -j${NUM_THREADS} install && \
     rm -rf /tmp/PDAL
 
-# PotreeConverter 2.1.1 — compilato da sorgente (unico modo per arm64)
-# Il risultato viene copiato nel runtime stage tramite COPY --from=builder.
-RUN git clone --depth 1 --branch 2.1.1 https://github.com/potree/PotreeConverter.git /tmp/PotreeConverter && \
-    cmake -S /tmp/PotreeConverter -B /tmp/PotreeConverter/build \
-        -DCMAKE_BUILD_TYPE=Release && \
-    make -C /tmp/PotreeConverter/build -j${NUM_THREADS} && \
-    mkdir -p /opt/potree && \
-    cp /tmp/PotreeConverter/build/PotreeConverter /opt/potree/ && \
-    rm -rf /tmp/PotreeConverter
-
 # ============================================================
 # STAGE 2 — runtime finale
 # Base runtime (no compiler), copia solo i binari compilati.
@@ -126,7 +116,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgeos-c1v5 libhdf4-0-alt \
     # LASzip runtime (per PDAL)
     liblaszip8 \
-    # PotreeConverter runtime
+    # TBB runtime
     libtbb2 \
     # Runtime GMP/MPFR/CGAL — richiesti dal binario mesh2pc
     libgmp10 libgmpxx4ldbl \
@@ -179,7 +169,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 RUN find /usr/local/lib/python3.10 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 # Aggiorna cache librerie dinamiche
-# Rimuoviamo la liblaszip custom (manda in crash Potree) e usiamo quella di sistema
+# Rimuoviamo la liblaszip custom (causa crash nei lettori LAS) e usiamo quella di sistema
 RUN rm -f /usr/local/lib/liblaszip* && \
     if [ "$TARGETARCH" = "amd64" ]; then \
         ln -s /usr/lib/x86_64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so; \
@@ -202,17 +192,13 @@ RUN mkdir -p /app/tinygltf && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image.h       -O /app/tinygltf/stb_image.h && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h -O /app/tinygltf/stb_image_write.h
 
-# ── PotreeConverter — copiato dal builder (compilato da sorgente per entrambe le arch)
-# Il percorso finale replica quello del prebuilt x64 per compatibilità con il codice Python.
-COPY --from=builder /opt/potree/PotreeConverter /app/PotreeConverter_linux_x64/PotreeConverter
-RUN chmod +x /app/PotreeConverter_linux_x64/PotreeConverter
-
 # Aggiorna cache librerie dinamiche
 RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
 
 # ── Progetto Django e cartella opt ────────────────────────
 COPY classifyViewer/ /webapp/classifyViewer/
 COPY opt/            /webapp/opt/
+RUN chmod +x /webapp/opt/*
 
 WORKDIR /webapp/classifyViewer
 

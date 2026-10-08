@@ -112,7 +112,7 @@ void write_las(const std::string& out_file,
         qmin_z = std::min(qmin_z, qz); qmax_z = std::max(qmax_z, qz);
     }
 
-    // Margine di sicurezza: assorbe il rumore in virgola mobile che PotreeConverter
+    // Margine di sicurezza: assorbe il rumore in virgola mobile che i lettori a valle
     // introduce ricalcolando le coordinate dagli int32, evitando "point outside bounding box".
     qmin_x -= scale_xyz; qmax_x += scale_xyz;
     qmin_y -= scale_xyz; qmax_y += scale_xyz;

@@ -24,7 +24,10 @@ import {
     showContextMenu,
     showClassifyModal,
     setLODParameters,
-    getCSRFToken
+    getCSRFToken,
+    reloadPointCloudPreservingState,
+    refreshPointCloudColumns,
+    PC_DIR
 } from "./functions.js";
 
 // --- Runtime path helpers (read from Django-injected config) ---
@@ -96,7 +99,7 @@ function _syncClassifyFocusedSegmentState() {
     const predictionActive = _isPredictionColorModeActive();
     const targetSegId = Number(_classifyFocusedSegmentId);
     const hasFocusedSegment = Number.isFinite(targetSegId);
-    const ldr = scene?.potree2Loader;
+    const ldr = scene?.pointCloudLoader;
 
     outlineContent.querySelectorAll('.outline-item[data-segment-id]').forEach(row => {
         const segId = parseInt(row.dataset.segmentId, 10);
@@ -241,11 +244,10 @@ function _disablePredictionSliderMode(loader = null) {
     }
 }
 
-function _enablePredictionSliderMode(loader, featIdx) {
-    if (!loader?.featureBin) return;
+function _enablePredictionSliderMode(loader, featName) {
+    if (!loader?.hasFeatures() || !loader.featureAttributes.has(featName)) return;
 
-    const absMin = loader.featureBin.vmin[featIdx];
-    const absMax = loader.featureBin.vmax[featIdx];
+    const { min: absMin, max: absMax } = loader.getFeatureRange(featName);
     const minInt = Math.floor(absMin);
     const maxInt = Math.ceil(absMax);
 
@@ -512,11 +514,11 @@ function initFeatureRangeSlider() {
         rangeHighlight.style.left = minPercent + "%";
         rangeHighlight.style.width = (maxPercent - minPercent) + "%";
 
-        const loader = scene.potree2Loader;
-        if (loader && loader.featureBin && currentColorMode.startsWith('feature:')) {
+        const loader = scene.pointCloudLoader;
+        if (loader && loader.hasFeatures() && currentColorMode.startsWith('feature:')) {
             const featName = currentColorMode.slice(8);
-            const featIdx = loader.featureBin.names.indexOf(featName);
-            if (featIdx >= 0) {
+            const featKnown = loader.featureAttributes.has(featName);
+            if (featKnown) {
                 if (predictionSliderState.enabled && featName.toLowerCase() === 'prediction') {
                     const idx = Math.max(0, Math.min(predictionSliderState.allIndex, Math.round(parseFloat(rangeMin.value))));
                     rangeMin.value = String(idx);
@@ -537,8 +539,7 @@ function initFeatureRangeSlider() {
                     return;
                 }
 
-                const absMin = loader.featureBin.vmin[featIdx];
-                const absMax = loader.featureBin.vmax[featIdx];
+                const { min: absMin, max: absMax } = loader.getFeatureRange(featName);
 
                 const currentAbsMin = absMin + (absMax - absMin) * (minVal / 100);
                 const currentAbsMax = absMin + (absMax - absMin) * (maxVal / 100);
@@ -582,7 +583,7 @@ function initFeatureRangeSlider() {
     };
 
     rangeResetBtn.onclick = () => {
-        const loader = scene.potree2Loader;
+        const loader = scene.pointCloudLoader;
 
         if (predictionSliderState.enabled) {
             rangeMin.value = String(predictionSliderState.allIndex);
@@ -644,7 +645,7 @@ function initColormapPicker() {
             btn.classList.add('active');
             _updateColormapPickerIcon(id);
 
-            const loader = scene.potree2Loader;
+            const loader = scene.pointCloudLoader;
             if (loader && typeof loader.setColormap === 'function') loader.setColormap(id);
 
             colormapDropdown.classList.remove('open');
@@ -654,11 +655,19 @@ function initColormapPicker() {
 initColormapPicker();
 
 /**
- * Called after loadPcBin() completes. Adds/refreshes the Features section
+ * Called on 'features-available' (after every point cloud load, including reloads
+ * after the columns of the point cloud changed). Adds/refreshes the Features section
  * in the color menu. Safe to call multiple times (e.g. after calculate).
  * @param {string[]} featureNames
  */
 function addFeaturesToColorMenu(featureNames) {
+    // The feature shown in the viewer may have disappeared (e.g. after restoring the backup):
+    // fall back to the classification view instead of keeping a stale label/mode.
+    if (currentColorMode.startsWith('feature:') && !featureNames.includes(currentColorMode.slice(8))) {
+        switchColorMode('classification');
+        if (_colorMenuBtn) _colorMenuBtn.textContent = 'Classification View';
+    }
+
     // Remove previous feature section first so a reload with zero features
     // actually clears stale entries from the menu.
     const existing = _colorMenuDropdown?.querySelector('.dropdown-feature-section');
@@ -761,7 +770,7 @@ function _measureAndSetDropdownWidth(dropdown, labels) {
     dropdown.style.minWidth = `${Math.ceil(maxTextWidth) + PADDING}px`;
 }
 
-window.addEventListener('feature-bin-loaded', (e) => {
+window.addEventListener('features-available', (e) => {
     addFeaturesToColorMenu(e.detail.names);
 });
 
@@ -819,19 +828,19 @@ function switchColorMode(mode) {
         mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
     }
 
-    // Potree2: the loader handles vertex-color updates internally
+    // The loader handles vertex-color updates internally
     // for all nodes (visible and future) through _applyColorModeToMesh.
-    const p2loader = scene.potree2Loader;
+    const p2loader = scene.pointCloudLoader;
     if (p2loader) {
         if (mode.startsWith('feature:')) {
             featureRangeControl.style.display = 'flex';
             const featName = mode.slice(8);
             featureNameDisplay.textContent = featName;
 
-            const featIdx = p2loader.featureBin ? p2loader.featureBin.names.indexOf(featName) : -1;
-            if (featName.toLowerCase() === 'prediction' && featIdx >= 0) {
+            const featKnown = p2loader.featureAttributes.has(featName);
+            if (featName.toLowerCase() === 'prediction' && featKnown) {
                 p2loader.resetFeatureRange();
-                _enablePredictionSliderMode(p2loader, featIdx);
+                _enablePredictionSliderMode(p2loader, featName);
             } else {
                 _disablePredictionSliderMode(p2loader);
                 rangeMin.value = 0;
@@ -849,7 +858,7 @@ function switchColorMode(mode) {
         return;
     }
 
-    // Fallback: TransformNode con getChildMeshes (sistemi non-Potree2)
+    // Fallback: TransformNode con getChildMeshes (sistemi non basati sul loader a chunk)
     const root = sceneObjects.currentPointCloud;
     if (!root) return;
 
@@ -1182,11 +1191,11 @@ export function registerPointCloudInOutline(pc, label = "Point Cloud") {
         outlineItem.nameInput.value = displayName;
     }
     outlineItem.setVisibilityCallback((visible) => {
-        const loader = window.__babylonScene?.potree2Loader;
+        const loader = window.__babylonScene?.pointCloudLoader;
         if (loader) loader.setSegmentVisible(0, visible);
     });
 }
-// Expose on window so potree2-loader.js (loaded as a separate module) can call it
+// Expose on window so pointcloud-loader.js (loaded as a separate module) can call it
 // after the point cloud finishes loading.
 window.__registerPointCloudInOutline = registerPointCloudInOutline;
 
@@ -1555,7 +1564,7 @@ const orthoCameraState = {
 
 function _computePointCloudBounds() {
     const root = sceneObjects.currentPointCloud;
-    const loader = scene.potree2Loader;
+    const loader = scene.pointCloudLoader;
     if (!root && !loader?.loadedNodes) return null;
 
     const meshes = (loader?.loadedNodes && loader.loadedNodes.size > 0)
@@ -2193,7 +2202,7 @@ function _scanMeshPick(mesh, m, wm, screenX, screenY, stride = 1, bestDist2 = In
 }
 
 function _pickClosestPointInCloudCPU(screenX, screenY) {
-    const loader = scene.potree2Loader;
+    const loader = scene.pointCloudLoader;
     if (!loader || !loader.loadedNodes || loader.loadedNodes.size === 0) return null;
 
     const worldMatrix = loader.rootTransform
@@ -2723,10 +2732,10 @@ lightModeToggle.addEventListener('change', (e) => {
 pointSizeSlider.addEventListener('input', (e) => {
     const multiplier = parseFloat(e.target.value);
     const pc = sceneObjects.currentPointCloud;
-    // For Potree2: delegate entirely to the loader (multiplier applied in update())
+    // Chunked point cloud: delegate entirely to the loader (multiplier applied in update())
     const handledByLoader = setLODParameters(scene, { pointSizeMultiplier: multiplier });
     if (pc && !handledByLoader) {
-        // Fallback for non-Potree2 point clouds only
+        // Fallback for point clouds without the chunked loader only
         const fixedSize = Math.round(multiplier * 2);
         if (pc.getChildMeshes) {
             pc.getChildMeshes().forEach(mesh => {
@@ -2792,14 +2801,19 @@ if (navFileBtn && fileDropdown) {
                     throw new Error(errData.message || errData.error || 'Failed to restore point cloud backup');
                 }
 
+                // The server restored features.las and reset the columns of the point cloud (the geometry
+                // is rebuilt only if the number of points differs): the loader just picks the columns up,
+                // keeping segments/classes/selections/camera.
+                const restoreData = await response.json().catch(() => ({}));
                 try {
-                    const featureBinLoader = window.__babylonScene?.potree2Loader;
-                    if (featureBinLoader) {
-                        const featureNames = await featureBinLoader.loadPcBin(_runtimeUrl('working', 'features.pcbin'));
-                        window.dispatchEvent(new CustomEvent('feature-bin-loaded', { detail: { names: featureNames } }));
+                    const activeDir = window.__babylonScene?.pointCloudLoader?.rangeBasePath?.split('/').pop();
+                    if (restoreData.rebuilt || (activeDir && activeDir !== PC_DIR)) {
+                        await reloadPointCloudPreservingState(window.__babylonScene, restoreData.version, PC_DIR);
+                    } else {
+                        await refreshPointCloudColumns(window.__babylonScene);
                     }
-                } catch (binErr) {
-                    console.warn('⚠️ .pcbin store not reloaded:', binErr.message);
+                } catch (reloadErr) {
+                    console.warn('⚠️ Point cloud not refreshed after restore:', reloadErr.message);
                 }
 
                 console.log('♻️ Point cloud restored from backup.');
@@ -2814,7 +2828,7 @@ if (navFileBtn && fileDropdown) {
         restoreDeletedPointsBtn.addEventListener("click", () => {
             fileDropdown.classList.remove('show');
 
-            const loader = scene?.potree2Loader;
+            const loader = scene?.pointCloudLoader;
             if (!loader?.restoreDeletedPoints) {
                 console.warn("No point cloud loaded.");
                 return;
@@ -2962,7 +2976,7 @@ function handleSelectionKeydown(e) {
     } else if (e.key === 'Delete') {
         e.preventDefault();
         e.stopPropagation();
-        const loader = scene?.potree2Loader;
+        const loader = scene?.pointCloudLoader;
         if (!loader?.deleteSelectedPoints) return;
 
         const count = loader.deleteSelectedPoints();
@@ -3103,7 +3117,7 @@ function disposeMoveTool() {
 }
 
 function activateMoveTool() {
-    const loader = scene.potree2Loader;
+    const loader = scene.pointCloudLoader;
     if (!loader || !loader.rootTransform) {
         console.warn('No point cloud loaded — cannot activate move tool.');
         return;
@@ -3164,7 +3178,7 @@ if (moveModeButton) {
 // SHIFT key held → snap to 10° increments
 // ---------------------------------------------------------------------------
 function disposeRotateTool() {
-    const loader = scene.potree2Loader;
+    const loader = scene.pointCloudLoader;
     if (loader?.rootTransform && rotateAnchorMesh && loader.rootTransform.parent === rotateAnchorMesh) {
         // Bake world transform back onto root before detaching pivot parent.
         const world = loader.rootTransform.getWorldMatrix();
@@ -3193,7 +3207,7 @@ function disposeRotateTool() {
 }
 
 function activateRotateTool() {
-    const loader = scene.potree2Loader;
+    const loader = scene.pointCloudLoader;
     if (!loader || !loader.rootTransform) {
         console.warn('No point cloud loaded — cannot activate rotate tool.');
         return;
@@ -3278,7 +3292,7 @@ window.addEventListener('keyup', (e) => {
 const cutModeButton = document.getElementById("tool-5");
 if (cutModeButton) {
     cutModeButton.addEventListener("click", () => {
-        const loader = scene.potree2Loader;
+        const loader = scene.pointCloudLoader;
         if (!loader) {
             console.warn("No point cloud loaded.");
             return;
@@ -3300,7 +3314,7 @@ if (cutModeButton) {
 
         const item = createOutlineItem(label, `${iconBase}modeling.png`, outlineContent, segId,
             (visible) => {
-                const ldr = scene.potree2Loader;
+                const ldr = scene.pointCloudLoader;
                 if (ldr) ldr.setSegmentVisible(segId, visible);
             },
             false // <--- start hidden
@@ -3324,7 +3338,7 @@ if (cutModeButton) {
 // access to all points.
 // ---------------------------------------------------------------------------
 function showAllSegmentsExceptDeleted() {
-    const ldr = scene.potree2Loader;
+    const ldr = scene.pointCloudLoader;
     const deletedSegId = ldr ? ldr._deletedSegmentId : null;
     outlineContent.querySelectorAll('.outline-item[data-segment-id]').forEach(row => {
         const segId = parseInt(row.dataset.segmentId, 10);
@@ -3347,7 +3361,7 @@ window.__showOnlyOutlineSegment = showOnlySegmentInOutline;
 // --- Training Logic ---
 if (startTrainingButton) {
     startTrainingButton.addEventListener("click", () => {
-        const loader = scene.potree2Loader;
+        const loader = scene.pointCloudLoader;
         if (!loader) {
             console.warn("No point cloud loaded.");
             return;

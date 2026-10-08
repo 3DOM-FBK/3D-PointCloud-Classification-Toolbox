@@ -26,7 +26,7 @@ SECRET_KEY = 'django-insecure-gyg1@$3v%2*ryw(za@vhw)0a%4m*=_=bc4jz-q8!)maz(u2-ty
 # DEBUG = True
 DEBUG = False
 
-ALLOWED_HOSTS = ['0.0.0.0', 'localhost']
+ALLOWED_HOSTS = ['0.0.0.0', 'localhost', '127.0.0.1']
 
 
 # Application definition
@@ -128,7 +128,7 @@ STORAGES = {
     },
 }
 
-# Runtime data (LAS, pcbin, Potree output, models) — NOT collected as static files
+# Runtime data (LAS, annotations.bin, chunked point cloud (pc/), models) — NOT collected as static files
 RUNTIME_DATA_ROOT = BASE_DIR / 'runtime_data'
 RUNTIME_DATA_URL = '/runtime-data/'
 
@@ -141,7 +141,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 DATA_UPLOAD_MAX_MEMORY_SIZE = 5242880000  # 5GB in bytes
 
 # 🔧 Optional: also increase the limit for files
-FILE_UPLOAD_MAX_MEMORY_SIZE = 5242880000  # 5GB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB: larger uploads are spooled to a temporary file instead of RAM
 
 LOGGING = {
     'version': 1,

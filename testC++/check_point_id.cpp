@@ -204,7 +204,7 @@ ExtraByteInfo parse_extra_bytes_vlr(std::ifstream& f,
 // read_las — rileva POINT_ID e normali dai VLR
 //            con rilevamento automatico scala colori (8 vs 16 bit)
 // ============================================================
-LasData read_las(const std::string& path) {
+LasData read_las(const std::string& path, bool header_only = false) {
     LasData data;
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open: " + path);
@@ -266,83 +266,47 @@ LasData read_las(const std::string& path) {
               << "  has_point_id=" << data.has_point_id
               << std::endl;
 
+    if (header_only) { f.close(); return data; }
+
     // --- Lettura point records ---
-    f.seekg(offset_to_data);
+    // The whole record block is read in big chunks and parsed from memory: reading field by field
+    // with ifstream (seekg flushes its buffer) costs several syscalls per point, which takes
+    // minutes on 5 M points when the file lives on a network/bind-mounted file system.
     data.points.resize(num_points);
     data.colors.resize(num_points);
     if (data.has_normals) data.normals.resize(num_points, {0, 0, 0});
 
-    for (uint32_t i = 0; i < num_points; ++i) {
-        // XYZ
-        int32_t ix = read_val<int32_t>(f);
-        int32_t iy = read_val<int32_t>(f);
-        int32_t iz = read_val<int32_t>(f);
-        data.points[i] = {
-            ix * scale_x + off_x,
-            iy * scale_y + off_y,
-            iz * scale_z + off_z
-        };
-
-        if (fmt_base <= 5) {
-            skip(f, 2); // intensity
-            skip(f, 1); // return bits
-            skip(f, 1); // classification
-            skip(f, 1); // scan angle
-            skip(f, 1); // user data
-            skip(f, 2); // point source ID
-
-            if (fmt_base == 1 || fmt_base == 3 || fmt_base == 4 || fmt_base == 5) {
-                skip(f, 8); // GPS time
-            }
-
-            if (format_has_rgb(fmt_base)) {
-                uint16_t r = read_val<uint16_t>(f);
-                uint16_t g = read_val<uint16_t>(f);
-                uint16_t b = read_val<uint16_t>(f);
-                data.colors[i] = { r / 65535.0, g / 65535.0, b / 65535.0 };
+    // Offsets inside the record (same layout the old field-by-field parser walked)
+    int rgb_off = -1;
+    if (format_has_rgb(fmt_base)) rgb_off = (fmt_base <= 5) ? ((fmt_base == 1 || fmt_base == 3 || fmt_base == 4 || fmt_base == 5) ? 28 : 20)
+                                                            : 30;
+    f.seekg(offset_to_data);
+    const size_t rec = point_length;
+    const size_t block_points = std::max<size_t>(1, (64u << 20) / rec);
+    std::vector<char> block(block_points * rec);
+    for (uint32_t start = 0; start < num_points; start += (uint32_t)block_points) {
+        const size_t cnt = std::min<size_t>(block_points, num_points - start);
+        f.read(block.data(), cnt * rec);
+        if ((size_t)f.gcount() != cnt * rec) throw std::runtime_error("Truncated LAS file: " + path);
+        for (size_t k = 0; k < cnt; ++k) {
+            const char* p = block.data() + k * rec;
+            const size_t i = start + k;
+            int32_t xyz[3];
+            memcpy(xyz, p, 12);
+            data.points[i] = { xyz[0] * scale_x + off_x, xyz[1] * scale_y + off_y, xyz[2] * scale_z + off_z };
+            if (rgb_off >= 0) {
+                uint16_t rgb[3];
+                memcpy(rgb, p + rgb_off, 6);
+                data.colors[i] = { rgb[0] / 65535.0, rgb[1] / 65535.0, rgb[2] / 65535.0 };
             } else {
                 data.colors[i] = {0.0, 0.0, 0.0};
             }
-
-            if (fmt_base == 4 || fmt_base == 5) {
-                skip(f, 29); // Wave packet descriptor
-            }
-        } else {
-            skip(f, 2); // intensity
-            skip(f, 1); // return flags
-            skip(f, 1); // classification flags
-            skip(f, 1); // classification
-            skip(f, 1); // user data
-            skip(f, 2); // scan angle
-            skip(f, 2); // point source ID
-            skip(f, 8); // GPS time
-
-            if (format_has_rgb(fmt_base)) {
-                uint16_t r = read_val<uint16_t>(f);
-                uint16_t g = read_val<uint16_t>(f);
-                uint16_t b = read_val<uint16_t>(f);
-                data.colors[i] = { r / 65535.0, g / 65535.0, b / 65535.0 };
-            } else {
-                data.colors[i] = {0.0, 0.0, 0.0};
-            }
-
-            if (fmt_base == 8 || fmt_base == 10) {
-                skip(f, 2); // NIR
-            }
-            if (fmt_base == 9 || fmt_base == 10) {
-                skip(f, 29); // Wave packet descriptor
-            }
-        }
-
-        // Extra bytes
-        if (extra_size > 0) {
-            std::vector<char> extra(extra_size);
-            f.read(extra.data(), extra_size);
-            if (data.has_normals) {
+            if (extra_size > 0 && data.has_normals) {
+                const char* ex = p + base_point_size;
                 float nx, ny, nz;
-                memcpy(&nx, extra.data() + eb.normal_x_off, 4);
-                memcpy(&ny, extra.data() + eb.normal_y_off, 4);
-                memcpy(&nz, extra.data() + eb.normal_z_off, 4);
+                memcpy(&nx, ex + eb.normal_x_off, 4);
+                memcpy(&ny, ex + eb.normal_y_off, 4);
+                memcpy(&nz, ex + eb.normal_z_off, 4);
                 data.normals[i] = { (double)nx, (double)ny, (double)nz };
             }
             // POINT_ID is ignored on read and recomputed on write.
@@ -497,7 +461,8 @@ std::string check_and_fix(const std::string& input_path,
                            const std::string& output_path)
 {
     std::cout << "Reading: " << input_path << std::endl;
-    LasData data = read_las(input_path);
+    // Header only first: when nothing has to change the points are never loaded
+    LasData data = read_las(input_path, true);
 
     bool needs_normals   = !data.has_normals;
     bool needs_point_id  = !data.has_point_id;
@@ -520,6 +485,8 @@ std::string check_and_fix(const std::string& input_path,
 
         return input_path;
     }
+
+    data = read_las(input_path);
 
     // Add normals if they are missing.
     if (needs_normals) {

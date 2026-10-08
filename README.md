@@ -3,7 +3,7 @@
 [3DPointcloudClassificationToolbox.webm](https://github.com/user-attachments/assets/db06b846-2902-48cd-986e-8798f9dd2e43)
 
 A web-based application for interactive visualization and supervised classification of
-3D point clouds. It combines a Django REST backend, a BabylonJS + Potree 2.0 frontend,
+3D point clouds. It combines a Django REST backend, a BabylonJS frontend with a chunked, multi-resolution point cloud format,
 and a GPU-accelerated C++ processing pipeline to support the full workflow — from raw
 3D data upload to labeling, feature extraction, Random Forest training, and classified
 output export.
@@ -21,7 +21,7 @@ output export.
 - **Random Forest classification** — GPU-accelerated training and inference via RAPIDS
   cuML; scikit-learn CPU fallback for non-GPU environments
 - **LOD streaming** — large point clouds streamed with adaptive level-of-detail via
-  Potree 2.0
+  a chunked point cloud format (stratified levels of detail, one column per attribute)
 - **Prediction visualization** — discrete per-class coloring and confidence overlay
 - **Export** — download classified segments and trained models as a single ZIP package
 
@@ -29,7 +29,7 @@ output export.
 
 The application is structured in three layers:
 
-1. **Frontend** — BabylonJS 3D scene with Potree 2.0 LOD streaming. All user
+1. **Frontend** — BabylonJS 3D scene with chunked LOD streaming. All user
    interaction (selection tools, class registry, colormap, segment management) runs
    in the browser.
 2. **Django backend** — REST API with 30+ endpoints that orchestrate file uploads,
@@ -37,7 +37,7 @@ The application is structured in three layers:
    support for large binary files).
 3. **C++ processing pipeline** — eight pre-compiled binaries at `/webapp/opt/` inside
    the container, covering format conversion, subsampling, GPU/CPU feature extraction,
-   Potree conversion, and `.pcbin` binary export. Invoked from Python via `subprocess`.
+   and annotation-based LAS splitting. Invoked from Python via `subprocess`.
 
 For a detailed breakdown, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -120,9 +120,10 @@ Mounting the source directory enables live code reloading without rebuilding the
 │       ├── functions.py            # JobManager and C++ subprocess wrappers
 │       ├── utils_functions/
 │       │   ├── RF_training.py      # Random Forest training
-│       │   └── RF_classify.py      # Random Forest inference (CPU/GPU)
+│       │   ├── RF_classify.py      # Random Forest inference (CPU/GPU)
+│       │   └── pc_columns.py       # Attribute columns of the chunked point cloud
 │       ├── static/viewer/
-│       │   ├── js/                 # BabylonJS app, Potree 2.0 loader, UI logic
+│       │   ├── js/                 # BabylonJS app, chunked point cloud loader + worker, UI logic
 │       │   ├── css/                # Application and documentation styles
 │       │   └── images/             # Workflow diagrams
 │       └── templates/viewer/
@@ -135,8 +136,8 @@ Mounting the source directory enables live code reloading without rebuilding the
     ├── mesh2pc
     ├── ply2las
     ├── split_las_by_binary
-    ├── las_to_feature_bin
-    └── check_point_id
+    ├── check_point_id
+    └── las2pc
 ```
 
 ## Documentation
@@ -148,6 +149,7 @@ Mounting the source directory enables live code reloading without rebuilding the
 | [Architecture](docs/ARCHITECTURE.md) | System design, data flow, Python ↔ C++ integration, ML pipeline |
 | [API Reference](docs/API_REFERENCE.md) | All REST endpoints with request and response schemas |
 | [C++ Binaries Reference](docs/BINARIES.md) | CLI reference for all processing binaries in `opt/` |
+| [Point Cloud Format](docs/POINTCLOUD_FORMAT.md) | Chunked point cloud format (`geom.bin`, columns, `meta.json`) and its tools |
 
 ## Python Dependencies
 

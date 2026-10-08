@@ -8,34 +8,11 @@ from tqdm import tqdm
 from django.conf import settings
 import laspy
 import json
+import sys
+import shutil
 from pathlib import Path
 
 
-
-def launch_subprocess(command):
-    """
-    Standalone helper to launch a subprocess and return its last line of output.
-    """
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True
-    )
-
-    stdout_lines = []
-    for line in process.stdout:
-        print(line, end="")      # print live
-        stdout_lines.append(line)
-
-    process.wait()
-
-    if process.returncode != 0:
-        raise RuntimeError(
-            f"Process failed (code {process.returncode})"
-        )
-
-    return stdout_lines[-1].strip() if stdout_lines else ""
 
 class JobManager:
     def __init__(self):
@@ -285,21 +262,110 @@ def feature_extraction(input_filepath, output_filepath, feature_list, radius_lis
 
 
 
-def Potree(input_filepath, output_filepath):
-    print("\n[FUNCTION] ---- Potree Converter -----")
+class PointCloudMismatch(RuntimeError):
+    """The LAS does not describe the points of the current chunked point cloud (POINT_ID mismatch)."""
 
-    # Make paths absolute
-    abs_input = os.path.abspath(os.path.join(settings.BASE_DIR, input_filepath))
-    abs_output = os.path.abspath(os.path.join(settings.BASE_DIR, output_filepath))
 
-    # Ensure the output directory exists
-    if not os.path.exists(abs_output):
-        os.makedirs(abs_output, exist_ok=True)
+def _abs_from_base(path):
+    return os.path.abspath(os.path.join(settings.BASE_DIR, path))
 
-    command = ["/app/PotreeConverter_linux_x64/PotreeConverter", "-i", abs_input, "-o", abs_output]
-    
-    job.launch_subprocess(command)
-    
+
+def _pc_columns_script():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils_functions", "pc_columns.py")
+
+
+def _run_pc_columns(abs_pc_dir, abs_las=None, only=None, prediction=None, drop_all=False, prune=False):
+    """Runs pc_columns.py through the JobManager (so /stop_process/ can kill it)."""
+    command = [sys.executable, _pc_columns_script(), "--pc-dir", abs_pc_dir]
+    if drop_all:
+        command.append("--drop-all")
+    if prediction:
+        command += ["--prediction", prediction]
+    elif abs_las:
+        command += ["--las", abs_las]
+        command += ["--only", ",".join(only)] if only else ["--all"]
+        if prune:
+            command.append("--prune")
+    try:
+        job.launch_subprocess(command)
+    except RuntimeError as e:
+        if "PC_COLUMNS_MISMATCH" in str(e):
+            raise PointCloudMismatch(str(e))
+        raise
+
+
+def build_pointcloud(input_filepath, output_filepath):
+    """
+    Builds the chunked point cloud (las2pc + one column per LAS Extra Byte) with an atomic swap.
+
+    las2pc and the column writer work in '<output>_tmp'. Only on success the tmp folder replaces the
+    output folder, so on error (or user stop) the previous point cloud stays untouched.
+
+    Returns:
+        str: geometry version token (used as ?v= cache buster by the viewer).
+    """
+    print("\n[FUNCTION] ---- Build point cloud (las2pc) -----")
+
+    abs_input = _abs_from_base(input_filepath)
+    abs_output = _abs_from_base(output_filepath)
+    abs_tmp = abs_output + "_tmp"
+    abs_old = abs_output + "_old"
+
+    for leftover in (abs_tmp, abs_old):
+        if os.path.exists(leftover):
+            shutil.rmtree(leftover, ignore_errors=True)
+    os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+
+    try:
+        job.launch_subprocess(["/webapp/opt/las2pc", "--input", abs_input, "--output", abs_tmp])
+        # A stopped process returns without error: make sure the geometry really completed
+        if not all(os.path.isfile(os.path.join(abs_tmp, f)) for f in ("meta.json", "geom.bin", "point_order.bin")):
+            raise RuntimeError("las2pc did not produce a complete point cloud (stopped or failed)")
+        _run_pc_columns(abs_tmp, abs_las=abs_input)
+        if not os.path.isfile(os.path.join(abs_tmp, "meta.json")):
+            raise RuntimeError("Column writer did not complete (stopped or failed)")
+    except Exception:
+        shutil.rmtree(abs_tmp, ignore_errors=True)
+        raise
+
+    # Atomic swap: pc -> pc_old, pc_tmp -> pc, remove pc_old
+    if os.path.exists(abs_output):
+        os.replace(abs_output, abs_old)
+    try:
+        os.replace(abs_tmp, abs_output)
+    except Exception:
+        if os.path.exists(abs_old):
+            os.replace(abs_old, abs_output)
+        raise
+    shutil.rmtree(abs_old, ignore_errors=True)
+
+    with open(os.path.join(abs_output, "meta.json"), "r") as f:
+        version = str(json.load(f)["version"])
+    print(f"Point cloud ready in {abs_output} (version {version})")
+    return version
+
+
+def update_pointcloud_columns(pc_dir, las_filepath=None, only=None, prediction_filepath=None, drop_all=False, prune=False):
+    """
+    Rewrites attribute columns of an existing chunked point cloud (no geometry rebuild).
+
+    - las_filepath (+ only): write all Extra Bytes of the LAS, or just the names in `only`
+    - prediction_filepath: write the 'prediction' column from a classified LAS (may be a subset);
+      raises PointCloudMismatch when its POINT_IDs do not belong to the point cloud
+    - drop_all: delete every column first (restore backup)
+    - prune: also drop the columns that are no longer Extra Bytes of the LAS (after a feature extraction)
+    """
+    print("\n[FUNCTION] ---- Update point cloud columns -----")
+    _run_pc_columns(
+        _abs_from_base(pc_dir),
+        abs_las=_abs_from_base(las_filepath) if las_filepath else None,
+        only=only,
+        prediction=_abs_from_base(prediction_filepath) if prediction_filepath else None,
+        drop_all=drop_all,
+        prune=prune,
+    )
+
+
 def launch_training_RF(data):
     print("\n[FUNCTION] ---- TRAINING RANDOM FOREST -----")
 
@@ -395,20 +461,20 @@ def export_point_cloud(filepath, points, header=None):
             f.write(line + '\n')
    
 
-def split_las_by_store(las_path: str, pcbin_path: str, output_dir: str = None, exclude_unclassified: bool = False):
+def split_las_by_store(las_path: str, annotations_path: str, output_dir: str = None, exclude_unclassified: bool = False):
     """
-    Splits a LAS file using .pcbin store annotations.
+    Splits a LAS file using the annotations.bin store.
 
     Args:
         las_path:              Path to the input .las file
-        pcbin_path:            Path to the .pcbin unified binary store
+        annotations_path:      Path to annotations.bin (2 bytes per POINT_ID: seg+1, class)
         output_dir:            Output directory (default: same folder as las_path)
-        exclude_unclassified:  If True, skip points with class_id == 0xFF
+        exclude_unclassified:  If True, skip points without a class (class_id == 0)
     """
-    print("\n[FUNCTION] ---- SPLIT LAS BY PCBIN STORE (C++ PDAL) -----")
+    print("\n[FUNCTION] ---- SPLIT LAS BY ANNOTATIONS STORE (C++ PDAL) -----")
 
     abs_las    = os.path.abspath(os.path.join(settings.BASE_DIR, las_path) if not os.path.isabs(las_path) else las_path)
-    abs_pcbin  = os.path.abspath(os.path.join(settings.BASE_DIR, pcbin_path) if not os.path.isabs(pcbin_path) else pcbin_path)
+    abs_annot  = os.path.abspath(os.path.join(settings.BASE_DIR, annotations_path) if not os.path.isabs(annotations_path) else annotations_path)
     abs_outdir = os.path.abspath(os.path.join(settings.BASE_DIR, output_dir) if output_dir and not os.path.isabs(output_dir) else (output_dir or os.path.dirname(abs_las)))
 
     os.makedirs(abs_outdir, exist_ok=True)
@@ -416,33 +482,30 @@ def split_las_by_store(las_path: str, pcbin_path: str, output_dir: str = None, e
     command = [
         "/webapp/opt/split_las_by_binary",
         abs_las,
-        abs_pcbin,
+        abs_annot,
         abs_outdir,
     ]
 
     if exclude_unclassified:
         command.append("--exclude-unclassified")
 
-    launch_subprocess(command)
+    job.launch_subprocess(command)
 
-# Backward-compat alias
-split_las_by_mapping = split_las_by_store
-
-def extract_segment_las(las_path: str, pcbin_path: str, seg_id: int, out_path: str):
+def extract_segment_las(las_path: str, annotations_path: str, seg_id: int, out_path: str):
     """
     Extracts all points belonging to a specific segment from features.las
     into a new LAS file ready for classification (no 'labels' extra dim added).
 
     Args:
-        las_path:   Path to features.las (source point cloud)
-        pcbin_path: Path to the .pcbin unified binary store
-        seg_id:     Integer segment ID to extract
-        out_path:   Path for the output .las file
+        las_path:         Path to features.las (source point cloud)
+        annotations_path: Path to annotations.bin
+        seg_id:           Integer segment ID to extract
+        out_path:         Path for the output .las file
     """
     print(f"\n[FUNCTION] ---- EXTRACT SEGMENT LAS (seg_id={seg_id}) -----")
 
     abs_las   = os.path.abspath(os.path.join(settings.BASE_DIR, las_path))
-    abs_pcbin = os.path.abspath(os.path.join(settings.BASE_DIR, pcbin_path))
+    abs_annot = os.path.abspath(os.path.join(settings.BASE_DIR, annotations_path))
     abs_out   = os.path.abspath(os.path.join(settings.BASE_DIR, out_path))
 
     os.makedirs(os.path.dirname(abs_out), exist_ok=True)
@@ -450,34 +513,10 @@ def extract_segment_las(las_path: str, pcbin_path: str, seg_id: int, out_path: s
     command = [
         "/webapp/opt/split_las_by_binary",
         abs_las,
-        abs_pcbin,
+        abs_annot,
         "--extract-segment",
         str(seg_id),
         abs_out,
     ]
 
-    launch_subprocess(command)
-
-def las_to_feature_bin(las_path: str, pcbin_path: str):
-    """
-    Converts a features.las file into a unified binary store (.pcbin)
-    with per-point feature values and empty annotation slots.
-
-    Args:
-        las_path:   Path to the input features.las (with POINT_ID + extra dims)
-        pcbin_path: Path for the output .pcbin file
-    """
-    print("\n[FUNCTION] ---- LAS TO PCBIN STORE -----")
-
-    abs_las   = os.path.abspath(os.path.join(settings.BASE_DIR, las_path))
-    abs_pcbin = os.path.abspath(os.path.join(settings.BASE_DIR, pcbin_path))
-
-    os.makedirs(os.path.dirname(abs_pcbin), exist_ok=True)
-
-    command = [
-        "/webapp/opt/las_to_feature_bin",
-        abs_las,
-        abs_pcbin,
-    ]
-
-    launch_subprocess(command)
+    job.launch_subprocess(command)

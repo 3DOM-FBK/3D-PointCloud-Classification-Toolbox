@@ -73,13 +73,6 @@ RUN mkdir -p /app/tinygltf && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image.h -O /app/tinygltf/stb_image.h && \
     wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h -O /app/tinygltf/stb_image_write.h
 
-# Potree Libraries
-RUN wget https://github.com/potree/PotreeConverter/releases/download/2.1.1/PotreeConverter_2.1.1_x64_linux.zip
-RUN unzip PotreeConverter_2.1.1_x64_linux.zip
-RUN rm PotreeConverter_2.1.1_x64_linux.zip
-
-RUN chmod +x PotreeConverter_linux_x64/PotreeConverter
-
 # # Build custom tools
 # Build already done so we can skip this step.  
 # RUN mkdir -p /app/build && \

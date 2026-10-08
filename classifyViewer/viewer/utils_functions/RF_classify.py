@@ -113,6 +113,13 @@ def read_las_data(filepath):
             except AttributeError:
                 continue
 
+    # POINT_ID goes through a float32 matrix (exact only up to 2^24): keep the real uint32 values aside
+    # and use them when writing, otherwise ids above 16 777 216 are corrupted.
+    for dim in list(las.point_format.dimension_names):  # all_dims is a one-shot generator
+        if dim.lower() in ('point_id', 'pointid'):
+            original_metadata['point_id'] = np.array(las[dim], dtype=np.uint32)
+            break
+
     if 'prediction' not in header:
         header.append('prediction')
 
@@ -173,6 +180,8 @@ def write_classification_las(X, Y, filename, header, original_metadata=None):
         elif cl == 'green': las.green = data.astype(np.uint16)
         elif cl == 'blue': las.blue = data.astype(np.uint16)
         elif cl == 'intensity': las.intensity = data.astype(np.uint16)
+        elif ('point_id' in cl or 'pointid' in cl) and original_metadata is not None and 'point_id' in original_metadata:
+            las[col_name] = original_metadata['point_id']
         elif cl == 'scan_angle': las.scan_angle_rank = np.clip(np.rint(data), -128, 127).astype(np.int8)
         else:
             las[col_name] = data.astype(np.float32 if 'point_id' not in cl else np.uint32)

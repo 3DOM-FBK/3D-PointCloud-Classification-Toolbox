@@ -1,0 +1,6 @@
+/classifyViewer/staticfiles/
+/classifyViewer/runtime_data/
+/testC++/build/
+
+# Working notes / prompts used to drive changes: not part of the application
+/PROMPT_*.md

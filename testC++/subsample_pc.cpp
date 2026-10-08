@@ -158,83 +158,49 @@ LasData read_las(const std::string& path) {
               << "  offset=(" << off_x << "," << off_y << "," << off_z << ")"
               << std::endl;
 
-    // Vai direttamente ai point records
-    f.seekg(offset_to_data);
-
+    // Read the point records in large blocks and decode them from memory.
+    // Walking the file field by field with ifstream (every skip() is a seekg that drops the
+    // stream buffer) costs several syscalls per point: minutes for millions of points on network
+    // or bind-mounted file systems.
     data.points.resize(num_points);
     data.colors.resize(num_points);
     if (has_normals_in_file) data.normals.resize(num_points, {0,0,0});
 
-    for (uint32_t i = 0; i < num_points; ++i) {
-        // XYZ int32 → double
-        int32_t ix = read_val<int32_t>(f);
-        int32_t iy = read_val<int32_t>(f);
-        int32_t iz = read_val<int32_t>(f);
-        data.points[i] = {
-            ix * scale_x + off_x,
-            iy * scale_y + off_y,
-            iz * scale_z + off_z
-        };
-        if (fmt_base <= 5) {
-            skip(f, 2); // intensity
-            skip(f, 1); // return bits
-            skip(f, 1); // classification
-            skip(f, 1); // scan angle
-            skip(f, 1); // user data
-            skip(f, 2); // point source ID
+    // Offset of the RGB triplet inside the record (-1: the format has no colour)
+    int rgb_off = -1;
+    if (format_has_rgb(fmt_base)) {
+        if (fmt_base <= 5) rgb_off = (fmt_base == 3 || fmt_base == 5) ? 28 : 20;
+        else               rgb_off = 30;
+    }
 
-            if (fmt_base == 1 || fmt_base == 3 || fmt_base == 4 || fmt_base == 5) {
-                skip(f, 8); // GPS time
-            }
-
-            if (format_has_rgb(fmt_base)) {
-                uint16_t r = read_val<uint16_t>(f);
-                uint16_t g = read_val<uint16_t>(f);
-                uint16_t b = read_val<uint16_t>(f);
-                data.colors[i] = { r / 65535.0, g / 65535.0, b / 65535.0 };
+    f.seekg(offset_to_data);
+    const size_t rec = point_length;
+    const size_t block_points = std::max<size_t>(1, (64u << 20) / rec);
+    std::vector<char> block(block_points * rec);
+    for (uint32_t start = 0; start < num_points; start += (uint32_t)block_points) {
+        const size_t cnt = std::min<size_t>(block_points, num_points - start);
+        f.read(block.data(), cnt * rec);
+        if ((size_t)f.gcount() != cnt * rec) throw std::runtime_error("Truncated LAS file: " + path);
+        for (size_t k = 0; k < cnt; ++k) {
+            const char* p = block.data() + k * rec;
+            const size_t i = start + k;
+            // XYZ int32 -> double
+            int32_t xyz[3];
+            std::memcpy(xyz, p, 12);
+            data.points[i] = { xyz[0] * scale_x + off_x, xyz[1] * scale_y + off_y, xyz[2] * scale_z + off_z };
+            if (rgb_off >= 0) {
+                uint16_t rgb[3];
+                std::memcpy(rgb, p + rgb_off, 6);
+                data.colors[i] = { rgb[0] / 65535.0, rgb[1] / 65535.0, rgb[2] / 65535.0 };
             } else {
                 data.colors[i] = {0.0, 0.0, 0.0};
             }
-
-            if (fmt_base == 4 || fmt_base == 5) {
-                skip(f, 29); // Wave packet descriptor
+            // Extra bytes: normals (3 x float) come first, POINT_ID (ignored here) last
+            if (has_normals_in_file) {
+                float n[3];
+                std::memcpy(n, p + base_point_size, 12);
+                data.normals[i] = { (double)n[0], (double)n[1], (double)n[2] };
             }
-        } else {
-            skip(f, 2); // intensity
-            skip(f, 1); // return flags
-            skip(f, 1); // classification flags
-            skip(f, 1); // classification
-            skip(f, 1); // user data
-            skip(f, 2); // scan angle
-            skip(f, 2); // point source ID
-            skip(f, 8); // GPS time
-
-            if (format_has_rgb(fmt_base)) {
-                uint16_t r = read_val<uint16_t>(f);
-                uint16_t g = read_val<uint16_t>(f);
-                uint16_t b = read_val<uint16_t>(f);
-                data.colors[i] = { r / 65535.0, g / 65535.0, b / 65535.0 };
-            } else {
-                data.colors[i] = {0.0, 0.0, 0.0};
-            }
-
-            if (fmt_base == 8 || fmt_base == 10) {
-                skip(f, 2); // NIR
-            }
-            if (fmt_base == 9 || fmt_base == 10) {
-                skip(f, 29); // Wave packet descriptor
-            }
-        }
-
-        // Extra bytes
-        if (has_normals_in_file) {
-            float nx = read_val<float>(f);
-            float ny = read_val<float>(f);
-            float nz = read_val<float>(f);
-            data.normals[i] = { (double)nx, (double)ny, (double)nz };
-        }
-        if (has_point_id) {
-            skip(f, 4); // POINT_ID
         }
     }
 

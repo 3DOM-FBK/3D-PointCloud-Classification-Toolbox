@@ -1,21 +1,21 @@
 from django.shortcuts import render
-from django.http import HttpResponse, StreamingHttpResponse, Http404,JsonResponse
+from django.http import HttpResponse, StreamingHttpResponse, FileResponse, Http404,JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from .functions import launch_training_RF, launch_classify_RF, subsampling_point_cloud, stop_processes, get_voxel_size, check_point_id, inspect_las_header
-from .functions import mesh_to_point_cloud, ply_to_las, feature_extraction, Potree, split_las_by_store, las_to_feature_bin, extract_segment_las
+from .functions import mesh_to_point_cloud, ply_to_las, feature_extraction, build_pointcloud, update_pointcloud_columns, PointCloudMismatch, split_las_by_store, extract_segment_las
 import base64
 import os
 import json
-import struct
 import traceback
 import re
 import datetime
 import zipfile
 import tempfile
 import shutil
+import zlib
+import numpy as np
 from django.conf import settings
 from io import BytesIO
-from .functions import extract_segment_las
 
 
 def _get_working_dir():
@@ -38,6 +38,45 @@ def _runtime_relative_path(*parts):
     """Return path relative to BASE_DIR, e.g. runtime_data/working/features.las"""
     base = settings.RUNTIME_DATA_ROOT.relative_to(settings.BASE_DIR).as_posix()
     return '/'.join([base, *parts])
+
+
+# Single chunked point cloud folder under runtime_data/working (keep in sync with PC_DIR in functions.js)
+PC_DIR = 'pc'
+
+
+def _las_point_count(las_path):
+    """Number of points from the LAS header (legacy count, or the 64-bit one of LAS 1.4)."""
+    import struct
+    with open(las_path, 'rb') as f:
+        head = f.read(375)
+    count, = struct.unpack_from('<I', head, 107)
+    if count == 0 and head[25] >= 4 and len(head) >= 255:
+        count, = struct.unpack_from('<Q', head, 247)
+    return count
+
+
+def _annotations_relative_path():
+    """Default annotations store: runtime_data/working/annotations.bin"""
+    return _runtime_relative_path('working', 'annotations.bin')
+
+
+def _resolve_annotations_path(annotations_path=None):
+    """
+    Resolve the annotations.bin path (relative to BASE_DIR) to a validated absolute path.
+    Raises ValueError if it escapes BASE_DIR, FileNotFoundError if the file is missing.
+    Returns (relative_path, absolute_path).
+    """
+    rel = annotations_path or _annotations_relative_path()
+    base = os.path.normpath(str(settings.BASE_DIR))
+    abs_path = os.path.normpath(os.path.join(base, rel))
+    if not abs_path.startswith(base):
+        raise ValueError("Invalid annotations_path")
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(
+            "annotations.bin not found: no annotations have been saved yet. "
+            "Create segments/classes in the viewer first."
+        )
+    return rel, abs_path
 
 @csrf_exempt
 def launch_RF_training(request):
@@ -234,22 +273,65 @@ def feat_extraction(request):
     return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
 
 @csrf_exempt
-def potree_converter(request):
+def build_pointcloud_view(request):
     if request.method == 'POST':
         try:
-            print("\n[REQUEST FUNCTION] POTREE CONVERTER:", request.body[:200]) 
+            print("\n[REQUEST FUNCTION] BUILD POINT CLOUD:", request.body[:200])
             data = json.loads(request.body)
 
             input_filepath = data['input_filepath']
             output_filepath = data['output_filepath']
-        
-            Potree(input_filepath, output_filepath)
+
+            version = build_pointcloud(input_filepath, output_filepath)
             print("\n")
 
-            return JsonResponse({"status": 'success', "message": "Potree conversion completed."})
+            return JsonResponse({"status": 'success', "message": "Point cloud built.", "version": version})
 
         except Exception as e:
-            print("\n[REQUEST FUNCTION] Potree conversion ERROR " + str(e))
+            print("\n[REQUEST FUNCTION] Build point cloud ERROR " + str(e))
+            print(traceback.format_exc())
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def update_pointcloud_columns_view(request):
+    """
+    Rewrites attribute columns of the current point cloud (the geometry is untouched).
+
+    JSON body (paths relative to BASE_DIR, like the other endpoints):
+      pc_dir               : point cloud folder (default runtime_data/working/pc)
+      las_filepath + only  : write the Extra Bytes `only` of the LAS (or all of them when `only` is empty)
+      prediction_filepath  : write the 'prediction' column from a classified LAS
+      drop_all             : remove every column first
+      prune                : with las_filepath, drop the columns that are not in the LAS any more
+
+    Answers 409 {"status": "mismatch"} when the classified LAS does not belong to the point cloud.
+    """
+    if request.method == 'POST':
+        try:
+            print("\n[REQUEST FUNCTION] UPDATE POINT CLOUD COLUMNS:", request.body[:200])
+            data = json.loads(request.body)
+            pc_dir = data.get('pc_dir') or _runtime_relative_path('working', PC_DIR)
+            las_filepath = data.get('las_filepath')
+            prediction = data.get('prediction_filepath')
+            only = data.get('only') or None
+            drop_all = bool(data.get('drop_all'))
+            prune = bool(data.get('prune'))
+            if not (las_filepath or prediction or drop_all):
+                return JsonResponse({'status': 'error', 'message': 'Nothing to update'}, status=400)
+
+            update_pointcloud_columns(pc_dir, las_filepath=las_filepath, only=only,
+                                      prediction_filepath=prediction, drop_all=drop_all, prune=prune)
+            print("\n")
+            return JsonResponse({"status": 'success', "message": "Point cloud columns updated."})
+
+        except PointCloudMismatch as e:
+            print("\n[REQUEST FUNCTION] Update point cloud columns MISMATCH " + str(e))
+            return JsonResponse({'status': 'mismatch', 'message': str(e)}, status=409)
+        except Exception as e:
+            print("\n[REQUEST FUNCTION] Update point cloud columns ERROR " + str(e))
             print(traceback.format_exc())
             return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -315,27 +397,24 @@ def save_file(request):
 @csrf_exempt
 def _split_las_by_binary(request):
     """
-    Split LAS point cloud by segment annotations from the .pcbin store.
+    Split LAS point cloud by segment annotations from the annotations.bin store.
 
     POST body (JSON):
-        las_path   - path to features.las
-        pcbin_path - path to features.pcbin (unified binary store)
-        output_dir - destination directory for output segment_*.las files
+        las_path         - path to features.las
+        annotations_path - path to annotations.bin (default: working/annotations.bin)
+        output_dir       - destination directory for output segment_*.las files
     """
     if request.method == 'POST':
         try:
-            print("\n[REQUEST FUNCTION] SPLIT LAS BY PCBIN:", request.body[:200])
+            print("\n[REQUEST FUNCTION] SPLIT LAS BY ANNOTATIONS:", request.body[:200])
             data = json.loads(request.body)
 
             las_path   = data['las_path']
-            pcbin_path = data.get('pcbin_path') or data.get('mapping_path')  # backward compat
             output_dir = data['output_dir']
             exclude_unclassified = bool(data.get('exclude_unclassified', False))
+            annotations_path, _ = _resolve_annotations_path(data.get('annotations_path'))
 
-            if not pcbin_path:
-                raise ValueError("pcbin_path is required")
-
-            split_las_by_store(las_path, pcbin_path, output_dir, exclude_unclassified=exclude_unclassified)
+            split_las_by_store(las_path, annotations_path, output_dir, exclude_unclassified=exclude_unclassified)
 
             # Rename segment files to training.las / validation.las if mapping provided
             segment_names = data.get('segment_names')  # e.g. {"1": "training", "2": "validation"}
@@ -355,38 +434,6 @@ def _split_las_by_binary(request):
 
         except Exception as e:
             print("\n[REQUEST FUNCTION] Split LAS ERROR " + str(e))
-            print(traceback.format_exc())
-            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-    return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
-
-@csrf_exempt
-def las_to_feature_bin_view(request):
-    """
-    Generate .pcbin feature store from a LAS file.
-
-    POST body (JSON):
-        las_path   - path to features.las
-        pcbin_path - destination path for features.pcbin
-    """
-    if request.method == 'POST':
-        try:
-            print("\n[REQUEST FUNCTION] LAS TO FEATURES PCBIN:", request.body[:200])
-            data = json.loads(request.body)
-
-            las_path   = data['las_path']
-            pcbin_path = data.get('pcbin_path')
-
-            if not pcbin_path:
-                raise ValueError("pcbin_path is required")
-
-            las_to_feature_bin(las_path, pcbin_path)
-            print("\n")
-
-            return JsonResponse({"status": 'success', "message": "Features pcbin generated successfully."})
-
-        except Exception as e:
-            print("\n[REQUEST FUNCTION] LAS TO FEATURES PCBIN ERROR " + str(e))
             print(traceback.format_exc())
             return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
@@ -482,13 +529,13 @@ def delete_model(request):
 def extract_segment_las_view(request):
     """
     Extract all points for a single segment from features.las into a new .las
-    file, using the .pcbin store for annotation lookup.
+    file, using the annotations.bin store for annotation lookup.
 
     POST body (JSON):
-        las_path   - path to features.las
-        pcbin_path - path to features.pcbin (unified binary store)
-        seg_id     - integer segment ID to extract
-        out_path   - destination .las path
+        las_path         - path to features.las
+        annotations_path - path to annotations.bin (default: working/annotations.bin)
+        seg_id           - integer segment ID to extract
+        out_path         - destination .las path
     """
     if request.method == 'POST':
         try:
@@ -496,14 +543,11 @@ def extract_segment_las_view(request):
             data = json.loads(request.body)
 
             las_path   = data['las_path']
-            pcbin_path = data.get('pcbin_path') or data.get('mapping_path')  # backward compat
             seg_id     = int(data['seg_id'])
             out_path   = data['out_path']
+            annotations_path, _ = _resolve_annotations_path(data.get('annotations_path'))
 
-            if not pcbin_path:
-                raise ValueError("pcbin_path is required")
-
-            extract_segment_las(las_path, pcbin_path, seg_id, out_path)
+            extract_segment_las(las_path, annotations_path, seg_id, out_path)
             print("\n")
 
             return JsonResponse({"status": 'success', "message": "Segment extraction completed."})
@@ -555,112 +599,78 @@ def read_text_file(request):
 @csrf_exempt
 def serve_range_file(request, filepath):
     """
-    Serve binary files (octree.bin, hierarchy.bin) with HTTP Range request support.
-    This is critical for Potree 2.0 which needs to fetch small chunks from
-    very large files (e.g. 3GB octree.bin).
-    
-    Without this, Django's dev server returns the entire file for every request,
-    which crashes the browser for large files.
-    """
-    # Security: restrict to specific binary files in the data directory
-    ALLOWED_EXTENSIONS = ('.bin', '.json', '.pcbin')
-    BASE_DATA_DIR = str(settings.RUNTIME_DATA_ROOT)
+    Serve the chunked point cloud files (geom.bin, col/*.bin, meta.json) with HTTP Range support.
 
-    # Normalize and validate path
+    Django does not handle Range by itself (ticket #22479). The file is opened and positioned at the
+    first requested byte, then handed to FileResponse: the WSGI server receives it through
+    wsgi.file_wrapper and, with an explicit Content-Length, Gunicorn sendfile()s exactly that slice
+    (zero-copy, no Python loop). A Python generator tops out at ~65 MB/s because of the GIL.
+
+    Each request opens its own descriptor on purpose: sendfile uses the descriptor's current offset,
+    so sharing one between concurrent requests would be racy (and open() costs microseconds).
+
+    With ?v=<token> in the query the response is cacheable forever (the token changes whenever the
+    file content changes); otherwise the browser has to revalidate.
+    """
+    ALLOWED_EXTENSIONS = ('.bin', '.json')
+    BASE_DATA_DIR = os.path.normpath(str(settings.RUNTIME_DATA_ROOT))
+
     # We lstrip('/') to ensure os.path.join doesn't treat it as an absolute path
     full_path = os.path.normpath(os.path.join(BASE_DATA_DIR, filepath.lstrip('/')))
 
     # Prevent directory traversal
-    if not full_path.startswith(os.path.normpath(BASE_DATA_DIR)):
+    if os.path.commonpath([full_path, BASE_DATA_DIR]) != BASE_DATA_DIR:
         raise Http404("Access denied")
 
     if not os.path.isfile(full_path):
         raise Http404(f"File not found: {filepath}")
 
-    _, ext = os.path.splitext(full_path)
-    if ext.lower() not in ALLOWED_EXTENSIONS:
+    ext = os.path.splitext(full_path)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
         raise Http404("File type not allowed")
 
     file_size = os.path.getsize(full_path)
+    content_type = 'application/json' if ext == '.json' else 'application/octet-stream'
 
-    # Determine content type
-    content_type = 'application/octet-stream'
-    if ext.lower() == '.json':
-        content_type = 'application/json'
-
-    # Check for Range header
+    status = 200
+    start, length = 0, file_size
     range_header = request.META.get('HTTP_RANGE', '')
-
-    if range_header:
-        # Parse Range: bytes=start-end
-        range_match = re.match(r'bytes=(\d+)-(\d*)', range_header)
-        if range_match:
+    range_match = re.match(r'bytes=(\d*)-(\d*)\s*$', range_header) if range_header else None
+    if range_match and (range_match.group(1) or range_match.group(2)):
+        if range_match.group(1):
             start = int(range_match.group(1))
             end = int(range_match.group(2)) if range_match.group(2) else file_size - 1
-
-            # Clamp
-            end = min(end, file_size - 1)
-
-            if start > end or start >= file_size:
-                response = HttpResponse(status=416)  # Range Not Satisfiable
-                response['Content-Range'] = f'bytes */{file_size}'
-                return response
-
-            length = end - start + 1
-
-            def file_chunk_iterator():
-                with open(full_path, 'rb') as f:
-                    f.seek(start)
-                    remaining = length
-                    chunk_size = 65536  # 64KB chunks
-                    while remaining > 0:
-                        read_size = min(chunk_size, remaining)
-                        data = f.read(read_size)
-                        if not data:
-                            break
-                        remaining -= len(data)
-                        yield data
-
-            response = StreamingHttpResponse(
-                file_chunk_iterator(),
-                status=206,
-                content_type=content_type
-            )
-            response['Content-Length'] = length
-            response['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-            response['Accept-Ranges'] = 'bytes'
-            response['Access-Control-Allow-Origin'] = '*'
+        else:  # suffix range: last N bytes
+            start = max(0, file_size - int(range_match.group(2)))
+            end = file_size - 1
+        end = min(end, file_size - 1)
+        if start > end or start >= file_size:
+            response = HttpResponse(status=416)  # Range Not Satisfiable
+            response['Content-Range'] = f'bytes */{file_size}'
             return response
+        length = end - start + 1
+        status = 206
 
-    # No Range header — serve full file (for small files like metadata.json)
-    # For large files, stream it
-    if file_size > 10 * 1024 * 1024:  # > 10MB: stream
-        def full_file_iterator():
-            with open(full_path, 'rb') as f:
-                chunk_size = 65536
-                while True:
-                    data = f.read(chunk_size)
-                    if not data:
-                        break
-                    yield data
-
-        response = StreamingHttpResponse(
-            full_file_iterator(),
-            content_type=content_type
-        )
-    else:
-        with open(full_path, 'rb') as f:
-            response = HttpResponse(f.read(), content_type=content_type)
-
-    response['Content-Length'] = file_size
+    f = open(full_path, 'rb')
+    f.seek(start)
+    response = FileResponse(f, status=status, content_type=content_type)
+    # FileResponse derives Content-Length from the file size minus the current position: override it
+    # so that only the requested slice is sent (also read by Gunicorn's sendfile as the byte count).
+    response['Content-Length'] = length
+    if status == 206:
+        response['Content-Range'] = f'bytes {start}-{start + length - 1}/{file_size}'
     response['Accept-Ranges'] = 'bytes'
     response['Access-Control-Allow-Origin'] = '*'
+    if request.GET.get('v'):
+        response['Cache-Control'] = 'public, max-age=31536000, immutable'
+    else:
+        response['Cache-Control'] = 'no-cache'
     return response
 
 
 def serve_runtime_file(request, filepath):
-    """Serve runtime data files (LAS, pcbin, JSON) without Range support."""
-    ALLOWED_EXTENSIONS = ('.las', '.bin', '.json', '.pcbin', '.txt')
+    """Serve runtime data files (LAS, JSON, ...) without Range support (streamed)."""
+    ALLOWED_EXTENSIONS = ('.las', '.bin', '.json', '.txt')
     BASE_DATA_DIR = str(settings.RUNTIME_DATA_ROOT)
 
     full_path = os.path.normpath(os.path.join(BASE_DATA_DIR, filepath.lstrip('/')))
@@ -681,8 +691,8 @@ def serve_runtime_file(request, filepath):
     elif ext.lower() == '.txt':
         content_type = 'text/plain'
 
-    with open(full_path, 'rb') as f:
-        response = HttpResponse(f.read(), content_type=content_type)
+    # FileResponse streams the file in chunks (no full read in memory)
+    response = FileResponse(open(full_path, 'rb'), content_type=content_type)
     response['Access-Control-Allow-Origin'] = '*'
     return response
 
@@ -804,7 +814,6 @@ def restore_pointcloud_backup(request):
             working_dir = _get_working_dir()
             features_las = _get_working_file('features.las')
             backup_las = _get_working_file('pointcloud_backup.las')
-            features_pcbin = _get_working_file('features.pcbin')
 
             if not os.path.isfile(backup_las):
                 return JsonResponse({"error": "point cloud backup not found"}, status=404)
@@ -812,19 +821,39 @@ def restore_pointcloud_backup(request):
             os.makedirs(working_dir, exist_ok=True)
             shutil.copy2(backup_las, features_las)
 
-            if os.path.isfile(features_pcbin):
-                os.remove(features_pcbin)
+            # The cloud goes back to the backup state: stored annotations no longer apply
+            stale_annotations = _get_working_file('annotations.bin')
+            if os.path.isfile(stale_annotations):
+                os.remove(stale_annotations)
 
-            las_to_feature_bin(
-                _runtime_relative_path('working', 'features.las'),
-                _runtime_relative_path('working', 'features.pcbin')
-            )
+            # Legacy unified store from older versions (no longer used)
+            legacy_pcbin = _get_working_file('features.pcbin')
+            if os.path.isfile(legacy_pcbin):
+                os.remove(legacy_pcbin)
+
+            # Geometry and POINT_ID are identical to the backup state: only the columns go back.
+            # A different point count means a different cloud: rebuild the geometry.
+            pc_rel = _runtime_relative_path('working', PC_DIR)
+            las_rel = _runtime_relative_path('working', 'features.las')
+            meta_path = _get_working_file(PC_DIR, 'meta.json')
+            rebuilt = True
+            version = None
+            if os.path.isfile(meta_path):
+                with open(meta_path, 'r') as mf:
+                    meta = json.load(mf)
+                if int(meta.get('points', -1)) == _las_point_count(backup_las):
+                    update_pointcloud_columns(pc_rel, las_filepath=las_rel, drop_all=True)
+                    version = str(meta['version'])
+                    rebuilt = False
+            if rebuilt:
+                version = build_pointcloud(las_rel, pc_rel)
 
             return JsonResponse({
                 "status": "success",
                 "message": "Point cloud restored from backup",
-                "las_path": _runtime_relative_path('working', 'features.las'),
-                "pcbin_path": _runtime_relative_path('working', 'features.pcbin')
+                "las_path": las_rel,
+                "version": version,
+                "rebuilt": rebuilt
             }, status=200)
         except Exception as e:
             print("\n[REQUEST FUNCTION] RESTORE POINT CLOUD BACKUP ERROR " + str(e))
@@ -833,88 +862,36 @@ def restore_pointcloud_backup(request):
 
     return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
 
-@csrf_exempt
-def start_training(request):
-    """
-    Endpoint for receiving training data in binary format.
-    Expects FormData with:
-    - 'labels': JSON string mapping segmentId -> segmentName
-    - 'buffer': Binary file (one byte per point total)
-    """
-    if request.method == 'POST':
-        try:
-            print("\n[REQUEST FUNCTION] START TRAINING")
-            label_map_json = request.POST.get('labels')
-            buffer_file = request.FILES.get('buffer')
-
-            if not label_map_json:
-                return JsonResponse({"error": "Missing 'labels' metadata"}, status=400)
-            if not buffer_file:
-                return JsonResponse({"error": "Missing 'buffer' binary data"}, status=400)
-
-            # Save in the working directory used by the pipeline
-            training_dir = _get_working_dir()
-            os.makedirs(training_dir, exist_ok=True)
-
-            # abs_input = os.path.abspath(os.path.join(settings.BASE_DIR, input_filepath))
-
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            bin_filename = f"labels_{timestamp}.bin"
-            json_filename = f"meta_{timestamp}.json"
-
-            # Save binary buffer
-            bin_path = os.path.join(training_dir, bin_filename)
-            with open(bin_path, 'wb') as f:
-                for chunk in buffer_file.chunks():
-                    f.write(chunk)
-            # Save metadata JSON
-            json_path = os.path.join(training_dir, json_filename)
-            with open(json_path, 'w', encoding='utf-8') as f:
-                f.write(label_map_json)
-
-            return JsonResponse({
-                "message": "Binary data saved successfully",
-                "filename": bin_filename,
-                "labels_filename": json_filename,
-                "bin_path": bin_path,
-                "json_path": json_path,
-                "size_bytes": os.path.getsize(bin_path)
-            }, status=200)
-
-        except Exception as e:
-            return JsonResponse({"error": str(e)}, status=500)
-
-    return JsonResponse({"error": "Method not allowed. Use POST."}, status=405)
-
 
 @csrf_exempt
 def export_mapping(request):
     """
-    Update segmentation annotations inside the unified .pcbin store.
+    Save the user annotations (segments/classes) into working/annotations.bin.
 
-    Reads the existing features.pcbin, patches segment_id and manual_class_id
-    for each annotated point (where buffer segment_id != 0), then writes the
-    file back atomically via a temp file + rename.
+    The client buffer only contains the segments requested by the caller (not
+    necessarily every existing segment), so the store is PATCHED: points with
+    seg != 0 in the buffer overwrite the stored state, all others are left untouched.
+    If no store exists yet (or its size differs, i.e. the cloud changed), the buffer
+    becomes the store. The upload is streamed to a temp file in chunks (gunzipped on
+    the fly when encoding=gzip), patched with numpy on a memmap (no per-point Python
+    loop) and moved atomically.
 
     Expects FormData with:
-    - 'buffer'      : Binary blob (2 bytes per point: segment_id, class_id)
+    - 'buffer'      : Binary blob (2 bytes per point: segment_id+1, class_id)
     - 'point_count' : Integer (total number of points in the buffer)
-    - 'pcbin_path'  : Relative path to features.pcbin (defaults to
-                      'runtime_data/working/features.pcbin')
+    - 'encoding'    : optional, 'gzip' if the buffer is gzip-compressed
 
     Returns JSON:
-    - pcbin_path    : same relative path that was updated
-    - point_count   : number of annotated points written
+    - annotations_path : relative path of annotations.bin
+    - point_count      : number of points covered by the buffer
     """
     if request.method == 'POST':
+        tmp_path = None
         try:
-            print("\n[REQUEST FUNCTION] EXPORT MAPPING (pcbin update)")
+            print("\n[REQUEST FUNCTION] SAVE ANNOTATIONS (annotations.bin)")
             buffer_file = request.FILES.get('buffer')
             point_count_str = request.POST.get('point_count')
-            pcbin_path = request.POST.get(
-                'pcbin_path',
-                _runtime_relative_path('working', 'features.pcbin')
-            )
+            encoding = (request.POST.get('encoding') or '').lower()
 
             if not buffer_file:
                 return JsonResponse({"error": "Missing 'buffer' binary data"}, status=400)
@@ -925,85 +902,91 @@ def export_mapping(request):
                 point_count = int(point_count_str)
             except ValueError:
                 return JsonResponse({"error": "Invalid point_count (must be integer)"}, status=400)
+            if point_count <= 0:
+                return JsonResponse({"error": "Invalid point_count (must be > 0)"}, status=400)
+            if encoding not in ('', 'gzip'):
+                return JsonResponse({"error": f"Unsupported encoding '{encoding}'"}, status=400)
 
-            # Read binary buffer
-            buffer_data = b''.join(buffer_file.chunks())
+            expected_size = point_count * 2
+            rel_path = _annotations_relative_path()
+            abs_path = _get_working_file('annotations.bin')
+            tmp_path = abs_path + '.tmp'
 
-            if len(buffer_data) != point_count * 2:
+            # Stream to the temp file, never holding the whole buffer in memory
+            written = 0
+            with open(tmp_path, 'wb') as out:
+                if encoding == 'gzip':
+                    decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                    for chunk in buffer_file.chunks():
+                        data = decomp.decompress(chunk)
+                        written += len(data)
+                        if written > expected_size:
+                            break
+                        out.write(data)
+                    else:
+                        data = decomp.flush()
+                        written += len(data)
+                        out.write(data)
+                else:
+                    for chunk in buffer_file.chunks():
+                        written += len(chunk)
+                        if written > expected_size:
+                            break
+                        out.write(chunk)
+
+            if written != expected_size:
+                os.remove(tmp_path)
+                tmp_path = None
                 return JsonResponse({
-                    "error": f"Buffer size mismatch: expected {point_count * 2} bytes, got {len(buffer_data)}"
+                    "error": f"Buffer size mismatch: expected {expected_size} bytes, got {'more than ' if written > expected_size else ''}{written}"
                 }, status=400)
 
-            # Resolve absolute path (pcbin_path is relative to BASE_DIR)
-            abs_pcbin = os.path.normpath(os.path.join(settings.BASE_DIR, pcbin_path))
-
-            # Security: must stay inside BASE_DIR
-            if not abs_pcbin.startswith(os.path.normpath(settings.BASE_DIR)):
-                return JsonResponse({"error": "Invalid pcbin_path"}, status=400)
-
-            if not os.path.isfile(abs_pcbin):
-                # features.pcbin doesn't exist yet (e.g. cloud was loaded without running
-                # feature calculation or training). Generate it from features.las first.
-                las_relative = _runtime_relative_path('working', 'features.las')
-                abs_las = os.path.normpath(os.path.join(settings.BASE_DIR, las_relative))
-                if not os.path.isfile(abs_las):
-                    return JsonResponse({"error": "features.las not found — please load a point cloud first"}, status=404)
-                print(f"[REQUEST FUNCTION] features.pcbin not found — generating from {las_relative}")
-                las_to_feature_bin(las_relative, pcbin_path)
-                print("[REQUEST FUNCTION] features.pcbin generated")
-
-            # Read existing pcbin into mutable bytearray
-            with open(abs_pcbin, 'rb') as f:
-                raw = f.read()
-
-            # Validate magic
-            if raw[:4] != b'PCBN':
-                return JsonResponse({"error": "Invalid pcbin file (bad magic)"}, status=400)
-
-            version = raw[4]
-            if version == 1:
-                bpf = 4
-            elif version == 2:
-                bpf = raw[5]   # bytes_per_feature stored at header byte [5]
-                if bpf not in (1, 4):
-                    return JsonResponse({"error": f"Unsupported pcbin bpf={bpf}"}, status=400)
+            # Patch semantics: the client only exports the segments it was asked for
+            # (e.g. training/validation), not necessarily every existing segment. So
+            # only points with seg != 0 in the new buffer overwrite the stored state.
+            # Vectorized with numpy on a memmap, in chunks (never a per-point Python loop).
+            patched_path = None
+            if os.path.isfile(abs_path) and os.path.getsize(abs_path) == expected_size:
+                patched_path = abs_path + '.patch.tmp'
+                shutil.copyfile(abs_path, patched_path)
+                old = np.memmap(patched_path, dtype=np.uint8, mode='r+', shape=(point_count, 2))
+                new = np.memmap(tmp_path, dtype=np.uint8, mode='r', shape=(point_count, 2))
+                chunk = 8_000_000
+                for start in range(0, point_count, chunk):
+                    stop = min(start + chunk, point_count)
+                    new_c = new[start:stop]
+                    mask = new_c[:, 0] != 0
+                    if mask.any():
+                        old_c = old[start:stop]
+                        old_c[mask] = new_c[mask]
+                old.flush()
+                del old, new
+                os.replace(patched_path, abs_path)
+                os.remove(tmp_path)
             else:
-                return JsonResponse({"error": f"Unsupported pcbin version={version}"}, status=400)
+                # No previous store (or the cloud changed size): the new buffer becomes the store
+                os.replace(tmp_path, abs_path)
+            tmp_path = None
 
-            N = struct.unpack_from('<I', raw, 8)[0]   # number of point slots
-            F = struct.unpack_from('<I', raw, 12)[0]  # number of features
-            header_size = 16 + F * 40                 # magic/ver/bpf/reserved/N/F + F*(name32+vmin+vmax)
-            record_size = F * bpf + 8                 # F×bpf feature bytes + 4 annotation + 4 confidence
-
-            data = bytearray(raw)
-
-            annotated = 0
-            for pid in range(min(point_count, N)):
-                seg_id_buf = buffer_data[pid * 2]      # 1-based in buffer (0 = unannotated)
-                class_id   = buffer_data[pid * 2 + 1]
-                if seg_id_buf != 0:
-                    rec_off = header_size + pid * record_size
-                    data[rec_off + F * bpf]     = seg_id_buf - 1         # restore 0-based segment_id
-                    data[rec_off + F * bpf + 1] = class_id if class_id != 0 else 0xFF  # 0 = JS "no class" → 0xFF sentinel
-                    annotated += 1
-
-            # Atomic write
-            tmp_path = abs_pcbin + '.tmp'
-            with open(tmp_path, 'wb') as f:
-                f.write(data)
-            os.replace(tmp_path, abs_pcbin)
-
-            print(f"[REQUEST FUNCTION] pcbin updated: {annotated} annotated points → {abs_pcbin}")
+            print(f"[REQUEST FUNCTION] annotations.bin saved: {point_count} points → {abs_path}")
 
             return JsonResponse({
-                "pcbin_path": pcbin_path,
-                "point_count": annotated,
+                "annotations_path": rel_path,
+                "point_count": point_count,
             }, status=200)
 
         except Exception as e:
-            print(f"[REQUEST FUNCTION] Export mapping ERROR: {str(e)}")
+            print(f"[REQUEST FUNCTION] Save annotations ERROR: {str(e)}")
             print(traceback.format_exc())
             return JsonResponse({"error": str(e)}, status=500)
+
+        finally:
+            for leftover in (tmp_path, _get_working_file('annotations.bin.patch.tmp')):
+                if leftover and os.path.isfile(leftover):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
 
     return JsonResponse({"error": "Method not allowed. Use POST."}, status=405)
 
@@ -1013,7 +996,7 @@ def package_download_view(request):
     """
     Creates a ZIP package containing the selected LAS segments and trained models.
     All temporary files generated during packaging are deleted after the response
-    is built (segment .las, segment .bin, metadata .json).
+    is built (extracted segment .las files). annotations.bin is kept.
     """
     if request.method == 'POST':
         
@@ -1027,15 +1010,14 @@ def package_download_view(request):
             selected_point_cloud_files = data.get('point_cloud_files', [])  # list of {path, label}
             selected_models   = data.get('models', [])    # list of model names
             project_las       = data.get('las_path')      # e.g. viewer/static/.../features.las
-            project_bin       = data.get('bin_path')      # labels_TIMESTAMP.bin from /api/start-training/
+            project_bin       = data.get('bin_path')      # annotations.bin (defaults to working/annotations.bin)
             project_name      = data.get('project_name')  # source point cloud base name
             # Convert relative paths to absolute if needed
             if project_las and not os.path.isabs(project_las):
                 project_las = os.path.join(settings.BASE_DIR, project_las)
-            # project_bin arrives already absolute from /api/start-training/, handle
-            # the relative case as well for robustness
-
-            if project_bin and not os.path.isabs(project_bin):
+            if not project_bin:
+                project_bin = _get_working_file('annotations.bin')
+            elif not os.path.isabs(project_bin):
                 project_bin = os.path.join(settings.BASE_DIR, project_bin)
 
             working_dir = _get_working_dir()
@@ -1044,17 +1026,7 @@ def package_download_view(request):
 
             models_root = _get_models_dir()
 
-            # Mark the bin and json generated by /api/start-training/ for cleanup
-            # The bin is named labels_TIMESTAMP.bin → the associated json is meta_TIMESTAMP.json
-            if project_bin and os.path.isfile(project_bin):
-                temp_files_to_delete.append(project_bin)
-                # The json has the same timestamp: labels_20240101_120000.bin → meta_20240101_120000.json
-                bin_basename = os.path.basename(project_bin)  # labels_TIMESTAMP.bin
-                if bin_basename.startswith('labels_'):
-                    json_name = bin_basename.replace('labels_', 'meta_', 1).replace('.bin', '.json')
-                    json_path = os.path.join(os.path.dirname(project_bin), json_name)
-                    if os.path.isfile(json_path):
-                        temp_files_to_delete.append(json_path)
+            # annotations.bin is the persistent annotation store: never deleted here
 
             items_to_zip = []  # list of (archive_path, file_content_or_path, is_content)
 
@@ -1092,8 +1064,8 @@ def package_download_view(request):
                 label  = seg['label'].replace(' ', '_').replace('.', '_')
                 if not project_bin or not os.path.isfile(project_bin):
                     raise ValueError(
-                        f"Segment bin not found (path: {project_bin}). "
-                        "The frontend must send the segment buffer via /api/start-training/ first."
+                        f"Annotations bin not found (path: {project_bin}). "
+                        "The frontend must save the annotations via /api/export-mapping/ first."
                     )
 
                 seg_las_name = f"segment_{seg_id}.las"

@@ -1,88 +1,102 @@
 // =====================================================================
-// POTREE 2.0 LOADER for BabylonJS
-// Faithful implementation based on Potree's OctreeLoader.js & DecoderWorker.js
-// Format: metadata.json + hierarchy.bin + octree.bin
+// CHUNKED POINT CLOUD LOADER for BabylonJS
+// Format: meta.json + geom.bin + col/<name>.bin  (see docs/POINTCLOUD_FORMAT.md)
+//
+// The geometry is built once at import (las2pc): spatial chunks, points ordered by
+// stratified levels of detail inside each chunk. Attributes (features, prediction) live
+// in separate columns with the same point order, downloaded only when needed.
+//
+// Every request (chunk, levels a..b) becomes one "virtual node" = one BabylonJS mesh
+// in `loadedNodes` (name `c<id>_l<a>-<b>`), with the same `mesh.metadata` layout the
+// editing code (selection, cut, classes, segments) has always used.
 // =====================================================================
-
-/**
- * Potree 2.0 hierarchy node
- */
-class Potree2Node {
-    constructor(name, boundingBox) {
-        this.name = name;
-        this.level = name === "r" ? 0 : name.length - 1;
-        this.boundingBox = boundingBox; // { min: [x,y,z], max: [x,y,z] }
-        this.numPoints = 0;
-        this.byteOffset = 0n;   // BigInt offset into octree.bin
-        this.byteSize = 0n;     // BigInt size in octree.bin
-        this.nodeType = 0;      // 0=normal, 2=proxy (lazy hierarchy chunk)
-        this.childMask = 0;
-        this.children = new Array(8).fill(null);
-        this.spacing = 0;
-
-        // For proxy nodes (type === 2)
-        this.hierarchyByteOffset = 0n;
-        this.hierarchyByteSize = 0n;
-
-        // State
-        this.loaded = false;
-        this.loading = false;
-        this.mesh = null;
-    }
-
-    get hasChildren() {
-        return this.childMask !== 0;
-    }
-}
-
-/**
- * Computes child AABB from parent AABB using octree index bits.
- * Potree convention:
- *   bit 0 (0b001) → Z axis
- *   bit 1 (0b010) → Y axis
- *   bit 2 (0b100) → X axis
- */
-function createChildAABB(parentBB, childIndex) {
-    const min = [...parentBB.min];
-    const max = [...parentBB.max];
-    const size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
-
-    if (childIndex & 0b100) { min[0] += size[0] / 2; } else { max[0] -= size[0] / 2; }
-    if (childIndex & 0b010) { min[1] += size[1] / 2; } else { max[1] -= size[1] / 2; }
-    if (childIndex & 0b001) { min[2] += size[2] / 2; } else { max[2] -= size[2] / 2; }
-
-    return { min, max };
-}
 
 const FEATURE_MISSING_SENTINEL = -1e38;
 const FEATURE_MISSING_COLOR = 0.8;
+const GEOM_RECORD_SIZE = 20;
+const COLUMN_FETCH_MAX_POINTS = 4_000_000;   // merge adjacent mesh ranges up to this size
+const SCAN_BLOCK_POINTS = 400_000;           // 8 MB of geometry per export block
 
 // ---- Sentinels for the canonical point_id → segmentId map (_pointSegmentMap) ----
 // The map is a Uint16Array, so it cannot store the negative _deletedSegmentId (-1)
 // nor an "unknown" state: both need out-of-band values.
 //   SEG_UNRESOLVED — this point has never been resolved to a segment. The geometry
-//                    replay in _createMeshFromBuffer decides (and then freezes) it.
+//                    replay in _createMeshFromDecoded decides (and then freezes) it.
 //   SEG_DELETED    — this point lives in the internal hidden "deleted" segment.
 // Uint16 leaves room for 65534 user segments, which also removes the 253-segment
 // ceiling an 8-bit map would have imposed.
 const SEG_UNRESOLVED = 0xFFFF;
 const SEG_DELETED = 0xFFFE;
 
+/**
+ * Small pool of module workers. Each request is answered through a promise; requests are sent
+ * to the worker with the fewest requests in flight.
+ */
+class WorkerPool {
+    constructor(size, cfg) {
+        this._workers = [];
+        this._pending = new Map();
+        this._nextId = 1;
+        const url = new URL('./pointcloud-worker.js', import.meta.url);
+        for (let i = 0; i < size; i++) {
+            const w = new Worker(url, { type: 'module' });
+            w.inflight = 0;
+            w.onmessage = (e) => {
+                const { id, ok, result, error } = e.data;
+                const p = this._pending.get(id);
+                if (!p) return;
+                this._pending.delete(id);
+                p.worker.inflight--;
+                if (ok) p.resolve(result); else p.reject(new Error(error));
+            };
+            w.onerror = (e) => console.error('[PointCloudLoader] worker error:', e.message || e);
+            this._workers.push(w);
+        }
+        this.ready = Promise.all(this._workers.map(w => this._send(w, { type: 'init', cfg })));
+    }
+
+    _send(worker, msg) {
+        return new Promise((resolve, reject) => {
+            const id = this._nextId++;
+            worker.inflight++;
+            this._pending.set(id, { resolve, reject, worker });
+            worker.postMessage({ ...msg, id });
+        });
+    }
+
+    async request(msg) {
+        await this.ready;
+        let best = this._workers[0];
+        for (const w of this._workers) if (w.inflight < best.inflight) best = w;
+        return this._send(best, msg);
+    }
+
+    dispose() {
+        for (const p of this._pending.values()) p.reject(new Error('Loader disposed'));
+        this._pending.clear();
+        for (const w of this._workers) w.terminate();
+        this._workers = [];
+    }
+}
 
 /**
- * Potree 2.0 Loader for BabylonJS
+ * Chunked point cloud loader for BabylonJS.
  *
- * Uses HTTP Range requests via a Django endpoint to fetch only the needed
- * bytes for each node from octree.bin. This way, even multi-GB files can
- * be handled without loading the entire file into browser memory.
+ * Geometry and columns are fetched with HTTP Range requests (a Django endpoint backed by
+ * sendfile), so multi-GB clouds never need to fit in browser memory: a point budget with LRU
+ * eviction bounds what stays loaded.
  */
-export class Potree2Loader {
+export class ChunkedPointCloudLoader {
     constructor(scene, baseUrl, options = {}) {
         this.scene = scene;
         this.baseUrl = baseUrl;
+        // Cache-busting token of the geometry (appended as ?v=)
+        this.version = options.version ?? null;
+        // State exported by a previous loader (reload after a geometry rebuild), applied in load()
+        this._initialState = options.initialState ?? null;
         this.metadata = null;
-        this.root = null;
-        this.rootTransform = new BABYLON.TransformNode("Potree2Root", scene);
+        this.chunks = [];
+        this.rootTransform = new BABYLON.TransformNode("PointCloudRoot", scene);
 
         const prefixes = ["/runtime-data/", "runtime-data/"];
         let foundPrefix = false;
@@ -96,28 +110,29 @@ export class Potree2Loader {
         if (!foundPrefix) this.rangeBasePath = baseUrl;
         this.rangeBasePath = this.rangeBasePath.replace(/^\/+|\/+$/g, '');
 
-        this.attributes = [];
-        this.bytesPerPoint = 0;
-        this.hierarchyBuffer = null;
-
         this.loadedNodes = new Map();   // name → mesh
-        this.activeNodes = new Set();
-        this.loadingNodes = new Set();
+        this.activeNodes = new Set();   // names of the meshes currently shown
+        this.loadingNodes = new Set();  // names of the virtual nodes being fetched
 
         // Fixed point size for all nodes — same value regardless of LOD level
         this.pointSize = options.pointSize ?? 2;
         // Multiplier applied on top of the auto-computed size (controlled by the UI slider)
         this.pointSizeMultiplier = options.pointSizeMultiplier ?? 1.0;
-        this.maxVisibleNodes = options.maxVisibleNodes || 500;
+        this.maxVisibleNodes = options.maxVisibleNodes || 4000;
         this.maxVisiblePoints = options.maxVisiblePoints || 5_000_000;
+        this._maxLoadedPoints = options.maxLoadedPoints ?? null;
         this.maxConcurrentLoads = options.maxConcurrentLoads || 6;
+        this.workerCount = options.workerCount || 3;
 
         this.stats = {
             loadedNodes: 0,
             visibleNodes: 0,
             totalPointsRendered: 0,
-            loadingNodes: 0
+            loadingNodes: 0,
+            loadedPoints: 0
         };
+        this._loadedPoints = 0;
+        this._tick = 0;
 
         // Persistent Selection History
         // [{ type, area, viewport, transformMatrix }]
@@ -140,16 +155,20 @@ export class Potree2Loader {
         // Current display mode, synchronized with the UI via setColorMode().
         // "classification" (default): classified points show their class color.
         // "color": all points show the original point cloud color.
-        // _createMeshFromBuffer uses this value to decide which colors to write
+        // _createMeshFromDecoded uses this value to decide which colors to write
         // into the vertex data of newly loaded LOD nodes.
         this.colorMode = "classification";
         this.classColorBlendStrength = 0.75;
-        this.featureBin = null;
+        // Feature attributes come from the columns of meta.json, filled by _buildFeatureAttributes()
+        this.featureAttributes = new Map();
         this._featureRangeMin = null;
         this._featureRangeMax = null;
         this._featureShaderMat = null;
         this._colormapId = 0; // 0=Blue>Green>Yellow>Red (default)
         this._featureDiscreteFilter = null; // { featureName: string, value: number|null }
+        this._columnFetchQueue = new Set();
+        this._columnFetchTimer = null;
+        this._columnEpoch = 0;
 
         // ---- CUT / SEGMENT HISTORY ----
         // segmentId 0 = main (uncut) cloud. Each cutSelection() adds an entry.
@@ -176,8 +195,7 @@ export class Potree2Loader {
             ? options.debugWatchPointId : null;
         this._segmentRevision = 0;
 
-        // Diagnostic toggle: keep disabled by default to isolate CUT behavior
-        // from dispose/reload side effects during segmentation debugging.
+        // Kept for API compatibility: eviction is now driven by the point budget (maxLoadedPoints)
         this.autoCleanupEnabled = options.autoCleanupEnabled === true;
 
         // Runtime handles that must be cleaned on dispose() to avoid stale callbacks
@@ -185,6 +203,20 @@ export class Potree2Loader {
         this._cameraForObserver = null;
         this._cameraViewObserver = null;
         this._cleanupIntervalId = null;
+        this._pool = null;
+        this._lastCamera = null;
+        this._updateTimer = null;
+        this._pendingLoads = [];
+        this._disposed = false;
+    }
+
+    /** Point budget kept in memory (loaded, visible or not). */
+    get maxLoadedPoints() {
+        return this._maxLoadedPoints ?? this.maxVisiblePoints * 3;
+    }
+
+    set maxLoadedPoints(v) {
+        this._maxLoadedPoints = v;
     }
 
     _getLocalBoundingBoxCenter() {
@@ -231,280 +263,413 @@ export class Potree2Loader {
         return true;
     }
 
+    // ========== STATE TRANSFER (reload after a geometry rebuild) ==========
+
+    /**
+     * Snapshot of every instance state that is NOT tied to meshes/nodes/buffers, so a
+     * new loader created on a rebuilt point cloud (same coordinates, same POINT_IDs)
+     * can continue exactly where this one was. Arrays/maps are handed over by reference:
+     * call it right before disposing this loader.
+     */
+    exportState() {
+        const rt = this.rootTransform;
+        return {
+            boundingBoxMin: this.metadata?.boundingBox ? [...this.metadata.boundingBox.min] : null,
+            points: this.metadata?.points ?? null,
+            offset: this.metadata?.offset ? [...this.metadata.offset] : null,
+            scale: this.metadata?.scale ? [...this.metadata.scale] : null,
+
+            selectionHistory: this.selectionHistory,
+            deselectionHistory: this.deselectionHistory,
+            selectionInverted: this.selectionInverted,
+            classificationHistory: this.classificationHistory,
+            cutHistory: this.cutHistory,
+            segmentIdCounter: this._segmentIdCounter,
+            cutCreationCounter: this._cutCreationCounter,
+            deletedSegmentId: this._deletedSegmentId,
+            mainCloudVisible: this.mainCloudVisible,
+            classColorLUT: this._classColorLUT,
+            pointClassMap: this._pointClassMap,
+            pointSegmentMap: this._pointSegmentMap,
+            segmentRevision: this._segmentRevision,
+
+            colorMode: this.colorMode,
+            classColorBlendStrength: this.classColorBlendStrength,
+            pointSize: this.pointSize,
+            pointSizeMultiplier: this.pointSizeMultiplier,
+            maxVisibleNodes: this.maxVisibleNodes,
+            maxVisiblePoints: this.maxVisiblePoints,
+            maxLoadedPoints: this._maxLoadedPoints,
+            maxConcurrentLoads: this.maxConcurrentLoads,
+            featureRangeMin: this._featureRangeMin,
+            featureRangeMax: this._featureRangeMax,
+            colormapId: this._colormapId,
+            featureDiscreteFilter: this._featureDiscreteFilter,
+
+            debugSegmentation: this.debugSegmentation,
+            debugWatchPointId: this.debugWatchPointId,
+            autoCleanupEnabled: this.autoCleanupEnabled,
+
+            // Root node orientation (rotateAroundBoundingBoxCenter)
+            rootRotationQuaternion: rt?.rotationQuaternion ? rt.rotationQuaternion.clone() : null,
+            rootRotation: rt?.rotation ? rt.rotation.clone() : null,
+            rootPivot: rt?.getPivotPoint ? rt.getPivotPoint().clone() : null
+        };
+    }
+
+    /**
+     * Applies a state produced by exportState() of a previous loader. Must run after
+     * metadata/columns are parsed and BEFORE the first nodes are created (load() does it
+     * when `options.initialState` is given), so new nodes pick up segments/classes/visibility.
+     *
+     * Geometric histories are expressed relative to metadata.boundingBox.min: if the new
+     * point cloud has a different bounding box, the AABBs (cutHistory, classificationHistory)
+     * are translated. Screen-space selections (selectionHistory/deselectionHistory) cannot
+     * be translated; a warning is logged in that case.
+     * Per-point maps are only transferred if the point count is identical.
+     */
+    importState(state) {
+        if (!state) return;
+        const sameCloud = state.points === null || state.points === this.metadata.points;
+
+        // Bounding box / quantization differences
+        const newMin = this.metadata.boundingBox.min;
+        let delta = null;
+        if (state.boundingBoxMin) {
+            const d = [state.boundingBoxMin[0] - newMin[0], state.boundingBoxMin[1] - newMin[1], state.boundingBoxMin[2] - newMin[2]];
+            if (Math.abs(d[0]) > 1e-9 || Math.abs(d[1]) > 1e-9 || Math.abs(d[2]) > 1e-9) delta = d;
+        }
+        const arrDiffers = (a, b) => !!a && !!b && a.some((v, i) => Math.abs(v - b[i]) > 1e-12);
+        if (arrDiffers(state.offset, this.metadata.offset) || arrDiffers(state.scale, this.metadata.scale)) {
+            console.warn('⚠️ offset/scale changed between builds; positions are re-derived from the new metadata.');
+        }
+        if (delta) {
+            console.warn('⚠️ boundingBox changed between builds, translating AABB histories by', delta,
+                '(screen-space selection history cannot be translated).');
+        }
+        const shiftAABB = (e) => {
+            if (!delta || !e || e.minX === undefined) return e;
+            return { ...e,
+                minX: e.minX + delta[0], maxX: e.maxX + delta[0],
+                minY: e.minY + delta[1], maxY: e.maxY + delta[1],
+                minZ: e.minZ + delta[2], maxZ: e.maxZ + delta[2] };
+        };
+
+        this.selectionHistory = state.selectionHistory ?? [];
+        this.deselectionHistory = state.deselectionHistory ?? [];
+        this.selectionInverted = !!state.selectionInverted;
+        this.classificationHistory = (state.classificationHistory ?? []).map(shiftAABB);
+        this.cutHistory = (state.cutHistory ?? []).map(shiftAABB);
+        this._segmentIdCounter = state.segmentIdCounter ?? this._segmentIdCounter;
+        this._cutCreationCounter = state.cutCreationCounter ?? this._cutCreationCounter;
+        this._deletedSegmentId = state.deletedSegmentId ?? this._deletedSegmentId;
+        this.mainCloudVisible = state.mainCloudVisible ?? true;
+        if (state.classColorLUT) this._classColorLUT = state.classColorLUT;
+        this._segmentRevision = state.segmentRevision ?? this._segmentRevision;
+
+        if (sameCloud) {
+            if (state.pointSegmentMap && this._pointSegmentMap && state.pointSegmentMap.length === this._pointSegmentMap.length) {
+                this._pointSegmentMap = state.pointSegmentMap;
+            }
+            if (state.pointClassMap && this._pointClassMap && state.pointClassMap.length === this._pointClassMap.length) {
+                this._pointClassMap = state.pointClassMap;
+            }
+        } else {
+            console.warn('⚠️ Point count changed between builds: per-point segment/class maps are NOT transferred.');
+        }
+
+        this.colorMode = state.colorMode ?? this.colorMode;
+        this.classColorBlendStrength = state.classColorBlendStrength ?? this.classColorBlendStrength;
+        this.pointSize = state.pointSize ?? this.pointSize;
+        this.pointSizeMultiplier = state.pointSizeMultiplier ?? this.pointSizeMultiplier;
+        this.maxVisibleNodes = state.maxVisibleNodes ?? this.maxVisibleNodes;
+        this.maxVisiblePoints = state.maxVisiblePoints ?? this.maxVisiblePoints;
+        this._maxLoadedPoints = state.maxLoadedPoints ?? this._maxLoadedPoints;
+        this.maxConcurrentLoads = state.maxConcurrentLoads ?? this.maxConcurrentLoads;
+        this._featureRangeMin = state.featureRangeMin ?? null;
+        this._featureRangeMax = state.featureRangeMax ?? null;
+        this._colormapId = state.colormapId ?? this._colormapId;
+        this._featureDiscreteFilter = state.featureDiscreteFilter ?? null;
+        this.debugSegmentation = state.debugSegmentation ?? this.debugSegmentation;
+        this.debugWatchPointId = state.debugWatchPointId ?? this.debugWatchPointId;
+        this.autoCleanupEnabled = state.autoCleanupEnabled ?? this.autoCleanupEnabled;
+
+        // A feature colour mode only makes sense if the feature still exists in the new point cloud
+        if (this.colorMode.startsWith('feature:') && !this.featureAttributes.has(this.colorMode.slice(8))) {
+            this.colorMode = 'classification';
+            this._featureRangeMin = null;
+            this._featureRangeMax = null;
+            this._featureDiscreteFilter = null;
+        }
+
+        const rt = this.rootTransform;
+        if (state.rootPivot) rt.setPivotPoint(state.rootPivot, BABYLON.Space.LOCAL);
+        if (state.rootRotationQuaternion) {
+            rt.rotationQuaternion = state.rootRotationQuaternion.clone();
+        } else if (state.rootRotation) {
+            rt.rotation.copyFrom(state.rootRotation);
+        }
+        rt.computeWorldMatrix(true);
+    }
+
     // ========== PUBLIC API ==========
 
     async load() {
-        const metaResponse = await fetch(`${this.baseUrl}/metadata.json`);
-        if (!metaResponse.ok) throw new Error(`Failed to load metadata.json: ${metaResponse.status}`);
-        this.metadata = await metaResponse.json();
+        this.metadata = await this._fetchMeta();
+        if (this.metadata.format !== 'pck') throw new Error(`Unsupported point cloud format: ${this.metadata.format}`);
 
-        this._parseAttributes();
+        this._prepareChunks();
+        this._buildFeatureAttributes();
 
-        // Canonical point_id → segmentId map, indexed by the POINT_ID attribute.
-        // This is the source of truth for segment membership: it survives LOD
-        // unload/reload cycles, so a point keeps the segment it was assigned to
-        // even when its octree node is dropped by cleanup() and fetched again.
-        // Without it every reload re-derives membership from the 2D selection
-        // replay, which is not equivalent to the original assignment (different
-        // tie-breaking on overlaps) and makes hidden segments pop back in blocks.
-        const hasPointId = this.attributes.some(a => {
-            const n = a.name.toLowerCase();
-            return n === "point_id" || n === "pointid";
-        });
-        if (hasPointId && this.metadata.points > 0) {
+        // Canonical point_id → segmentId map, indexed by POINT_ID (the index of the point in
+        // features.las). This is the source of truth for segment membership: it survives LOD
+        // unload/reload cycles, so a point keeps the segment it was assigned to even when its
+        // node is evicted and fetched again. Without it every reload re-derives membership from
+        // the 2D selection replay, which is not equivalent to the original assignment
+        // (different tie-breaking on overlaps) and makes hidden segments pop back in blocks.
+        if (this.metadata.points > 0) {
             this._pointSegmentMap = new Uint16Array(this.metadata.points).fill(SEG_UNRESOLVED);
-        } else {
-            this._pointSegmentMap = null;
-            console.warn("⚠️ No POINT_ID attribute: segment membership will be re-derived geometrically on every LOD load.");
+            // Class per point (0 = none). Needed for the annotations export of points whose node
+            // is not loaded: it falls back to the classification history replay when 0.
+            this._pointClassMap = new Uint8Array(this.metadata.points);
         }
 
-        // Load the complete hierarchy.bin in one request.
-        // hierarchy.bin contains ALL hierarchy chunks for the entire octree.
-        // Previously only firstChunkSize bytes were used, causing proxy nodes
-        // whose chunks were beyond that offset to never resolve — leaving entire
-        // subtrees permanently at low LOD regardless of camera distance.
-        const hierUrl = this._getRangeUrl("hierarchy.bin");
-        const hierResponse = await fetch(hierUrl);
-        if (!hierResponse.ok) throw new Error(`Failed to load hierarchy.bin: ${hierResponse.status}`);
-        this.hierarchyBuffer = await hierResponse.arrayBuffer();
-
-        const bbMin = this.metadata.boundingBox.min;
-        const bbMax = this.metadata.boundingBox.max;
-        const localBB = {
-            min: [0, 0, 0],
-            max: [bbMax[0] - bbMin[0], bbMax[1] - bbMin[1], bbMax[2] - bbMin[2]]
-        };
-
-        this.root = new Potree2Node("r", localBB);
-        this.root.nodeType = 2;
-        this.root.hierarchyByteOffset = 0n;
-        this.root.hierarchyByteSize = BigInt(this.metadata.hierarchy.firstChunkSize);
-        this.root.spacing = this.metadata.spacing;
-
-        this._parseHierarchyChunk(this.root);
-
-        const allNodes = this._collectNodes(this.root);
-        const levelStats = {};
-        let totalNodePoints = 0;
-        for (const n of allNodes) {
-            if (!levelStats[n.level]) levelStats[n.level] = { count: 0, points: 0 };
-            levelStats[n.level].count++;
-            levelStats[n.level].points += n.numPoints;
-            totalNodePoints += n.numPoints;
+        // Reload after a rebuild: restore user state before any node is created
+        if (this._initialState) {
+            this.importState(this._initialState);
+            this._initialState = null;
         }
-        // console.log(`✅ Hierarchy parsed: ${allNodes.length} nodes, ${totalNodePoints.toLocaleString()} total points`);
-        // for (const [level, data] of Object.entries(levelStats).sort((a, b) => a[0] - b[0])) {
-        // console.log(`   Level ${level}: ${data.count} nodes, ${data.points.toLocaleString()} points`);
-        // }
 
         const pointCountDisplay = document.getElementById('point-count');
         if (pointCountDisplay) pointCountDisplay.textContent = this.metadata.points.toLocaleString();
 
-        await this._loadInitialNodes();
+        const bbMin = this.metadata.boundingBox.min;
+        this._pool = new WorkerPool(this.workerCount, {
+            scale: this.metadata.scale,
+            offset: this.metadata.offset,
+            qMin: this.metadata.qMin,
+            bbMin: bbMin
+        });
+
+        await this._loadHead();
 
         // Fix LAS ↔ BabylonJS coordinate system mismatch: negate X scale to remove mirror effect
         this.rootTransform.scaling.x = -1;
         this.rootTransform.computeWorldMatrix(true);
 
+        // First LOD pass: shows the overview and starts fetching the detail levels
+        const camera = this.scene.activeCamera;
+        // The camera has not been framed on the cloud yet: do not cull anything in this first pass
+        if (camera) this.update(camera, { ignoreFrustum: true });
+
         return this.rootTransform;
     }
 
-    _getRangeUrl(filename) {
-        return `/pointcloud-data/${this.rangeBasePath}/${filename}`;
+    async _fetchMeta() {
+        const url = `/pointcloud-data/${this.rangeBasePath}/meta.json?t=${Date.now()}`;
+        const response = await fetch(url, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Failed to load meta.json: ${response.status}`);
+        return await response.json();
     }
 
-    async _fetchRange(filename, byteOffset, byteSize) {
-        const url = this._getRangeUrl(filename);
-        const first = Number(byteOffset);
-        const last = first + Number(byteSize) - 1;
+    _withVersion(url, version = this.version) {
+        if (version === null || version === undefined || version === "") return url;
+        return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}`;
+    }
 
-        const response = await fetch(url, {
-            headers: { 'Range': `bytes=${first}-${last}` }
+    _geomUrl() {
+        return this._withVersion(`/pointcloud-data/${this.rangeBasePath}/${this.metadata.geom.file}`,
+            this.version ?? this.metadata.version);
+    }
+
+    _columnUrl(name) {
+        const col = this.metadata.columns[name];
+        return this._withVersion(`/pointcloud-data/${this.rangeBasePath}/${col.file}`, col.version);
+    }
+
+    /** Derives per-chunk bookkeeping from meta.json (prefix sums, AABBs, loaded-level state). */
+    _prepareChunks() {
+        const meta = this.metadata;
+        const H = meta.levels.head;
+        const count = meta.levels.count;
+        this.chunks = meta.chunks.map(c => {
+            const prefix = new Array(count + 1).fill(0);   // points of levels [0, l)
+            for (let l = 0; l < count; l++) prefix[l + 1] = prefix[l] + c.levelPoints[l];
+            return {
+                id: c.id,
+                min: c.min, max: c.max, size: c.size,
+                levelPoints: c.levelPoints,
+                prefix,
+                headOffset: c.headOffset, bodyOffset: c.bodyOffset, points: c.points,
+                headPoints: prefix[H],
+                loadedCount: 0,        // levels [0, loadedCount) are in memory (never a hole)
+                loading: false,
+                stack: [],             // meshes of the body levels, in level order (top = last)
+                headMesh: null,
+                wanted: H,
+                visible: false,
+                bb: null
+            };
         });
+        // Nominal spacing of the coarsest level of a typical chunk, comparable to the root
+        // spacing of an octree: used to size the AABB margin of cut/classification regions.
+        const sizes = this.chunks.map(c => c.size).sort((a, b) => a - b);
+        const medianSize = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 1;
+        meta.spacing = medianSize / Math.pow(2, meta.levels.base + 1);
+        this._worldMatrixKey = null;
+    }
 
-        if (response.status === 206) {
-            return await response.arrayBuffer();
-        } else if (response.ok) {
-            console.warn(`⚠️ Server returned full file instead of range for ${filename}. Slicing locally.`);
-            const fullBuffer = await response.arrayBuffer();
-            return fullBuffer.slice(first, first + Number(byteSize));
-        } else {
-            throw new Error(`Range request failed for ${filename}: ${response.status} ${response.statusText}`);
+    /** Loads the overview (levels < head of every chunk) with a single Range request. */
+    async _loadHead() {
+        const meta = this.metadata;
+        const H = meta.levels.head;
+        const segments = this.chunks
+            .filter(c => c.headPoints > 0)
+            .map(c => ({ key: c.id, from: c.headOffset, count: c.headPoints }));
+        const result = await this._pool.request({
+            type: 'geom', url: this._geomUrl(), start: 0, count: meta.head.points, segments
+        });
+        if (this._disposed) return;
+        for (const seg of result.segments) {
+            const chunk = this.chunks[seg.key];
+            const vnode = this._makeVirtualNode(chunk, 0, H - 1, chunk.headOffset, seg.positions.length / 3);
+            this._createMeshFromDecoded(vnode, seg);
+            chunk.loadedCount = H;
+            chunk.headMesh = this.loadedNodes.get(vnode.name);
         }
     }
 
-    async _loadInitialNodes() {
-        const allNodes = this._collectNodes(this.root);
-
-        const initialNodes = allNodes
-            .filter(n => n.level <= 2 && n.numPoints > 0 && n.byteSize > 0n)
-            .sort((a, b) => a.level - b.level || b.numPoints - a.numPoints);
-
-        const batchSize = 6;
-        for (let i = 0; i < initialNodes.length; i += batchSize) {
-            const batch = initialNodes.slice(i, i + batchSize);
-            await Promise.all(batch.map(node => this._loadNode(node)));
-        }
-
-        // Do NOT force visibility here — let update() decide which nodes to show
-        // based on SSE and the parent-replacement logic. Forcing all initial nodes
-        // visible was the root cause of low-LOD nodes bleeding through high-LOD ones.
-        // Trigger one update pass so the correct nodes become visible immediately.
-        const camera = this.scene.activeCamera;
-        if (camera) this.update(camera);
-
-        this.stats.visibleNodes = this.activeNodes.size;
+    _makeVirtualNode(chunk, from, to, start, numPoints) {
+        return {
+            name: `c${chunk.id}_l${from}-${to}`,
+            level: from,
+            levelTo: to,
+            chunk,
+            start,
+            numPoints,
+            spacing: chunk.size / Math.pow(2, this.metadata.levels.base + from),
+            boundingBox: { min: chunk.min, max: chunk.max }
+        };
     }
 
-    async _loadNode(node) {
-        if (this.loadedNodes.has(node.name) || this.loadingNodes.has(node.name)) return;
-        if (node.byteSize === 0n || node.numPoints === 0) return;
-        if (this.loadingNodes.size >= this.maxConcurrentLoads) return;
+    // ========== LOD SELECTION ==========
 
-        this.loadingNodes.add(node.name);
-        this.stats.loadingNodes = this.loadingNodes.size;
-        this._debugSegment('node-load-start', { node: node.name, level: node.level, expectedPoints: node.numPoints });
-
-        try {
-            const buffer = await this._fetchRange("octree.bin", node.byteOffset, node.byteSize);
-
-            const expectedBytes = node.numPoints * this.bytesPerPoint;
-            let numPoints = node.numPoints;
-            if (buffer.byteLength < expectedBytes) {
-                console.warn(`⚠️ Node ${node.name}: got ${buffer.byteLength}B, expected ${expectedBytes}B`);
-                numPoints = Math.floor(buffer.byteLength / this.bytesPerPoint);
-                if (numPoints === 0) return;
-                node.numPoints = numPoints;
-            }
-
-            this._createMeshFromBuffer(node, buffer);
-            this.stats.loadedNodes++;
-            this._debugSegment('node-load-complete', { node: node.name, level: node.level, points: node.numPoints });
-
-            // if (this.stats.loadedNodes <= 30 || this.stats.loadedNodes % 50 === 0) {
-            //     console.log(`   ✅ Node ${node.name} (L${node.level}): ${node.numPoints.toLocaleString()} pts`);
-            // }
-        } catch (err) {
-            console.error(`❌ Failed to load node ${node.name}:`, err);
-        } finally {
-            this.loadingNodes.delete(node.name);
-            this.stats.loadingNodes = this.loadingNodes.size;
+    /**
+     * Rebuilds the AABB of every chunk in world space when the root transform changed
+     * (rotateAroundBoundingBoxCenter). Cheap check: 16 floats.
+     */
+    _refreshChunkBoxes(world) {
+        const m = world.m;
+        let same = this._worldMatrixKey !== null;
+        if (same) for (let i = 0; i < 16; i++) if (this._worldMatrixKey[i] !== m[i]) { same = false; break; }
+        if (same) return;
+        this._worldMatrixKey = Float32Array.from(m);
+        const mn = new BABYLON.Vector3(), mx = new BABYLON.Vector3();
+        for (const c of this.chunks) {
+            mn.set(c.min[0], c.min[1], c.min[2]);
+            mx.set(c.max[0], c.max[1], c.max[2]);
+            if (!c.bb) c.bb = new BABYLON.BoundingBox(mn, mx, world);
+            else c.bb.reConstruct(mn, mx, world);
         }
     }
 
-    update(camera) {
-        if (!this.root || !camera) return;
+    /**
+     * Chooses which levels of which chunks should be on screen and starts fetching the missing
+     * ones.
+     *
+     *  - The camera is brought into the LOCAL space of the point cloud with the inverse of the
+     *    root world matrix (chunk AABBs are local, before the X mirror and any rotation).
+     *  - Chunks outside the view frustum are culled (not shown, nothing fetched for them).
+     *  - A level l of a chunk is worth showing while the projected spacing of the previous level
+     *    is still larger than the point size: finer levels would not be distinguishable.
+     *  - Chunks are served by decreasing size on screen until the point budget is used up.
+     */
+    update(camera, { ignoreFrustum = false } = {}) {
+        if (!this.chunks.length || !camera || this._disposed) return;
+        this._lastCamera = camera;
+        this._tick++;
 
         const anySegmentVisible = this.mainCloudVisible || this.cutHistory.some(e => e.visible);
-
-        // ---- Potree-style iterative LOD selection ----
-        //
-        // Mirrors Potree's updateVisibility() algorithm from Potree_update_visibility.js:
-        //   - Uses a max-priority queue ordered by screenPixelRadius of bounding sphere
-        //   - Starts from root (weight = Infinity)
-        //   - At each step: pop highest-priority node, decide visibility, push children
-        //   - Nodes at level <= 2 are ALWAYS shown regardless of budget (Potree line 182)
-        //   - No recursive fallback logic — the queue naturally handles parent/child order
-        //   because parents are visited before children (they have higher weight initially)
-        //
-        // This eliminates all the fragile allChildrenCovered/isFallback logic.
+        const meta = this.metadata;
+        const H = meta.levels.head;
+        const nLevels = meta.levels.count;
 
         const engine = this.scene.getEngine();
         const screenHeight = engine.getRenderHeight();
         const fov = camera.fov || 0.8;
-        const slope = Math.tan(fov / 2);
+        const pixelsPerUnit = screenHeight / (2 * Math.tan(fov / 2));   // times size / distance
+        const thresholdPx = Math.max(1, this.pointSize);
 
-        const nodesToShow = new Set();
-        const toLoad = [];
+        const world = this.rootTransform.getWorldMatrix();
+        this._refreshChunkBoxes(world);
+        const invWorld = BABYLON.Matrix.Invert(world);
+        const camWorld = camera.globalPosition || camera.position;
+        const cam = BABYLON.Vector3.TransformCoordinates(camWorld, invWorld);
+        const planes = BABYLON.Frustum.GetPlanes(camera.getTransformationMatrix());
+
+        // ---- 1. visibility + wanted detail per chunk
+        const visibleChunks = [];
+        for (const c of this.chunks) {
+            c.visible = ignoreFrustum || c.bb.isInFrustum(planes);
+            if (!c.visible) continue;
+            const dx = Math.max(c.min[0] - cam.x, 0, cam.x - c.max[0]);
+            const dy = Math.max(c.min[1] - cam.y, 0, cam.y - c.max[1]);
+            const dz = Math.max(c.min[2] - cam.z, 0, cam.z - c.max[2]);
+            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            // Camera inside (or touching) the chunk: refine as much as the budget allows
+            const d = Math.max(dist, 1e-6);
+            c.screenSize = dist <= 1e-6 ? Infinity : c.size * pixelsPerUnit / d;
+            let t = H;
+            if (dist <= 1e-6) {
+                t = nLevels;
+            } else {
+                // Highest useful level count: levels < t where spacing(t-1) is still resolvable
+                let l = 0;
+                while (l < nLevels - 1 && (c.size / Math.pow(2, meta.levels.base + l)) * pixelsPerUnit / d > thresholdPx) l++;
+                t = Math.max(H, l + 1);
+            }
+            c.target = Math.min(nLevels, t);
+            visibleChunks.push(c);
+        }
+        visibleChunks.sort((a, b) => b.screenSize - a.screenSize);
+
+        // ---- 2. point budget, biggest on screen first
+        // The overview (levels < head) of every chunk is always shown: it counts against the budget
+        let used = meta.head.points;
+        let meshCount = visibleChunks.length;
+        const budget = this.maxVisiblePoints;
+        for (const c of visibleChunks) {
+            let t = c.target;
+            while (t > H && used + (c.prefix[t] - c.prefix[H]) > budget) t--;
+            if (meshCount >= this.maxVisibleNodes) t = H;
+            c.wanted = t;
+            used += c.prefix[t] - c.prefix[H];
+            if (t > H) meshCount++;
+        }
+
+        // ---- 3. requests (one per chunk, contiguous missing levels), closest/biggest first
+        this._pendingLoads = [];
+        for (const c of visibleChunks) {
+            if (c.wanted > c.loadedCount && !c.loading) this._pendingLoads.push(c);
+        }
+        this._pump();
+
+        // ---- 4. apply visibility to the loaded meshes
         let totalPoints = 0;
-
-        // Simple max-heap using a sorted array (node count is small enough)
-        const heap = [{ node: this.root, weight: Infinity }];
-
-        while (heap.length > 0) {
-            // Pop max-weight element
-            let maxIdx = 0;
-            for (let i = 1; i < heap.length; i++) {
-                if (heap[i].weight > heap[maxIdx].weight) maxIdx = i;
-            }
-            const { node } = heap[maxIdx];
-            heap.splice(maxIdx, 1);
-
-            if (!node || node.numPoints === 0) continue;
-
-            // Resolve proxy nodes (lazy hierarchy chunks)
-            if (node.nodeType === 2) this._ensureHierarchyLoaded(node);
-
-            const level = node.level !== undefined ? node.level : (node.name === 'r' ? 0 : node.name.length - 1);
-
-            // Visibility decision — mirrors Potree logic:
-            // always show level <= 2, otherwise check point budget
-            const alwaysVisible = level <= 2;
-            const withinBudget = totalPoints + node.numPoints <= this.maxVisiblePoints &&
-                nodesToShow.size < this.maxVisibleNodes;
-            const visible = alwaysVisible || withinBudget;
-
-            if (!visible) continue;
-
-            // Show this node
-            nodesToShow.add(node.name);
-            totalPoints += node.numPoints;
-
-            // Trigger load if not in memory
-            if (!this.loadedNodes.has(node.name)) {
-                toLoad.push(node);
-            }
-
-            // Push children to heap with their screen-space weight
-            for (const child of node.children) {
-                if (!child || child.numPoints === 0) continue;
-
-                const bb = child.boundingBox;
-                // Bounding sphere center and radius from AABB
-                const cx = (bb.min[0] + bb.max[0]) / 2;
-                const cy = (bb.min[1] + bb.max[1]) / 2;
-                const cz = (bb.min[2] + bb.max[2]) / 2;
-                const dx = bb.max[0] - bb.min[0];
-                const dy = bb.max[1] - bb.min[1];
-                const dz = bb.max[2] - bb.min[2];
-                const radius = Math.sqrt(dx * dx + dy * dy + dz * dz) / 2;
-
-                const camX = camera.position.x;
-                const camY = camera.position.y;
-                const camZ = camera.position.z;
-                const dist = Math.sqrt((camX - cx) ** 2 + (camY - cy) ** 2 + (camZ - cz) ** 2);
-
-                // Camera inside sphere → always refine
-                let weight;
-                if (dist - radius <= 0) {
-                    weight = Infinity;
-                } else {
-                    // screenPixelRadius: how large this node appears on screen
-                    weight = radius * (screenHeight / 2) / (slope * dist);
-                }
-
-                // Only push children worth refining (Potree: minimumNodePixelSize)
-                if (weight < 1 && level > 2) continue;
-
-                heap.push({ node: child, weight });
-            }
-        }
-
-        // Trigger background loads (limited by maxConcurrentLoads)
-        // Sort by weight descending so closest nodes load first
-        for (const node of toLoad) {
-            if (!this.loadingNodes.has(node.name)) {
-                this._loadNode(node);
-            }
-        }
-
-        // Apply visibility to all loaded meshes
         for (const [name, mesh] of this.loadedNodes) {
-            const shouldShow = nodesToShow.has(name);
+            const info = mesh.metadata.nodeInfo;
+            const chunk = this.chunks[info.chunkId];
+            // The overview is never culled (BabylonJS culls what is out of view when drawing); finer
+            // levels are shown only for the chunks in the frustum, up to the level that was asked for
+            const shouldShow = (chunk.visible || info.levelTo < H) && info.levelTo < chunk.wanted;
             const wasHidden = !mesh.isVisible;
             const targetVisible = shouldShow && anySegmentVisible;
 
             if (mesh.isVisible !== targetVisible) mesh.isVisible = targetVisible;
+            if (shouldShow) {
+                mesh.metadata.lastUsedTick = this._tick;
+                totalPoints += info.numPoints;
+            }
 
             if (targetVisible && wasHidden) {
                 this._debugSegment('node-visible', {
@@ -522,7 +687,133 @@ export class Potree2Loader {
         this.stats.visibleNodes = this.activeNodes.size;
         this.stats.totalPointsRendered = totalPoints;
         this.stats.loadingNodes = this.loadingNodes.size;
+        this.stats.loadedPoints = this._loadedPoints;
+    }
 
+    /** Re-runs update() on the next tick, collapsing bursts (used when a fetch completes). */
+    _requestUpdate() {
+        if (this._updateTimer !== null || this._disposed) return;
+        this._updateTimer = setTimeout(() => {
+            this._updateTimer = null;
+            if (this._lastCamera && !this._disposed) this.update(this._lastCamera);
+        }, 16);
+    }
+
+    /** Starts as many queued chunk requests as the concurrency limit allows. */
+    _pump() {
+        while (this.loadingNodes.size < this.maxConcurrentLoads && this._pendingLoads.length > 0) {
+            const chunk = this._pendingLoads.shift();
+            if (chunk.loading || chunk.wanted <= chunk.loadedCount) continue;
+            this._loadChunkLevels(chunk, chunk.loadedCount, chunk.wanted - 1);
+        }
+    }
+
+    /** Fetches and builds the mesh of levels [from, to] (>= head) of one chunk. */
+    async _loadChunkLevels(chunk, from, to) {
+        const meta = this.metadata;
+        const H = meta.levels.head;
+        if (from < H) from = H;
+        if (to < from) return;
+        const name = `c${chunk.id}_l${from}-${to}`;
+        const start = chunk.bodyOffset + (chunk.prefix[from] - chunk.prefix[H]);
+        const count = chunk.prefix[to + 1] - chunk.prefix[from];
+        if (count === 0) { chunk.loadedCount = to + 1; return; }
+
+        chunk.loading = true;
+        this.loadingNodes.add(name);
+        this.stats.loadingNodes = this.loadingNodes.size;
+        this._debugSegment('node-load-start', { node: name, level: from, expectedPoints: count });
+
+        try {
+            const result = await this._pool.request({
+                type: 'geom', url: this._geomUrl(), start, count,
+                segments: [{ key: name, from: 0, count }]
+            });
+            if (this._disposed) return;
+            const seg = result.segments[0];
+            const vnode = this._makeVirtualNode(chunk, from, to, start, seg.positions.length / 3);
+            this._createMeshFromDecoded(vnode, seg);
+            chunk.stack.push(this.loadedNodes.get(name));
+            chunk.loadedCount = to + 1;
+            this._debugSegment('node-load-complete', { node: name, level: from, points: vnode.numPoints });
+            this._evictIfNeeded();
+        } catch (err) {
+            if (!this._disposed) console.error(`❌ Failed to load ${name}:`, err);
+        } finally {
+            chunk.loading = false;
+            this.loadingNodes.delete(name);
+            this.stats.loadingNodes = this.loadingNodes.size;
+            if (!this._disposed) {
+                this._pump();
+                this._requestUpdate();
+            }
+        }
+    }
+
+    // ========== EVICTION ==========
+
+    /**
+     * Keeps the number of loaded points under maxLoadedPoints. Only the TOP mesh of a chunk (its
+     * highest levels) is a candidate, so a chunk never ends up with a hole in its level prefix;
+     * the overview (head) is never evicted. Meshes shown in the last update are kept; among the
+     * others the least recently used goes first.
+     */
+    _evictIfNeeded() {
+        const limit = this.maxLoadedPoints;
+        let guard = 100000;
+        while (this._loadedPoints > limit && guard-- > 0) {
+            let victim = null, victimChunk = null;
+            for (const c of this.chunks) {
+                const top = c.stack[c.stack.length - 1];
+                if (!top) continue;
+                if (top.metadata.lastUsedTick === this._tick && c.visible) continue;
+                if (victim === null || top.metadata.lastUsedTick < victim.metadata.lastUsedTick) {
+                    victim = top; victimChunk = c;
+                }
+            }
+            if (!victim) break;
+            victimChunk.stack.pop();
+            victimChunk.loadedCount = victim.metadata.nodeInfo.level;
+            this._disposeMesh(victim);
+        }
+    }
+
+    _disposeMesh(mesh) {
+        const name = mesh.metadata?.nodeInfo?.name;
+        if (name !== undefined) {
+            this.loadedNodes.delete(name);
+            this.activeNodes.delete(name);
+        }
+        this._loadedPoints -= mesh.metadata?.nodeInfo?.numPoints ?? 0;
+        this._columnFetchQueue.delete(mesh);
+        mesh.dispose();
+        this.stats.loadedNodes = this.loadedNodes.size;
+        this.stats.loadedPoints = this._loadedPoints;
+    }
+
+    // ========== CLEANUP (API compatibility) ==========
+
+    /** Frees every mesh that is not currently shown (except the overview). */
+    cleanup() {
+        for (const c of this.chunks) {
+            while (c.stack.length > 0) {
+                const top = c.stack[c.stack.length - 1];
+                if (this.activeNodes.has(top.metadata.nodeInfo.name)) break;
+                c.stack.pop();
+                c.loadedCount = top.metadata.nodeInfo.level;
+                this._disposeMesh(top);
+            }
+        }
+    }
+
+    /** No-op kept for API compatibility: eviction is driven by the point budget. */
+    startAutoCleanup() { }
+
+    stopAutoCleanup() {
+        if (this._cleanupIntervalId !== null) {
+            window.clearInterval(this._cleanupIntervalId);
+            this._cleanupIntervalId = null;
+        }
     }
 
     /**
@@ -532,7 +823,8 @@ export class Potree2Loader {
     setPointSize(size) {
         this.pointSize = Math.max(1, size);
         for (const mesh of this.loadedNodes.values()) {
-            if (mesh.material) mesh.material.pointSize = this.pointSize;
+            if (mesh.material && mesh.material !== this._featureShaderMat) mesh.material.pointSize = this.pointSize;
+            if (mesh.metadata?._origMaterial) mesh.metadata._origMaterial.pointSize = this.pointSize;
         }
         if (this._featureShaderMat) this._featureShaderMat.setFloat('pointSize', this.pointSize);
     }
@@ -565,90 +857,152 @@ export class Potree2Loader {
         }
     }
 
+    // ========== FEATURES (columns) ==========
+
     /**
-     * Load the unified point cloud binary store (.pcbin).
-     *
-     * .pcbin binary format
-     * ─────────────────────
-     * Header:
-     *   [0-3]          magic: "PCBN"
-     *   [4]            version: uint8
-     *   [5-7]          reserved: 3 bytes
-     *   [8-11]         point_count: uint32  (= max_point_id + 1)
-     *   [12-15]        feature_count: uint32 (= F)
-     *   [16..+F*32]    feature_names: char[32] × F (null-padded)
-     *   [..+F*4]       vmin: float32 × F
-     *   [..+F*4]       vmax: float32 × F
-     *   Header size = 16 + F*40
-     *
-     * Records (N records, indexed by point_id):
-     *   [0..F*4-1]     features: float32 × F  (NaN = no data)
-     *   [F*4]          segment_id: uint8       (0xFF = unassigned)
-     *   [F*4+1]        manual_class_id: uint8  (0xFF = unassigned)
-     *   [F*4+2]        predicted_class_id: uint8 (0xFF = unassigned)
-     *   [F*4+3]        padding: uint8
-     *   [F*4+4..+3]    confidence: float32     (NaN = no prediction)
-     *   Record size = F*4 + 8
+     * Names of the columns that are NOT features (standard LAS fields and service attributes).
+     * Everything else in meta.json "columns" (LAS Extra Bytes written by the feature extraction,
+     * plus `prediction`) is exposed as a feature. Compared case-insensitively.
      */
-    async loadPcBin(url) {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error("Failed to fetch .pcbin: " + response.status);
-        const buffer = await response.arrayBuffer();
-        const dv = new DataView(buffer);
+    static NON_FEATURE_ATTRIBUTES = new Set([
+        'position', 'rgb', 'intensity', 'return number', 'number of returns',
+        'classification', 'classification flags', 'scan direction flag',
+        'edge of flight line', 'scan angle rank', 'scan angle', 'scanner channel',
+        'user data', 'point source id', 'gps-time', 'gps time', 'nir',
+        'point_id', 'pointid'
+    ]);
 
-        // ── Header ──────────────────────────────────────────────────────────
-        const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
-        if (magic !== 'PCBN') throw new Error("Invalid .pcbin magic: " + magic);
-
-        const version = dv.getUint8(4);
-        const bpf = (version === 2) ? dv.getUint8(5) : 4;  // bytes per feature
-        if (version !== 1 && version !== 2)
-            throw new Error("Unsupported .pcbin version: " + version);
-        const N = dv.getUint32(8, true);   // point_count
-        const F = dv.getUint32(12, true);   // feature_count
-
-        let offset = 16;
-        const decoder = new TextDecoder('utf-8', { fatal: false });
-        const names = [];
-        for (let f = 0; f < F; f++) {
-            const bytes = new Uint8Array(buffer, offset, 32);
-            const end = bytes.indexOf(0);
-            const name = decoder.decode(bytes.slice(0, end === -1 ? 32 : end)).trim();
-            if (name.length > 0) names.push(name);
-            offset += 32;
+    _buildFeatureAttributes() {
+        this.featureAttributes = new Map();
+        for (const [name, col] of Object.entries(this.metadata.columns || {})) {
+            if (ChunkedPointCloudLoader.NON_FEATURE_ATTRIBUTES.has(String(name).toLowerCase())) continue;
+            this.featureAttributes.set(name, { name, ...col });
         }
-        const vmin = new Float32Array(buffer.slice(offset, offset + F * 4)); offset += F * 4;
-        const vmax = new Float32Array(buffer.slice(offset, offset + F * 4)); offset += F * 4;
+    }
 
-        // ── Records ─────────────────────────────────────────────────────────
-        const recSize = F * bpf + 8;  // features + annotation tail
-        const segIds = new Uint8Array(N);
-        const classIds = new Uint8Array(N);
-        const predIds = new Uint8Array(N);
-        const confidence = new Float32Array(N);
-
-        // Only scan the annotation tail per record (4 reads × N) — skip features.
-        // Feature data is looked up on demand from the raw DataView to avoid
-        // allocating N*F*4 bytes (e.g. 2+ GB for large datasets).
-        const annotOff = F * bpf;  // byte offset within a record to annotation tail
-        for (let pid = 0; pid < N; pid++) {
-            const recOff = offset + pid * recSize;
-            segIds[pid] = dv.getUint8(recOff + annotOff);
-            classIds[pid] = dv.getUint8(recOff + annotOff + 1);
-            predIds[pid] = dv.getUint8(recOff + annotOff + 2);
-            confidence[pid] = dv.getFloat32(recOff + annotOff + 4, true);
-        }
-
-        // Keep raw DataView for on-demand feature lookup (no N*F pre-allocation).
-        const dvFloat = new Float32Array(buffer, 0);
-        const dvUint8 = new Uint8Array(buffer, 0);
-        this.featureBin = { N, F, names, vmin, vmax, bpf, dv, dvFloat, dvUint8, offset, recSize };
-        this.pcbinAnnotations = { segIds, classIds, predIds, confidence };
-        return names;
+    hasFeatures() {
+        return this.featureAttributes.size > 0;
     }
 
     getFeatureList() {
-        return this.featureBin ? [...this.featureBin.names] : [];
+        return [...this.featureAttributes.keys()];
+    }
+
+    /**
+     * Value range of a feature from meta.json. Falls back to 0..1 when min/max are missing or
+     * not finite.
+     */
+    getFeatureRange(name) {
+        const attr = this.featureAttributes.get(name);
+        if (!attr) return { min: 0, max: 1 };
+        const min = Number(attr.min);
+        const max = Number(attr.max);
+        if (attr.min === null || attr.max === null || !Number.isFinite(min) || !Number.isFinite(max)) {
+            return { min: 0, max: 1 };
+        }
+        return { min, max };
+    }
+
+    /**
+     * Re-reads meta.json after the columns changed on the server (features computed, classification,
+     * backup restored) WITHOUT touching the geometry: updates the feature list, drops the cached
+     * values of the columns whose version changed and re-downloads the active one.
+     * Returns { reloadNeeded: true } when the geometry itself changed (different build): the
+     * caller then has to reload the loader.
+     */
+    async refreshColumns() {
+        const meta = await this._fetchMeta();
+        if (meta.version !== this.metadata.version || meta.points !== this.metadata.points) {
+            return { reloadNeeded: true };
+        }
+        this.metadata.columns = meta.columns || {};
+        this._buildFeatureAttributes();
+
+        if (this.colorMode.startsWith('feature:')) {
+            const name = this.colorMode.slice(8);
+            if (!this.featureAttributes.has(name)) {
+                // The active feature does not exist any more (e.g. after a restore)
+                this.setColorMode('classification');
+                window.dispatchEvent(new CustomEvent('features-available', { detail: { names: this.getFeatureList() } }));
+                return { reloadNeeded: false, activeFeatureLost: name };
+            }
+            // Same name, possibly new values: invalidate and fetch again
+            this._columnEpoch++;
+            this._applyFeatureShaderMode(true, name);
+        }
+        window.dispatchEvent(new CustomEvent('features-available', { detail: { names: this.getFeatureList() } }));
+        return { reloadNeeded: false };
+    }
+
+    /**
+     * Makes sure `mesh` has a `featureValue` vertex buffer for the active feature: a placeholder
+     * filled with the "missing" sentinel is installed immediately (the shader paints it grey)
+     * and the real values are fetched from the column in the background.
+     */
+    _ensureFeatureBuffer(mesh) {
+        const md = mesh.metadata;
+        const featureName = this.colorMode.slice(8);
+        if (!this.featureAttributes.has(featureName)) return;
+        if (md.featureName === featureName && md.featureEpoch === this._columnEpoch) return;
+
+        const n = md.nodeInfo.numPoints;
+        if (!mesh.getVertexBuffer('featureValue')) {
+            const placeholder = new Float32Array(n).fill(FEATURE_MISSING_SENTINEL);
+            const buf = new BABYLON.VertexBuffer(this.scene.getEngine(), placeholder, 'featureValue', true, false, 1);
+            mesh.setVerticesBuffer(buf);
+        }
+        md.featureName = featureName;
+        md.featureEpoch = this._columnEpoch;
+        md.featureReady = false;
+        this._columnFetchQueue.add(mesh);
+        if (this._columnFetchTimer === null) {
+            this._columnFetchTimer = setTimeout(() => {
+                this._columnFetchTimer = null;
+                this._flushColumnFetches();
+            }, 0);
+        }
+    }
+
+    /** Groups the pending meshes into contiguous ranges (as few requests as possible) and fetches them. */
+    _flushColumnFetches() {
+        if (this._disposed || this._columnFetchQueue.size === 0) return;
+        const name = this.colorMode.startsWith('feature:') ? this.colorMode.slice(8) : null;
+        const col = name ? this.metadata.columns?.[name] : null;
+        const meshes = [...this._columnFetchQueue].filter(m => m.metadata.featureName === name);
+        this._columnFetchQueue.clear();
+        if (!col || meshes.length === 0) return;
+
+        const epoch = this._columnEpoch;
+        const items = meshes.map(m => ({ mesh: m, start: m.metadata.pcRange.start, count: m.metadata.pcRange.count }))
+            .sort((a, b) => a.start - b.start);
+
+        const groups = [];
+        for (const it of items) {
+            const g = groups[groups.length - 1];
+            if (g && it.start <= g.end + 4096 && (it.start + it.count - g.start) <= COLUMN_FETCH_MAX_POINTS) {
+                g.items.push(it);
+                g.end = Math.max(g.end, it.start + it.count);
+            } else {
+                groups.push({ start: it.start, end: it.start + it.count, items: [it] });
+            }
+        }
+
+        const url = this._columnUrl(name);
+        for (const g of groups) {
+            const segments = g.items.map(it => ({ key: it.mesh.metadata.nodeInfo.name, from: it.start - g.start, count: it.count }));
+            this._pool.request({ type: 'column', url, start: g.start, count: g.end - g.start, kind: col.type, segments })
+                .then(result => {
+                    if (this._disposed) return;
+                    for (const seg of result.segments) {
+                        const mesh = this.loadedNodes.get(seg.key);
+                        if (!mesh || mesh.metadata.featureName !== name || mesh.metadata.featureEpoch !== epoch) continue;
+                        if (seg.values.length !== mesh.metadata.nodeInfo.numPoints) continue;
+                        mesh.updateVerticesData('featureValue', seg.values);
+                        mesh.metadata.featureReady = true;
+                    }
+                })
+                .catch(err => console.error(`❌ Failed to load column ${name}:`, err));
+        }
     }
 
     _blendClassChannel(original, classChannel) {
@@ -679,6 +1033,8 @@ export class Potree2Loader {
     /**
      * Applies the current colorMode to the vertex colors of a single mesh.
      * Called by setColorMode() and by update() when a node becomes visible.
+     * (Feature colours are drawn by the feature shader from the `featureValue` buffer, the vertex
+     * colours always hold the classification / original colours.)
      */
     _applyColorModeToMesh(mesh) {
         const colors = mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
@@ -691,68 +1047,19 @@ export class Potree2Loader {
             ? mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind)
             : null;
         const numPoints = colors.length / 4;
-        let changed = false;
-
-        // Feature bin mode (e.g. "feature:planarity_0_8")
-        const isFeatureMode = this.colorMode.startsWith('feature:');
-        const featureName = isFeatureMode ? this.colorMode.slice(8) : null;
-        const featureBin = isFeatureMode ? this.featureBin : null;
-        const featureIdx = (featureBin && featureName !== null) ? featureBin.names.indexOf(featureName) : -1;
-        const isPredictionFeature = featureName !== null && featureName.toLowerCase() === 'prediction';
-        const pointIds = mesh.metadata?.pointIds;
-
-        // Cache LUT + range boundaries outside the loop
-        const lut = Potree2Loader._viridisLUT;
-        const fmin = (featureBin && featureIdx >= 0)
-            ? (this._featureRangeMin !== null ? this._featureRangeMin : featureBin.vmin[featureIdx]) : 0;
-        const fmax = (featureBin && featureIdx >= 0)
-            ? (this._featureRangeMax !== null ? this._featureRangeMax : featureBin.vmax[featureIdx]) : 1;
 
         const tmpVecColorMode = new BABYLON.Vector3();
 
         for (let i = 0; i < numPoints; i++) {
             // 1. Apply base color
-            if (isFeatureMode && featureBin && featureIdx >= 0 && pointIds) {
-                const pid = pointIds[i];
-                let r = FEATURE_MISSING_COLOR, g = FEATURE_MISSING_COLOR, b = FEATURE_MISSING_COLOR;
-                if (pid >= 0 && pid < featureBin.N) {
-                    // On-demand feature lookup from raw Uint8Array / Float32Array.
-                    const recOff = featureBin.offset + pid * featureBin.recSize;
-                    let val;
-                    if (featureBin.bpf === 1) {
-                        const q = featureBin.dvUint8[recOff + featureIdx];
-                        val = (q === 255) ? NaN
-                            : featureBin.vmin[featureIdx] + (q / 254) * (featureBin.vmax[featureIdx] - featureBin.vmin[featureIdx]);
-                    } else {
-                        val = featureBin.dvFloat[(recOff + featureIdx * 4) / 4];
-                    }
-                    if (Number.isFinite(val)) {
-                        let t;
-                        if (isPredictionFeature) {
-                            // Snap to integer class, normalize by fmax for palette consistency
-                            const iv = Math.round(val);
-                            t = fmax > 0 ? Math.max(0, Math.min(1, iv / fmax)) : 0.5;
-                        } else {
-                            t = (fmax > fmin) ? (val - fmin) / (fmax - fmin) : 0.5;
-                        }
-                        const lutIdx = Math.round(Math.max(0, Math.min(1, t)) * 255) * 3;
-                        r = lut[lutIdx]; g = lut[lutIdx + 1]; b = lut[lutIdx + 2];
-                    }
-                }
-                colors[i * 4] = r;
-                colors[i * 4 + 1] = g;
-                colors[i * 4 + 2] = b;
-                colors[i * 4 + 3] = 1.0;
-            } else {
-                const hasClass = classIds && classIds[i] > 0 && classColors;
-                if (this.colorMode === "classification" && hasClass) {
-                    this._writeBlendedClassColor(colors, i, originalColors, classColors);
-                } else if (originalColors) {
-                    colors[i * 4] = originalColors[i * 4];
-                    colors[i * 4 + 1] = originalColors[i * 4 + 1];
-                    colors[i * 4 + 2] = originalColors[i * 4 + 2];
-                    colors[i * 4 + 3] = originalColors[i * 4 + 3];
-                }
+            const hasClass = classIds && classIds[i] > 0 && classColors;
+            if (this.colorMode === "classification" && hasClass) {
+                this._writeBlendedClassColor(colors, i, originalColors, classColors);
+            } else if (originalColors) {
+                colors[i * 4] = originalColors[i * 4];
+                colors[i * 4 + 1] = originalColors[i * 4 + 1];
+                colors[i * 4 + 2] = originalColors[i * 4 + 2];
+                colors[i * 4 + 3] = originalColors[i * 4 + 3];
             }
 
             // 2. Re-apply selection highlight on top (always overrides)
@@ -767,14 +1074,12 @@ export class Potree2Loader {
                     colors[i * 4 + 3] = 1.0;
                 }
             }
-
-            changed = true;
         }
-        if (changed) mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
+        mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
     }
 
     getStats() {
-        return { ...this.stats, loadedNodes: this.loadedNodes.size };
+        return { ...this.stats, loadedNodes: this.loadedNodes.size, loadedPoints: this._loadedPoints };
     }
 
     getRoot() {
@@ -787,220 +1092,31 @@ export class Potree2Loader {
         }
         this._cameraForObserver = null;
         this._cameraViewObserver = null;
+        this._disposed = true;
 
         if (this._cleanupIntervalId !== null) {
             clearInterval(this._cleanupIntervalId);
             this._cleanupIntervalId = null;
         }
+        if (this._updateTimer !== null) { clearTimeout(this._updateTimer); this._updateTimer = null; }
+        if (this._columnFetchTimer !== null) { clearTimeout(this._columnFetchTimer); this._columnFetchTimer = null; }
+        this._columnFetchQueue.clear();
+        this._pendingLoads = [];
 
         for (const mesh of this.loadedNodes.values()) {
-            if (mesh.material) mesh.material.dispose();
             mesh.dispose();
         }
         this.loadedNodes.clear();
         this.activeNodes.clear();
         this.loadingNodes.clear();
         this.rootTransform.dispose();
-        this.hierarchyBuffer = null;
-    }
-
-    // ========== ATTRIBUTE PARSING ==========
-
-    _parseAttributes() {
-        this.attributes = [];
-        let byteOffset = 0;
-
-        for (const attr of this.metadata.attributes) {
-            this.attributes.push({
-                name: attr.name,
-                type: attr.type,
-                size: attr.size,
-                numElements: attr.numElements,
-                elementSize: attr.elementSize,
-                byteOffset: byteOffset,
-                min: attr.min,
-                max: attr.max,
-                scale: attr.scale,
-                offset: attr.offset
-            });
-            byteOffset += attr.size;
+        if (this._pool) { this._pool.dispose(); this._pool = null; }
+        if (this._baseMat) { this._baseMat.dispose(); this._baseMat = null; }
+        if (this._featureShaderMat) {
+            this._featureShaderMat.dispose();
+            this._featureShaderMat = null;
         }
-
-        this.bytesPerPoint = byteOffset;
-        // console.log("📋 Attributes:", this.attributes.map(a => `${a.name}(${a.type}, ${a.size}B)`).join(", "));
-        // console.log("   Bytes per point:", this.bytesPerPoint);
     }
-
-    // ========== HIERARCHY PARSING ==========
-
-    _parseHierarchyChunk(rootNode) {
-        const buffer = this.hierarchyBuffer;
-        const chunkStart = Number(rootNode.hierarchyByteOffset);
-        const chunkEnd = chunkStart + Number(rootNode.hierarchyByteSize);
-
-        if (chunkEnd > buffer.byteLength) {
-            console.error(`Hierarchy chunk exceeds buffer: ${chunkStart}-${chunkEnd} > ${buffer.byteLength}`);
-            return;
-        }
-
-        const view = new DataView(buffer, chunkStart, chunkEnd - chunkStart);
-        const bytesPerNode = 22;
-        const numNodes = Math.floor((chunkEnd - chunkStart) / bytesPerNode);
-
-        const nodes = new Array(numNodes);
-        nodes[0] = rootNode;
-        let nodePos = 1;
-
-        for (let i = 0; i < numNodes; i++) {
-            const current = nodes[i];
-            if (!current) break;
-
-            const offset = i * bytesPerNode;
-            const type = view.getUint8(offset + 0);
-            const childMask = view.getUint8(offset + 1);
-            const numPoints = view.getUint32(offset + 2, true);
-            const byteOffset = view.getBigInt64(offset + 6, true);
-            const byteSize = view.getBigInt64(offset + 14, true);
-
-            if (current.nodeType === 2) {
-                current.byteOffset = byteOffset;
-                current.byteSize = byteSize;
-                current.numPoints = numPoints;
-            } else if (type === 2) {
-                current.hierarchyByteOffset = byteOffset;
-                current.hierarchyByteSize = byteSize;
-                current.numPoints = numPoints;
-            } else {
-                current.byteOffset = byteOffset;
-                current.byteSize = byteSize;
-                current.numPoints = numPoints;
-            }
-
-            current.nodeType = type;
-            current.childMask = childMask;
-
-            if (current.nodeType === 2) continue;
-
-            for (let childIdx = 0; childIdx < 8; childIdx++) {
-                if (!((1 << childIdx) & childMask)) continue;
-
-                const childName = current.name + childIdx;
-                const childBB = createChildAABB(current.boundingBox, childIdx);
-                const child = new Potree2Node(childName, childBB);
-                child.spacing = current.spacing / 2;
-
-                current.children[childIdx] = child;
-                nodes[nodePos] = child;
-                nodePos++;
-            }
-        }
-
-        rootNode.nodeType = 0;
-    }
-
-    _ensureHierarchyLoaded(node) {
-        if (node.nodeType !== 2) return;
-        const bufLen = this.hierarchyBuffer ? this.hierarchyBuffer.byteLength : 0;
-        const chunkStart = Number(node.hierarchyByteOffset);
-        const chunkEnd = chunkStart + Number(node.hierarchyByteSize);
-        if (chunkEnd > bufLen) {
-            console.warn(`⚠️ Proxy node ${node.name}: chunk [${chunkStart}-${chunkEnd}] exceeds hierarchy buffer (${bufLen} bytes). Node will stay as proxy.`);
-            return;
-        }
-        this._parseHierarchyChunk(node);
-    }
-
-    _collectNodes(node) {
-        const result = [node];
-        for (const child of node.children) {
-            if (child) result.push(...this._collectNodes(child));
-        }
-        return result;
-    }
-
-    // ========== LOD TRAVERSAL ==========
-    // Replaced by iterative heap-based algorithm inside update().
-    // See update() for the Potree-faithful implementation.
-
-    _getLocalCenter(node) {
-        const bb = node.boundingBox;
-        return new BABYLON.Vector3(
-            (bb.min[0] + bb.max[0]) / 2,
-            (bb.min[1] + bb.max[1]) / 2,
-            (bb.min[2] + bb.max[2]) / 2
-        );
-    }
-
-    // ========== ATTRIBUTE COLORIZATION UTILITIES ==========
-
-    /**
-     * Reads a scalar value from the ArrayBuffer based on the attribute type.
-     */
-    _readAttrScalar(view, byteOffset, attr) {
-        const t = attr.type;
-        if (t === 'int8') return view.getInt8(byteOffset);
-        if (t === 'uint8') return view.getUint8(byteOffset);
-        if (t === 'int16') return view.getInt16(byteOffset, true);
-        if (t === 'uint16') return view.getUint16(byteOffset, true);
-        if (t === 'int32') return view.getInt32(byteOffset, true);
-        if (t === 'uint32') return view.getUint32(byteOffset, true);
-        if (t === 'float') return view.getFloat32(byteOffset, true);
-        if (t === 'double') return view.getFloat64(byteOffset, true);
-        // int64/uint64: fallback to int32 (only low 4 bytes)
-        return view.getInt32(byteOffset, true);
-    }
-
-    /**
-     * Viridis colormap (clamps to [0,1]). Used for continuous attributes (e.g. intensity).
-     */
-    static _buildViridisLUT() {
-        const stops = [
-            [0.267, 0.005, 0.329], [0.283, 0.141, 0.458], [0.163, 0.471, 0.558],
-            [0.134, 0.659, 0.518], [0.478, 0.821, 0.318], [0.993, 0.906, 0.144]
-        ];
-        const lut = new Float32Array(256 * 3);
-        for (let i = 0; i < 256; i++) {
-            const t = i / 255;
-            const scaled = t * (stops.length - 1);
-            const lo = Math.floor(scaled);
-            const hi = Math.min(lo + 1, stops.length - 1);
-            const f = scaled - lo;
-            lut[i * 3] = stops[lo][0] + (stops[hi][0] - stops[lo][0]) * f;
-            lut[i * 3 + 1] = stops[lo][1] + (stops[hi][1] - stops[lo][1]) * f;
-            lut[i * 3 + 2] = stops[lo][2] + (stops[hi][2] - stops[lo][2]) * f;
-        }
-        return lut;
-    }
-
-    _colormapViridis(t) {
-        const idx = Math.round(Math.max(0, Math.min(1, t)) * 255) * 3;
-        return [Potree2Loader._viridisLUT[idx],
-        Potree2Loader._viridisLUT[idx + 1],
-        Potree2Loader._viridisLUT[idx + 2]];
-    }
-
-    /**
-     * Discrete cyclic palette for integer attributes (e.g. classification, return_number).
-     * Returns [r, g, b] in [0,1].
-     */
-    _colormapDiscrete(intValue) {
-        const palette = [
-            [0.22, 0.62, 0.85],  // blue
-            [0.95, 0.45, 0.10],  // orange
-            [0.17, 0.72, 0.44],  // green
-            [0.80, 0.22, 0.33],  // red
-            [0.58, 0.40, 0.74],  // purple
-            [0.99, 0.75, 0.18],  // yellow
-            [0.40, 0.76, 0.65],  // teal
-            [0.88, 0.53, 0.79],  // pink
-            [0.60, 0.60, 0.60],  // gray
-            [0.99, 0.55, 0.38],  // salmon
-        ];
-        const idx = Math.abs(intValue) % palette.length;
-        return palette[idx];
-    }
-
-
 
     // ========== FEATURE SHADER ==========
 
@@ -1125,11 +1241,12 @@ export class Potree2Loader {
         }
     `;
 
+
     _getOrCreateFeatureShaderMaterial() {
         if (this._featureShaderMat) return this._featureShaderMat;
-        BABYLON.Effect.ShadersStore['potreeFeatureVertexShader'] = Potree2Loader._featureVertexShader;
-        BABYLON.Effect.ShadersStore['potreeFeatureFragmentShader'] = Potree2Loader._featureFragmentShader;
-        const mat = new BABYLON.ShaderMaterial('potreeFeatureMat', this.scene, 'potreeFeature', {
+        BABYLON.Effect.ShadersStore['pcFeatureVertexShader'] = ChunkedPointCloudLoader._featureVertexShader;
+        BABYLON.Effect.ShadersStore['pcFeatureFragmentShader'] = ChunkedPointCloudLoader._featureFragmentShader;
+        const mat = new BABYLON.ShaderMaterial('pcFeatureMat', this.scene, 'pcFeature', {
             attributes: ['position', 'featureValue'],
             uniforms: ['worldViewProjection', 'pointSize', 'fmin', 'fmax', 'colormap', 'predictionDiscrete', 'discreteFilterEnabled', 'discreteFilterValue'],
         });
@@ -1148,44 +1265,13 @@ export class Potree2Loader {
         return mat;
     }
 
-    _uploadFeatureAttribute(mesh) {
-        if (!this.featureBin) return;
-        const featureName = this.colorMode.slice(8);
-        const featureIdx = this.featureBin.names.indexOf(featureName);
-        if (featureIdx < 0) return;
-        const pointIds = mesh.metadata?.pointIds;
-        if (!pointIds) return;
-        const numPoints = pointIds.length;
-        const featureValues = new Float32Array(numPoints);
-        const { bpf, dvFloat, dvUint8, offset, recSize, F, N, vmin, vmax } = this.featureBin;
-        for (let i = 0; i < numPoints; i++) {
-            const pid = pointIds[i];
-            if (pid < 0 || pid >= N) { featureValues[i] = FEATURE_MISSING_SENTINEL; continue; }
-            const recOff = offset + pid * recSize;
-            if (bpf === 1) {
-                const q = dvUint8[recOff + featureIdx];
-                featureValues[i] = (q === 255) ? FEATURE_MISSING_SENTINEL
-                    : vmin[featureIdx] + (q / 254) * (vmax[featureIdx] - vmin[featureIdx]);
-            } else {
-                const val = dvFloat[(recOff + featureIdx * 4) / 4];
-                featureValues[i] = Number.isFinite(val) ? val : FEATURE_MISSING_SENTINEL;
-            }
-        }
-        const buf = new BABYLON.VertexBuffer(
-            this.scene.getEngine(), featureValues, 'featureValue', false, false, 1
-        );
-        mesh.setVerticesBuffer(buf);
-    }
-
     _applyFeatureShaderMode(enable, featureName) {
         const shaderMat = this._getOrCreateFeatureShaderMaterial();
         const isPredictionFeature = typeof featureName === 'string' && featureName.toLowerCase() === 'prediction';
-        if (this.featureBin && featureName) {
-            const featureIdx = this.featureBin.names.indexOf(featureName);
-            if (featureIdx >= 0) {
-                shaderMat.setFloat('fmin', this._featureRangeMin !== null ? this._featureRangeMin : this.featureBin.vmin[featureIdx]);
-                shaderMat.setFloat('fmax', this._featureRangeMax !== null ? this._featureRangeMax : this.featureBin.vmax[featureIdx]);
-            }
+        if (featureName && this.featureAttributes.has(featureName)) {
+            const range = this.getFeatureRange(featureName);
+            shaderMat.setFloat('fmin', this._featureRangeMin !== null ? this._featureRangeMin : range.min);
+            shaderMat.setFloat('fmax', this._featureRangeMax !== null ? this._featureRangeMax : range.max);
         }
 
         const discreteForFeature = this._featureDiscreteFilter && this._featureDiscreteFilter.featureName === featureName;
@@ -1202,12 +1288,18 @@ export class Potree2Loader {
         for (const mesh of this.loadedNodes.values()) {
             if (enable) {
                 if (!mesh.metadata._origMaterial) mesh.metadata._origMaterial = mesh.material;
-                this._uploadFeatureAttribute(mesh);
+                this._ensureFeatureBuffer(mesh);
                 mesh.material = shaderMat;
             } else {
                 if (mesh.metadata._origMaterial) {
                     mesh.material = mesh.metadata._origMaterial;
                     mesh.metadata._origMaterial = null;
+                }
+                // Only the active column is kept in memory
+                if (mesh.metadata.featureName) {
+                    mesh.metadata.featureName = null;
+                    mesh.metadata.featureReady = false;
+                    if (mesh.getVertexBuffer('featureValue')) mesh.removeVerticesData('featureValue');
                 }
             }
         }
@@ -1236,11 +1328,12 @@ export class Potree2Loader {
     resetFeatureRange() {
         this._featureRangeMin = null;
         this._featureRangeMax = null;
-        if (this._featureShaderMat && this.featureBin && this.colorMode.startsWith('feature:')) {
-            const featureIdx = this.featureBin.names.indexOf(this.colorMode.slice(8));
-            if (featureIdx >= 0) {
-                this._featureShaderMat.setFloat('fmin', this.featureBin.vmin[featureIdx]);
-                this._featureShaderMat.setFloat('fmax', this.featureBin.vmax[featureIdx]);
+        if (this._featureShaderMat && this.colorMode.startsWith('feature:')) {
+            const featureName = this.colorMode.slice(8);
+            if (this.featureAttributes.has(featureName)) {
+                const range = this.getFeatureRange(featureName);
+                this._featureShaderMat.setFloat('fmin', range.min);
+                this._featureShaderMat.setFloat('fmax', range.max);
             }
         }
     }
@@ -1252,87 +1345,37 @@ export class Potree2Loader {
 
     // ========== MESH CREATION ==========
 
-    _createMeshFromBuffer(node, buffer) {
-        const view = new DataView(buffer);
-        const numPoints = node.numPoints;
-        const positions = new Float32Array(numPoints * 3);
-        const colors = new Float32Array(numPoints * 4);
+    /**
+     * Base material shared by every node: all points use the same size and the vertex colours
+     * (alpha 0 hides cut segments).
+     */
+    _getBaseMaterial() {
+        if (this._baseMat) return this._baseMat;
+        const mat = new BABYLON.StandardMaterial("mat_pc_base", this.scene);
+        mat.pointsCloud = true;
+        mat.pointSize = this.pointSize;
+        mat.disableLighting = true;
+        mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
+        mat.useVertexAlpha = true; // needed for alpha=0 to hide cut segment points
+        // Use ALPHA TEST to discard invisible points efficiently and avoid depth sorting issues
+        mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
+        mat.alphaCutOff = 0.1;
+        this._baseMat = mat;
+        return mat;
+    }
 
-        const scale = this.metadata.scale;
-        const metaOffset = this.metadata.offset;
-        const bbMin = this.metadata.boundingBox.min;
-
-        let posAttr = null;
-        let rgbAttr = null;
-        let pointIdAttr = null;
-
-        for (const attr of this.attributes) {
-            if (attr.name === "position") posAttr = attr;
-            if (attr.name === "rgb") rgbAttr = attr;
-            if (attr.name.toLowerCase() === "point_id" || attr.name.toLowerCase() === "pointid") {
-                pointIdAttr = attr;
-            }
-        }
-
-        if (!posAttr) {
-            console.error("No position attribute found!");
-            return;
-        }
-
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-
-        const pointIds = new Int32Array(numPoints);
-        pointIds.fill(-1);
-
-        for (let j = 0; j < numPoints; j++) {
-            const pointOffset = j * this.bytesPerPoint;
-
-            if (pointOffset + posAttr.byteOffset + 12 > buffer.byteLength) break;
-
-            const rawX = view.getInt32(pointOffset + posAttr.byteOffset + 0, true);
-            const rawY = view.getInt32(pointOffset + posAttr.byteOffset + 4, true);
-            const rawZ = view.getInt32(pointOffset + posAttr.byteOffset + 8, true);
-
-            const x = (rawX * scale[0]) + metaOffset[0] - bbMin[0];
-            const y = (rawY * scale[1]) + metaOffset[1] - bbMin[1];
-            const z = (rawZ * scale[2]) + metaOffset[2] - bbMin[2];
-
-            positions[3 * j + 0] = x;
-            positions[3 * j + 1] = y;
-            positions[3 * j + 2] = z;
-
-            minX = Math.min(minX, x); maxX = Math.max(maxX, x);
-            minY = Math.min(minY, y); maxY = Math.max(maxY, y);
-            minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
-
-            // Decode RGB (uint16 × 3)
-            if (rgbAttr && pointOffset + rgbAttr.byteOffset + 6 <= buffer.byteLength) {
-                const rRaw = view.getUint16(pointOffset + rgbAttr.byteOffset + 0, true);
-                const gRaw = view.getUint16(pointOffset + rgbAttr.byteOffset + 2, true);
-                const bRaw = view.getUint16(pointOffset + rgbAttr.byteOffset + 4, true);
-
-                const r = rRaw > 255 ? rRaw / 256 : rRaw;
-                const g = gRaw > 255 ? gRaw / 256 : gRaw;
-                const b = bRaw > 255 ? bRaw / 256 : bRaw;
-
-                colors[4 * j + 0] = r / 255.0;
-                colors[4 * j + 1] = g / 255.0;
-                colors[4 * j + 2] = b / 255.0;
-                colors[4 * j + 3] = 1.0;
-            } else {
-                colors[4 * j + 0] = 1.0;
-                colors[4 * j + 1] = 1.0;
-                colors[4 * j + 2] = 1.0;
-                colors[4 * j + 3] = 1.0;
-            }
-
-            // Decode POINT_ID
-            if (pointIdAttr && pointOffset + pointIdAttr.byteOffset + 4 <= buffer.byteLength) {
-                // Read as Int32/Uint32 (usually 4 bytes). Using getInt32.
-                pointIds[j] = view.getInt32(pointOffset + pointIdAttr.byteOffset, true);
-            }
-        }
+    /**
+     * Builds the BabylonJS mesh of a virtual node from the arrays decoded by the worker
+     * (`positions` local Float32 relative to boundingBox.min, `colors` RGBA Float32, `pointIds`).
+     * Persistent selection / classification / cut state is replayed on the new points exactly
+     * as before: this is the only place where the data layer meets the editing logic.
+     */
+    _createMeshFromDecoded(node, decoded) {
+        const positions = decoded.positions;
+        const colors = decoded.colors;
+        const pointIds = decoded.pointIds;
+        const numPoints = positions.length / 3;
+        node.numPoints = numPoints;
 
 
         // Save original positions so they can be hidden (by assigning NaN)
@@ -1511,25 +1554,16 @@ export class Potree2Loader {
             visibleSegments: this._currentVisibleSegmentIds()
         });
 
+
         // Create BabylonJS mesh
-        const mesh = new BABYLON.Mesh(`potree2_${node.name}`, this.scene);
+        const mesh = new BABYLON.Mesh(`pc_${node.name}`, this.scene);
         const vertexData = new BABYLON.VertexData();
         vertexData.positions = positions;
         vertexData.colors = colors;
         // updatable=true is REQUIRED to update visibility and colors dynamically
         vertexData.applyToMesh(mesh, true);
 
-        const mat = new BABYLON.StandardMaterial(`mat_p2_${node.name}`, this.scene);
-        mat.pointsCloud = true;
-        mat.pointSize = this.pointSize;
-        mat.disableLighting = true;
-        mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
-        mat.useVertexAlpha = true; // needed for alpha=0 to hide cut segment points
-        // Use ALPHA TEST to discard invisible points efficiently and avoid depth sorting issues
-        mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
-        mat.alphaCutOff = 0.1;
-
-        mesh.material = mat;
+        mesh.material = this._getBaseMaterial();
         mesh.hasAlpha = true;
 
         mesh.parent = this.rootTransform;
@@ -1537,60 +1571,38 @@ export class Potree2Loader {
         mesh.isPickable = true;
 
         mesh.metadata = {
-            nodeInfo: { name: node.name, level: node.level, numPoints: node.numPoints },
+            nodeInfo: {
+                name: node.name, level: node.level, levelTo: node.levelTo,
+                numPoints, chunkId: node.chunk.id
+            },
             originalPositions,
             originalColors,
             classIds,
             classColors,
             segmentIds,
             pointIds,
-            potree2Node: true,
-            // Used by update() to compute per-node projected point size (spacing-based LOD).
+            // Where this node lives in geom.bin (and in every column): offset/length in points
+            pcRange: { start: node.start, count: numPoints },
+            pointCloudNode: true,
+            // Nominal spacing / bounds of the node (levels from..to of one chunk)
             nodeSpacing: node.spacing,
             nodeBoundingBox: node.boundingBox,
-            segmentRevision: this._segmentRevision
+            segmentRevision: this._segmentRevision,
+            lastUsedTick: this._tick,
+            featureName: null,
+            featureEpoch: -1,
+            featureReady: false
         };
 
         this.loadedNodes.set(node.name, mesh);
-        node.loaded = true;
-        node.mesh = mesh;
+        this._loadedPoints += numPoints;
+        this.stats.loadedNodes = this.loadedNodes.size;
+        this.stats.loadedPoints = this._loadedPoints;
 
-        if (this.colorMode.startsWith('feature:') && this.featureBin) {
+        if (this.colorMode.startsWith('feature:') && this.featureAttributes.has(this.colorMode.slice(8))) {
             mesh.metadata._origMaterial = mesh.material;
-            this._uploadFeatureAttribute(mesh);
             mesh.material = this._getOrCreateFeatureShaderMaterial();
-        }
-    }
-
-    // ========== CLEANUP ==========
-
-    cleanup(keepCount = 200) {
-        if (this.loadedNodes.size <= keepCount) return;
-
-        const inactiveNodes = [...this.loadedNodes.keys()]
-            .filter(name => !this.activeNodes.has(name));
-
-        const toRemove = inactiveNodes.slice(0, Math.max(0, inactiveNodes.length - keepCount));
-
-        for (const name of toRemove) {
-            const mesh = this.loadedNodes.get(name);
-            if (mesh.material) mesh.material.dispose();
-            mesh.dispose();
-            this.loadedNodes.delete(name);
-            this.stats.loadedNodes--;
-        }
-
-    }
-
-    startAutoCleanup(intervalMs = 30000, keepCount = 200) {
-        this.stopAutoCleanup();
-        this._cleanupIntervalId = window.setInterval(() => this.cleanup(keepCount), intervalMs);
-    }
-
-    stopAutoCleanup() {
-        if (this._cleanupIntervalId !== null) {
-            window.clearInterval(this._cleanupIntervalId);
-            this._cleanupIntervalId = null;
+            this._ensureFeatureBuffer(mesh);
         }
     }
 
@@ -2820,18 +2832,19 @@ export class Potree2Loader {
     }
 
     /**
-     * Build and return an array of { point_id, element } for all points 
-     * Build and return an array of { point_id, element } for all points
-     * in the entire cloud that belong to a mapped segment.
-     * Traverse the octree to find all points across all levels of detail.
+     * Build and return the buffer [seg+1, class] (2 bytes per POINT_ID) for every point of the
+     * entire cloud that belongs to a mapped segment.
+     *
+     * Points of the nodes currently loaded are read from their meshes (that is where the live
+     * state is). All the others are streamed from geom.bin in contiguous blocks of ~8 MB
+     * (positions + POINT_ID only, decoded in a worker) and resolved with the canonical
+     * segment/class maps, falling back to the chronological geometric replay.
      */
     async exportAllTrainingData(segmentNameMap) {
         const totalPoints = this.metadata.points;
         const buffer = new Uint8Array(totalPoints * 2); // Interleaved: [segId, classId, segId, classId, ...]
-        const seenIds = new Set();
-        let totalProcessed = 0;
-        let skippedNoId = 0;
-        let duplicates = 0;
+        // 1 = already handled through a loaded mesh, 2 = handled from geom.bin
+        const handled = new Uint8Array(totalPoints);
 
         // Identify which segments the user actually cares about (including segment 0)
         const requestedIds = Object.keys(segmentNameMap).map(id => parseInt(id, 10));
@@ -2839,165 +2852,120 @@ export class Potree2Loader {
 
         const includeSegmentZero = segmentNameMap[0] !== undefined;
 
-        // Helper: Is this node worth visiting?
-        const shouldVisit = (node) => {
+        // Helper: is this chunk worth visiting?
+        const shouldVisit = (chunk) => {
             if (includeSegmentZero) return true;
             return this.cutHistory.some(region => {
                 if (!segmentNameMap[region.segmentId]) return false;
-                return (node.boundingBox.min[0] <= region.maxX && node.boundingBox.max[0] >= region.minX &&
-                    node.boundingBox.min[1] <= region.maxY && node.boundingBox.max[1] >= region.minY &&
-                    node.boundingBox.min[2] <= region.maxZ && node.boundingBox.max[2] >= region.minZ);
+                return (chunk.min[0] <= region.maxX && chunk.max[0] >= region.minX &&
+                    chunk.min[1] <= region.maxY && chunk.max[1] >= region.minY &&
+                    chunk.min[2] <= region.maxZ && chunk.max[2] >= region.minZ);
             });
         };
 
-        const traverse = async (node) => {
-            if (!shouldVisit(node)) return;
+        // ---- 1. loaded nodes: live mesh state
+        for (const mesh of this.loadedNodes.values()) {
+            const chunk = this.chunks[mesh.metadata?.nodeInfo?.chunkId];
+            if (!chunk || !shouldVisit(chunk)) continue;
+            if (!mesh.metadata.pointIds || !mesh.metadata.segmentIds) continue;
+            const segmentIds = mesh.metadata.segmentIds;
+            const classIds = mesh.metadata.classIds || new Int32Array(mesh.metadata.pointIds.length);
+            const pointIds = mesh.metadata.pointIds;
+            for (let i = 0; i < pointIds.length; i++) {
+                const pid = pointIds[i];
+                if (pid < 0 || pid >= totalPoints || handled[pid]) continue;
+                handled[pid] = 1;
 
-            // Proxy node? Expand hierarchy
-            if (node.nodeType === 2) {
-                this._ensureHierarchyLoaded(node);
+                const segId = segmentIds[i] || 0;
+                if (segmentNameMap[segId] !== undefined) {
+                    buffer[pid * 2] = segId + 1;      // +1 so 0 stays "unannotated"
+                    buffer[pid * 2 + 1] = classIds[i] || 0;
+                }
             }
+        }
 
-            // Is this node already loaded in the scene?
-            const mesh = this.loadedNodes.get(node.name);
-            if (mesh && mesh.metadata && mesh.metadata.pointIds && mesh.metadata.segmentIds) {
-                const segmentIds = mesh.metadata.segmentIds;
-                const classIds = mesh.metadata.classIds || new Int32Array(mesh.metadata.pointIds.length);
-                const pointIds = mesh.metadata.pointIds;
+        // ---- 2. everything else: contiguous ranges of geom.bin
+        const ranges = [];
+        for (const chunk of this.chunks) {
+            if (!shouldVisit(chunk)) continue;
+            const hp = chunk.headPoints;
+            if (hp > 0) ranges.push([chunk.headOffset, chunk.headOffset + hp]);
+            if (chunk.points - hp > 0) ranges.push([chunk.bodyOffset, chunk.bodyOffset + chunk.points - hp]);
+        }
+        ranges.sort((a, b) => a[0] - b[0]);
+        const merged = [];
+        for (const r of ranges) {
+            const last = merged[merged.length - 1];
+            if (last && r[0] <= last[1]) last[1] = Math.max(last[1], r[1]); else merged.push([r[0], r[1]]);
+        }
+        const blocks = [];
+        for (const [a, b] of merged) {
+            for (let s = a; s < b; s += SCAN_BLOCK_POINTS) blocks.push([s, Math.min(b, s + SCAN_BLOCK_POINTS)]);
+        }
+
+        const url = this._geomUrl();
+        const pos = new BABYLON.Vector3();
+        const chronologicalCuts = this._getChronologicalCuts();
+        const hasClassMap = !!this._pointClassMap;
+        let next = 0;
+        const scanner = async () => {
+            while (next < blocks.length) {
+                const [s, e] = blocks[next++];
+                const result = await this._pool.request({
+                    type: 'geom', url, start: s, count: e - s, colors: false,
+                    segments: [{ key: 0, from: 0, count: e - s }]
+                });
+                if (this._disposed) return;
+                const { positions, pointIds } = result.segments[0];
                 for (let i = 0; i < pointIds.length; i++) {
                     const pid = pointIds[i];
-                    totalProcessed++;
-                    if (pid === -1 || pid >= totalPoints) {
-                        skippedNoId++;
-                        continue;
-                    }
-                    if (seenIds.has(pid)) {
-                        duplicates++;
-                        continue;
+                    if (pid < 0 || pid >= totalPoints || handled[pid]) continue;
+                    handled[pid] = 2;
+
+                    let finalSegId = 0;
+                    let finalClassId = 0;
+
+                    // Canonical segment map first
+                    if (this._pointSegmentMap && pid < this._pointSegmentMap.length) {
+                        const canonical = this._readPointSegment(pid);
+                        if (canonical !== null) {
+                            finalSegId = canonical;
+                        } else {
+                            // Fallback to projection if not yet evaluated — same chronological
+                            // replay the LOD path uses, so the export agrees with what the user
+                            // sees on screen.
+                            pos.set(positions[3 * i], positions[3 * i + 1], positions[3 * i + 2]);
+                            const seg = this._resolvePointSegment(pos, chronologicalCuts);
+                            finalSegId = seg ? seg.segmentId : 0;
+                            // Cache it
+                            this._writePointSegment(pid, finalSegId);
+                        }
                     }
 
-                    const segId = segmentIds[i] || 0;
-                    if (segmentNameMap[segId] !== undefined) {
-                        seenIds.add(pid);
-                        buffer[pid * 2] = segId + 1;      // +1 so 0 stays "unannotated"
-                        buffer[pid * 2 + 1] = classIds[i] || 0;
+                    if (segmentNameMap[finalSegId] === undefined) continue;
+
+                    // Class: canonical map, else the classification history replay
+                    const stored = hasClassMap ? this._pointClassMap[pid] : 0;
+                    if (stored !== 0 && stored !== 0xFF) {
+                        finalClassId = stored;
+                    } else if (this.classificationHistory.length > 0) {
+                        pos.set(positions[3 * i], positions[3 * i + 1], positions[3 * i + 2]);
+                        const cls = this._getPointClassification(pos);
+                        finalClassId = cls ? cls.classId : 0;
+                        if (finalClassId > 0 && hasClassMap) this._pointClassMap[pid] = finalClassId;
                     }
+
+                    buffer[pid * 2] = finalSegId + 1; // +1 so 0 stays "unannotated"
+                    buffer[pid * 2 + 1] = finalClassId;
                 }
-            } else if (node.numPoints > 0) {
-                // Fetch and parse points for this node
-                const nodeBuffer = await this._fetchRange("octree.bin", node.byteOffset, node.byteSize);
-                if (nodeBuffer) {
-                    const points = this._parsePointsFromBufferDirect(node, nodeBuffer);
-                    for (const p of points) {
-                        totalProcessed++;
-                        const pid = p.id;
-                        if (pid === -1 || pid >= totalPoints) {
-                            skippedNoId++;
-                            continue;
-                        }
-                        if (seenIds.has(pid)) {
-                            duplicates++;
-                            continue;
-                        }
-
-                        let finalSegId = 0;
-                        let finalClassId = 0;
-
-                        // Use canonical maps if available
-                        if (this._pointSegmentMap && pid < this._pointSegmentMap.length) {
-                            const canonical = this._readPointSegment(pid);
-                            if (canonical !== null) {
-                                finalSegId = canonical;
-                            } else {
-                                // Fallback to projection if not yet evaluated — same
-                                // chronological replay the LOD path uses, so the export
-                                // agrees with what the user sees on screen.
-                                const seg = this._resolvePointSegment(p.pos);
-                                finalSegId = seg ? seg.segmentId : 0;
-                                // Cache it
-                                this._writePointSegment(pid, finalSegId);
-                            }
-                        }
-
-                        if (this._pointClassMap && pid < this._pointClassMap.length) {
-                            const stored = this._pointClassMap[pid];
-                            if (stored !== 0 && stored !== 0xFF) {
-                                finalClassId = stored;
-                            } else {
-                                // Fallback
-                                const cls = this._getPointClassification(p.pos);
-                                finalClassId = cls ? cls.classId : 0;
-                                // Cache it
-                                if (finalClassId > 0) this._pointClassMap[pid] = finalClassId;
-                            }
-                        }
-
-                        if (segmentNameMap[finalSegId] !== undefined) {
-                            seenIds.add(pid);
-                            buffer[pid * 2] = finalSegId + 1; // +1 so 0 stays "unannotated"
-                            buffer[pid * 2 + 1] = finalClassId;
-                        }
-                    }
-                }
-            }
-
-            // Subdivide (processed sequentially to avoid ERR_INSUFFICIENT_RESOURCES)
-            for (const child of node.children) {
-                if (child) await traverse(child);
             }
         };
-
-        await traverse(this.root);
+        await Promise.all(Array.from({ length: Math.min(3, blocks.length) }, scanner));
 
         return {
             buffer: buffer,
             segmentMap: segmentNameMap
         };
-    }
-
-    /**
-     * Lightweight point parser that returns { pos: Vector3, id: number }[]
-     */
-    _parsePointsFromBufferDirect(node, buffer) {
-        const view = new DataView(buffer);
-        const numPoints = node.numPoints;
-        const results = [];
-
-        const scale = this.metadata.scale;
-        const metaOffset = this.metadata.offset;
-        const bbMin = this.metadata.boundingBox.min;
-
-        let posAttr = null;
-        let pointIdAttr = null;
-        for (const attr of this.attributes) {
-            const lowName = attr.name.toLowerCase();
-            if (lowName === "position") posAttr = attr;
-            if (lowName === "point_id" || lowName === "pointid") {
-                pointIdAttr = attr;
-            }
-        }
-        if (!posAttr) return [];
-
-        for (let j = 0; j < numPoints; j++) {
-            const pointOffset = j * this.bytesPerPoint;
-            if (pointOffset + posAttr.byteOffset + 12 > buffer.byteLength) break;
-
-            const rawX = view.getInt32(pointOffset + posAttr.byteOffset + 0, true);
-            const rawY = view.getInt32(pointOffset + posAttr.byteOffset + 4, true);
-            const rawZ = view.getInt32(pointOffset + posAttr.byteOffset + 8, true);
-
-            const x = (rawX * scale[0]) + metaOffset[0] - bbMin[0];
-            const y = (rawY * scale[1]) + metaOffset[1] - bbMin[1];
-            const z = (rawZ * scale[2]) + metaOffset[2] - bbMin[2];
-
-            let pid = -1;
-            if (pointIdAttr && pointOffset + pointIdAttr.byteOffset + 4 <= buffer.byteLength) {
-                pid = view.getInt32(pointOffset + pointIdAttr.byteOffset, true);
-            }
-
-            results.push({ pos: new BABYLON.Vector3(x, y, z), id: pid });
-        }
-        return results;
     }
 
     /**
@@ -3029,23 +2997,33 @@ export class Potree2Loader {
     }
 
     /**
-     * Export training data as binary annotations written into the .pcbin store.
-     * Collects the segment/class buffer and POSTs to /api/export-mapping/,
-     * which updates the server-side .pcbin file atomically.
-     * Returns the pcbin_path on success.
+     * Export the segment/class annotations to the server (working/annotations.bin).
+     * Collects the segment/class buffer (2 bytes per POINT_ID: seg+1, class) and POSTs it
+     * to /api/export-mapping/ — gzip-compressed with CompressionStream when available.
+     * Returns { annotations_path, point_count, segmentMap } on success.
      */
-    async exportAllTrainingDataAsMapping(segmentNameMap) {
-        // First collect the binary buffer (same as exportAllTrainingData)
+    async exportAnnotations(segmentNameMap) {
         const exportResult = await this.exportAllTrainingData(segmentNameMap);
         if (!exportResult || !exportResult.buffer) {
             throw new Error('Failed to export training data');
         }
 
-        // POST to /api/export-mapping/ — now updates the .pcbin store
+        let body = new Blob([exportResult.buffer], { type: 'application/octet-stream' });
+        let encoding = null;
+        if (typeof CompressionStream !== 'undefined') {
+            try {
+                body = await new Response(body.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+                encoding = 'gzip';
+            } catch (e) {
+                console.warn('[PointCloudLoader] gzip compression failed, sending raw annotations:', e);
+                body = new Blob([exportResult.buffer], { type: 'application/octet-stream' });
+            }
+        }
+
         const formData = new FormData();
-        formData.append('buffer', new Blob([exportResult.buffer], { type: 'application/octet-stream' }));
+        formData.append('buffer', body, 'annotations.bin');
         formData.append('point_count', this.metadata.points.toString());
-        formData.append('pcbin_path', (window.__APP_CONFIG?.runtimeDataPathPrefix || 'runtime_data') + '/working/features.pcbin');
+        if (encoding) formData.append('encoding', encoding);
 
         const response = await fetch('/api/export-mapping/', {
             method: 'POST',
@@ -3054,15 +3032,14 @@ export class Potree2Loader {
 
         if (!response.ok) {
             const err = await response.json().catch(() => ({}));
-            throw new Error(err.error || 'Failed to export mapping');
+            throw new Error(err.error || 'Failed to save annotations');
         }
 
         const data = await response.json();
-        console.log('[Potree2Loader] .pcbin annotations updated:', data.pcbin_path, `(${data.point_count} points annotated)`);
+        console.log('[PointCloudLoader] annotations.bin saved:', data.annotations_path, `(${data.point_count} points)`);
 
         return {
-            mapping_path: data.pcbin_path,   // kept as mapping_path for caller compatibility
-            pcbin_path: data.pcbin_path,
+            annotations_path: data.annotations_path,
             point_count: data.point_count,
             segmentMap: exportResult.segmentMap
         };
@@ -3395,59 +3372,51 @@ export class Potree2Loader {
         if (mod) mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
     }
 
-    dispose() {
-        if (this._cameraViewObserver && this._cameraForObserver) {
-            this._cameraForObserver.onViewMatrixChangedObservable.remove(this._cameraViewObserver);
-        }
-        if (this._cleanupIntervalId) {
-            window.clearInterval(this._cleanupIntervalId);
-        }
-        this._pointSegmentMap = null;
-        this._pointClassMap = null;
-        this._classColorLUT?.clear();
-        this.loadedNodes.clear();
-        this.activeNodes.clear();
-        this.rootTransform.dispose();
-    }
-
-} // END class Potree2Loader
-Potree2Loader._viridisLUT = Potree2Loader._buildViridisLUT();
+} // END class ChunkedPointCloudLoader
 
 
 // =====================================================================
 // PUBLIC HELPER FUNCTIONS
 // =====================================================================
 
-export async function loadPotree2PointCloud(basePath, scene, options = {}) {
-    // console.log("🚀 loadPotree2PointCloud:", basePath);
-
-    const loader = new Potree2Loader(scene, basePath, options);
+/**
+ * Load a chunked point cloud (runtime_data/working/pc).
+ * options (besides the ChunkedPointCloudLoader ones):
+ *   version      - cache-busting token appended as ?v= to the geometry requests
+ *   initialState - state exported by a previous loader (see exportState()), applied before the first nodes
+ *   preserveView - true when reloading: keep camera and outline entry untouched
+ */
+export async function loadPointCloud(basePath, scene, options = {}) {
+    const loader = new ChunkedPointCloudLoader(scene, basePath, options);
     await loader.load();
 
     const camera = scene.activeCamera;
     if (camera) {
-        const bbMin = loader.metadata.boundingBox.min;
-        const bbMax = loader.metadata.boundingBox.max;
-        const localCenter = new BABYLON.Vector3(
-            (bbMax[0] - bbMin[0]) / 2,
-            (bbMax[1] - bbMin[1]) / 2,
-            (bbMax[2] - bbMin[2]) / 2
-        );
-        const localSize = new BABYLON.Vector3(
-            bbMax[0] - bbMin[0],
-            bbMax[1] - bbMin[1],
-            bbMax[2] - bbMin[2]
-        );
-        const radius = localSize.length() * 0.7;
+        if (!options.preserveView) {
+            const bbMin = loader.metadata.boundingBox.min;
+            const bbMax = loader.metadata.boundingBox.max;
+            const localCenter = new BABYLON.Vector3(
+                (bbMax[0] - bbMin[0]) / 2,
+                (bbMax[1] - bbMin[1]) / 2,
+                (bbMax[2] - bbMin[2]) / 2
+            );
+            const localSize = new BABYLON.Vector3(
+                bbMax[0] - bbMin[0],
+                bbMax[1] - bbMin[1],
+                bbMax[2] - bbMin[2]
+            );
+            const radius = localSize.length() * 0.7;
 
-        // console.log(`📷 Camera: target=${localCenter}, radius=${radius.toFixed(1)}`);
-        camera.setTarget(localCenter);
-        camera.radius = radius;
-        camera.minZ = 0.1;
-        camera.maxZ = radius * 10;
+            // The root is mirrored on X: the target has to be the centre in WORLD space
+            camera.setTarget(BABYLON.Vector3.TransformCoordinates(localCenter, loader.rootTransform.getWorldMatrix()));
+            camera.radius = radius;
+            camera.minZ = 0.1;
+            camera.maxZ = radius * 10;
+        }
 
         let lastUpdate = 0;
         const updateThrottle = 200;
+        let trailing = null;
 
         loader._cameraForObserver = camera;
         loader._cameraViewObserver = camera.onViewMatrixChangedObservable.add(() => {
@@ -3455,33 +3424,39 @@ export async function loadPotree2PointCloud(basePath, scene, options = {}) {
             if (now - lastUpdate > updateThrottle) {
                 loader.update(camera);
                 lastUpdate = now;
+            } else if (trailing === null) {
+                // Make sure the final camera position is always evaluated
+                trailing = setTimeout(() => {
+                    trailing = null;
+                    lastUpdate = Date.now();
+                    if (!loader._disposed) loader.update(camera);
+                }, updateThrottle);
             }
         });
+    }
 
-        if (loader.autoCleanupEnabled) {
-            loader.startAutoCleanup(30000, 200);
-        } else {
-            loader.stopAutoCleanup();
+    scene.pointCloudLoader = loader;
+
+    // Notify main.js that the loader is ready, so it can populate the color menu
+    window.dispatchEvent(new CustomEvent('pointcloud-loaded', { detail: { loader } }));
+
+    // Features come from the columns: tell the UI which ones are available
+    window.dispatchEvent(new CustomEvent('features-available', { detail: { names: loader.getFeatureList() } }));
+
+    if (!options.preserveView) {
+        if (window.__registerPointCloudInOutline) {
+            window.__registerPointCloudInOutline(loader.rootTransform, "Point Cloud");
+        }
+
+        if (window.__frameCameraOnMesh) {
+            window.__frameCameraOnMesh(scene.activeCamera, loader.rootTransform);
         }
     }
 
-    scene.potree2Loader = loader;
-
-    // Notify main.js that attribute list is ready, so it can populate the color menu
-    window.dispatchEvent(new CustomEvent('potree2-loaded', { detail: { loader } }));
-
-    if (window.__registerPointCloudInOutline) {
-        window.__registerPointCloudInOutline(loader.rootTransform, "Potree 2.0 Cloud");
-    }
-
-    if (window.__frameCameraOnMesh) {
-        window.__frameCameraOnMesh(scene.activeCamera, loader.rootTransform);
-    }
-
-    console.log(`✅ Potree2Loader ready: ${loader.loadedNodes.size} nodes loaded, ${loader.activeNodes.size} visible`);
+    console.log(`✅ PointCloudLoader ready: ${loader.loadedNodes.size} nodes loaded, ${loader.activeNodes.size} visible`);
     return loader.getRoot();
 }
 
-export function getPotree2Loader(scene) {
-    return scene.potree2Loader || null;
+export function getPointCloudLoader(scene) {
+    return scene.pointCloudLoader || null;
 }

@@ -137,7 +137,7 @@
 
                     <h2 id="what-is-3dom">What is 3DOM Classify?</h2>
                     <p>
-                        3DOM Classify Viewer is a local in-browser tool built on <strong>BabylonJS</strong> and <strong>Potree</strong> that lets you:
+                        3DOM Classify Viewer is a local in-browser tool built on <strong>BabylonJS</strong> and a custom chunked point cloud format that lets you:
                         <ul>
                             <li>load point clouds or models (ply, las, glb);</li>
                             <li>visually inspect and label them;</li>
@@ -211,8 +211,8 @@
                         For the GLB format, it is possible to decide the target points of the point cloud. </p>
                     
                     <h2 id="loading-pipeline">Loading Pipeline</h2>
-                    <p> For semplicity and compatibility of the Potree library, the files are converted to a LAS version 1.2 Format 3 Point Cloud. 
-                        Potree has the main task to prepare the point cloud data for BabylonJS. </p>
+                    <p> For simplicity and compatibility, the files are converted to a LAS version 1.2 Format 3 Point Cloud. 
+                        The LAS is then converted once into a chunked, multi-resolution point cloud (geometry plus one column per attribute) that BabylonJS streams on demand; computing features or classifying only rewrites the affected columns. </p>
                     <p> Once ready the point cloud will be available for viewing and annotation. </p>
 
                     

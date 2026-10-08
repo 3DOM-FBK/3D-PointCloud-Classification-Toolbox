@@ -49,8 +49,7 @@ points, training a classifier, running inference, and exporting results.
    canonical 0-based sequential indexing, which is required by the annotation system.
 5. **Feature extraction:** Geometric features are computed at one or more radii (see
    [Feature Extraction](#feature-extraction)).
-6. **Potree conversion:** The processed LAS is converted to Potree 2.0 format for LOD
-   streaming in the 3D viewport.
+6. **Point cloud conversion:** The processed LAS is converted once into the chunked point cloud (multi-resolution geometry plus one column per attribute) that is streamed to the 3D viewport.
 
 Once complete, the point cloud is displayed and ready for interaction.
 
@@ -99,7 +98,7 @@ After making a selection:
 1. Right-click within the selection to open the context menu (Training Mode only).
 2. Assign the selected points to a named **segment** (a spatial region) and optionally
    to a **class** (semantic label).
-3. Annotations are stored in the `.pcbin` binary store and persisted on the server.
+3. Annotations are kept in the viewer and saved on the server as `annotations.bin` (2 bytes per point) when needed (training, classification of a segment).
 
 > **Segments and classes** are distinct concepts. A segment is a named spatial region
 > defined by a selection; a class is the semantic label (e.g. *ground*, *vegetation*)
@@ -123,6 +122,13 @@ omnivariance, eigenentropy, change of curvature, and additional neighborhood sta
 | **GPU / CPU** | GPU binary is selected by default when a CUDA device is available; fallback to CPU otherwise |
 
 Real-time progress is reported in the status panel during extraction.
+
+When extraction finishes only the new feature columns are written (the geometry is not
+converted again) and the viewer picks them up without reloading the cloud. Your segments,
+classes, selections, camera and view settings are untouched. The same happens after a
+classification (the `prediction` column is written; points outside the classified segment have
+no prediction and are shown grey) and after restoring the backup. The features are then
+available in the colour menu, with their value range taken from the point cloud metadata.
 
 ### Training a Model
 
