@@ -68,12 +68,24 @@ Django REST API (Python 3.10, Gunicorn)
 - **BabylonJS** renders the 3D scene, manages the camera, lighting, and any additional
   mesh or annotation layers.
 - The **chunked point cloud loader** streams the cloud (`geom.bin` and attribute columns)
-  with HTTP Range requests against the `/pointcloud-data/` endpoint. It picks the levels
-  of detail of every spatial chunk from the projected point spacing, culls chunks outside
+  with HTTP Range requests against the `/pointcloud-data/` endpoint. It decides how many points
+  of every spatial chunk to fetch from the projected point spacing (one screen metric for perspective and
+  orthographic cameras, one budget factor that degrades the whole cloud uniformly), culls chunks outside
   the view frustum, keeps a point budget in memory with LRU eviction, and decodes data in
-  a pool of workers (format: [POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)).
+  a pool of workers. The **level of detail is continuous and per point**: the vertex shader drops every
+  point whose own spacing is finer than the pixel threshold, so the density does not jump at chunk borders
+  (format and model: [POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)).
 - **Selection tools** (rectangle, lasso, polygon) are implemented via mouse event
   listeners and an SVG overlay rendered on top of the 3D canvas.
+  Selections, cuts and class assignments are **spatial** and act on every point that is loaded,
+  including the ones the continuous LOD currently drops in the shader (as they always acted on
+  points that were not loaded yet); the CPU picker (measure tool) ignores the dropped points.
+- **LOD diagnostics** (browser console):
+  `scene.pointCloudLoader.setLodDebug('chunk' | 'level' | 'spacing' | 'off')` colours the points per
+  chunk, per mesh of a chunk, or with a heat map of the projected spacing (uniform density = uniform
+  colour); `getLodStats()` returns, per chunk, the points needed / loaded and the projected spacing,
+  plus the budget factor; `setAdaptivePointSize(false)` turns off the growth of the points where the
+  data is sparser than the screen.
 
 **State management:** Application state (class registry, segment map, active mode,
 annotation buffer) is held in the global scope and ES6 module exports. There is no
@@ -170,10 +182,10 @@ import) by `las2pc` into the chunked point cloud `working/pc/` (full description
 [POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md)):
 
 - `geom.bin` — 20 B/point (quantized XYZ, RGB, `POINT_ID`), grouped in spatial chunks of at
-  most 250 000 points; inside each chunk the points are ordered by stratified levels of detail
+  most 250 000 points; inside each chunk the points are ordered by stratified levels of detail (a variable number of levels per chunk, the remainder is ~1 % of the points)
   (a random subsample of any level prefix is uniform). The first Range request of a cloud is
   the whole overview (`head` block), then the loader asks one contiguous range per chunk for
-  the missing levels.
+  the missing points (contiguous ranges, at most 256 k points per request).
 - `col/<name>.bin` — one column per attribute (features, `prediction`) in the same point
   order; `meta.json` holds their `min`/`max` and a `version`. The loader downloads only the
   column of the feature being displayed, for the meshes it has loaded.

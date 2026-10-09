@@ -8,11 +8,14 @@
 //   { type: 'init', cfg }                       cfg: { scale, offset, qMin, bbMin }
 //   { type: 'geom', url, start, count, segments, colors }
 //        start/count in POINTS (20 B records). segments: [{ key, from, count }] with `from`
-//        relative to `start`. Result: { segments: [{ key, positions, colors?, pointIds }] }
+//        relative to `start`; optional seg.lod = { model, seqStart } adds lodInfo (Float32 pairs: lodSpacing,
+//        fullSpacing of the point, see pointcloud-lod.js). Result: { segments: [{ key, positions, colors?, pointIds, lodInfo? }] }
 //   { type: 'column', url, start, count, kind, segments }
 //        kind: 'float32' | 'uint8'. Result: { segments: [{ key, values }] } where values is a
 //        Float32Array and missing data (NaN / 255) is already mapped to FEATURE_MISSING_SENTINEL.
 // =====================================================================
+
+import { fillLodInfo } from './pointcloud-lod.js';
 
 const GEOM_RECORD = 20;
 const FEATURE_MISSING_SENTINEL = -1e38;
@@ -105,6 +108,12 @@ self.onmessage = async (e) => {
                 const out = { key: seg.key, positions: d.positions, pointIds: d.pointIds };
                 transfer.push(d.positions.buffer, d.pointIds.buffer);
                 if (d.colors) { out.colors = d.colors; transfer.push(d.colors.buffer); }
+                if (seg.lod) {
+                    const n = d.positions.length / 3;
+                    const info = new Float32Array(2 * n);
+                    fillLodInfo(seg.lod.model, seg.lod.seqStart, n, info);
+                    out.lodInfo = info; transfer.push(info.buffer);
+                }
                 segments.push(out);
             }
             self.postMessage({ id: m.id, ok: true, result: { segments } }, transfer);

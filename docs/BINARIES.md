@@ -192,7 +192,8 @@ columns are written afterwards by `viewer/utils_functions/pc_columns.py`.
 
 ```
 las2pc --input <features.las> --output <out_dir> [--ordered-las <out.las>]
-    [--max-chunk 250000] [--base 3] [--levels 6] [--head-budget 1000000] [--seed 12345]
+    [--max-chunk 250000] [--base 3] [--levels 0] [--max-levels 16] [--remainder-frac 0.05] [--remainder-min 2048]
+    [--head-budget 1000000] [--seed 12345]
     [--mode auto|memory|ooc] [--memory-budget MB] [--temp-dir DIR]
 ```
 
@@ -201,7 +202,9 @@ las2pc --input <features.las> --output <out_dir> [--ordered-las <out.las>]
 | `--ordered-las` | none | also write the input LAS in the order of `geom.bin` (row *r* = point *r*) |
 | `--max-chunk` | 250000 | Maximum points of a spatial chunk; a denser grid cell is split into octants |
 | `--base` | 3 | Level 0 uses a `2^base` grid per side inside the chunk cube |
-| `--levels` | 6 | Number of stratified levels (a last "remainder" level is added) |
+| `--levels` | 0 | `0`: adaptive number of levels per chunk (`formatVersion` 2); `N`: exactly `N` regular levels (`formatVersion` 1). A last "remainder" level is always added |
+| `--max-levels` | 16 | Cap of the adaptive levels (`base + max-levels <= 20`) |
+| `--remainder-frac`, `--remainder-min` | 0.05, 2048 | Adaptive: stop when the remainder is below this fraction of the chunk or below this many points |
 | `--head-budget` | 1000000 | Points of the overview block that is fetched with one Range request |
 | `--seed` | 12345 | Seed of the per-chunk shuffle (the output is deterministic) |
 | `--mode` | `auto` | `memory` (mapped input, ~28 B/point of RAM + the LAS in the page cache), `ooc` (sequential passes, temp file per chunk) or `auto`: memory when it fits in the budget |

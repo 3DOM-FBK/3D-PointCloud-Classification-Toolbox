@@ -6,10 +6,27 @@
 // stratified levels of detail inside each chunk. Attributes (features, prediction) live
 // in separate columns with the same point order, downloaded only when needed.
 //
-// Every request (chunk, levels a..b) becomes one "virtual node" = one BabylonJS mesh
-// in `loadedNodes` (name `c<id>_l<a>-<b>`), with the same `mesh.metadata` layout the
-// editing code (selection, cut, classes, segments) has always used.
+// Every request (chunk, points a..b of its level-ordered sequence) becomes one "virtual node" =
+// one BabylonJS mesh in `loadedNodes` (name `c<id>_p<a>-<b>`), with the same `mesh.metadata`
+// layout the editing code (selection, cut, classes, segments) has always used.
+//
+// Level of detail is CONTINUOUS and per point: the loader decides how many points of every chunk
+// to fetch (`need`, from the projected spacing of the chunk's nearest point), and the vertex shader
+// drops each point whose own spacing (attribute `lodInfo.x`, see pointcloud-lod.js) is finer than
+// the pixel threshold, so the density on screen does not depend on the chunk but on the distance of
+// every single point. The same screen metric (pixels per unit, perspective or orthographic) drives
+// the loading decisions and the shader.
 // =====================================================================
+
+import { makeLodModel, lodCountFor, lodSpacingAt } from './pointcloud-lod.js';
+
+/** A point is dropped when its projected spacing is below DRAW_MIN_RATIO * threshold; between that
+ *  and the threshold it is drawn smaller (transition band). */
+const DRAW_MIN_RATIO = 0.7;
+const PREFETCH_MARGIN = 1.25;            // fetch up to need * margin
+const MIN_REQUEST_GAP_POINTS = 1024;     // a shortfall smaller than this is not worth a request (each request prefetches 25 % more)
+const MAX_REQUEST_POINTS = 256 * 1024;   // points per request (keeps one connection from being monopolised)
+const MAX_BUDGET_FACTOR = 4096;
 
 const FEATURE_MISSING_SENTINEL = -1e38;
 const FEATURE_MISSING_COLOR = 0.8;
@@ -32,6 +49,13 @@ const SEG_DELETED = 0xFFFE;
  * Small pool of module workers. Each request is answered through a promise; requests are sent
  * to the worker with the fewest requests in flight.
  */
+/** Distinct colour for the debug views (hue in turns). */
+function lodDebugColor(h) {
+    h = h - Math.floor(h);
+    const f = (n) => { const k = (n + h * 6) % 6; return 0.85 - 0.75 * Math.max(0, Math.min(k, 4 - k, 1)); };
+    return [f(5), f(3), f(1)];
+}
+
 class WorkerPool {
     constructor(size, cfg) {
         this._workers = [];
@@ -123,6 +147,15 @@ export class ChunkedPointCloudLoader {
         this._maxLoadedPoints = options.maxLoadedPoints ?? null;
         this.maxConcurrentLoads = options.maxConcurrentLoads || 6;
         this.workerCount = options.workerCount || 3;
+        // Continuous LOD (see the header): uniform budget factor, adaptive point size, debug view
+        this.budgetFactor = 1;                       // >= 1: threshold multiplier that makes the needed points fit maxVisiblePoints
+        this.adaptivePointSize = options.adaptivePointSize !== false;
+        this.maxPointSizePx = options.maxPointSizePx ?? 8;
+        this.lodDebug = "off";                       // off | chunk | level | spacing
+        this._screenK = 1;                           // pixels per unit at depth 1 (perspective) / per unit (orthographic)
+        this._persp = true;
+        this._lodU = null;                           // last uniform values sent to the materials
+        this._lodStats = { needTotal: 0 };
 
         this.stats = {
             loadedNodes: 0,
@@ -202,6 +235,10 @@ export class ChunkedPointCloudLoader {
         // after Reset Scene / re-import.
         this._cameraForObserver = null;
         this._cameraViewObserver = null;
+        this._cameraProjObserver = null;
+        this._resizeObserver = null;
+        this._renderObserver = null;
+        this._throttleTimer = null;
         this._cleanupIntervalId = null;
         this._pool = null;
         this._lastCamera = null;
@@ -457,10 +494,9 @@ export class ChunkedPointCloudLoader {
         this.rootTransform.scaling.x = -1;
         this.rootTransform.computeWorldMatrix(true);
 
-        // First LOD pass: shows the overview and starts fetching the detail levels
-        const camera = this.scene.activeCamera;
-        // The camera has not been framed on the cloud yet: do not cull anything in this first pass
-        if (camera) this.update(camera, { ignoreFrustum: true });
+        // The first LOD pass (detail fetching) is run by loadPointCloud() once the camera is framed on
+        // the cloud: running it now would fetch for a view nobody sees.
+        this._installRenderObserver();
 
         return this.rootTransform;
     }
@@ -491,22 +527,21 @@ export class ChunkedPointCloudLoader {
     _prepareChunks() {
         const meta = this.metadata;
         const H = meta.levels.head;
-        const count = meta.levels.count;
         this.chunks = meta.chunks.map(c => {
-            const prefix = new Array(count + 1).fill(0);   // points of levels [0, l)
-            for (let l = 0; l < count; l++) prefix[l + 1] = prefix[l] + c.levelPoints[l];
+            const lod = makeLodModel(c.size, meta.levels.base, c.levelPoints);
+            const prefix = lod.prefix;                      // points of levels [0, l)
             return {
                 id: c.id,
                 min: c.min, max: c.max, size: c.size,
                 levelPoints: c.levelPoints,
-                prefix,
+                lod,                                        // continuous LOD model (pointcloud-lod.js)
                 headOffset: c.headOffset, bodyOffset: c.bodyOffset, points: c.points,
-                headPoints: prefix[H],
-                loadedCount: 0,        // levels [0, loadedCount) are in memory (never a hole)
+                headPoints: prefix[Math.min(H, c.levelPoints.length)],
+                loaded: 0,             // points [0, loaded) of the level-ordered sequence are in memory (never a hole)
                 loading: false,
-                stack: [],             // meshes of the body levels, in level order (top = last)
+                stack: [],             // meshes of the body, in sequence order (top = last)
                 headMesh: null,
-                wanted: H,
+                need: 0,               // points the current view asks for
                 visible: false,
                 bb: null
             };
@@ -525,29 +560,33 @@ export class ChunkedPointCloudLoader {
         const H = meta.levels.head;
         const segments = this.chunks
             .filter(c => c.headPoints > 0)
-            .map(c => ({ key: c.id, from: c.headOffset, count: c.headPoints }));
+            .map(c => ({ key: c.id, from: c.headOffset, count: c.headPoints, lod: { model: c.lod, seqStart: 0 } }));
         const result = await this._pool.request({
             type: 'geom', url: this._geomUrl(), start: 0, count: meta.head.points, segments
         });
         if (this._disposed) return;
         for (const seg of result.segments) {
             const chunk = this.chunks[seg.key];
-            const vnode = this._makeVirtualNode(chunk, 0, H - 1, chunk.headOffset, seg.positions.length / 3);
+            const n = seg.positions.length / 3;
+            const vnode = this._makeVirtualNode(chunk, 0, n, chunk.headOffset);
             this._createMeshFromDecoded(vnode, seg);
-            chunk.loadedCount = H;
+            chunk.loaded = n;
             chunk.headMesh = this.loadedNodes.get(vnode.name);
         }
     }
 
-    _makeVirtualNode(chunk, from, to, start, numPoints) {
+    /** A node = the points [seqFrom, seqTo) of the level-ordered sequence of a chunk. */
+    _makeVirtualNode(chunk, seqFrom, seqTo, start) {
+        const numPoints = seqTo - seqFrom;
         return {
-            name: `c${chunk.id}_l${from}-${to}`,
-            level: from,
-            levelTo: to,
+            name: `c${chunk.id}_p${seqFrom}-${seqTo}`,
+            seqFrom,
+            seqTo,
             chunk,
             start,
             numPoints,
-            spacing: chunk.size / Math.pow(2, this.metadata.levels.base + from),
+            // Nominal spacing of the first point of the node (used to size cut/classification margins)
+            spacing: lodSpacingAt(chunk.lod, seqFrom),
             boundingBox: { min: chunk.min, max: chunk.max }
         };
     }
@@ -574,15 +613,25 @@ export class ChunkedPointCloudLoader {
     }
 
     /**
-     * Chooses which levels of which chunks should be on screen and starts fetching the missing
-     * ones.
-     *
-     *  - The camera is brought into the LOCAL space of the point cloud with the inverse of the
-     *    root world matrix (chunk AABBs are local, before the X mirror and any rotation).
-     *  - Chunks outside the view frustum are culled (not shown, nothing fetched for them).
-     *  - A level l of a chunk is worth showing while the projected spacing of the previous level
-     *    is still larger than the point size: finer levels would not be distinguishable.
-     *  - Chunks are served by decreasing size on screen until the point budget is used up.
+     * Pixels per unit at depth 1 (perspective) or per unit (orthographic): the single screen metric
+     * of the loader AND of the vertex shader. ppu(z) = k / z in perspective, k in orthographic.
+     */
+    _computeScreenK(camera) {
+        const P = camera.getProjectionMatrix().m;
+        return P[5] * this.scene.getEngine().getRenderHeight() / 2;
+    }
+
+    /**
+     * Continuous LOD pass.
+     *  1. visible chunks (frustum) and their ppu at the NEAREST point of the chunk's AABB;
+     *  2. need = points of the level-ordered sequence whose spacing still projects to >= the pixel
+     *     threshold (pointcloud-lod.js): the overview (head) is always counted;
+     *  3. if the needs exceed maxVisiblePoints the threshold is multiplied by one common factor
+     *     (bisection): the whole cloud degrades the same way instead of near = full / far = overview;
+     *  4. chunks whose need exceeds what is loaded fetch the missing points (geometric growth), the
+     *     most starved first.
+     * Every loaded mesh of a chunk in view is shown: the vertex shader drops the points that are too
+     * fine for their own distance, so there is no density border between chunks.
      */
     update(camera, { ignoreFrustum = false } = {}) {
         if (!this.chunks.length || !camera || this._disposed) return;
@@ -591,14 +640,12 @@ export class ChunkedPointCloudLoader {
 
         const anySegmentVisible = this.mainCloudVisible || this.cutHistory.some(e => e.visible);
         const meta = this.metadata;
-        const H = meta.levels.head;
-        const nLevels = meta.levels.count;
 
-        const engine = this.scene.getEngine();
-        const screenHeight = engine.getRenderHeight();
-        const fov = camera.fov || 0.8;
-        const pixelsPerUnit = screenHeight / (2 * Math.tan(fov / 2));   // times size / distance
-        const thresholdPx = Math.max(1, this.pointSize);
+        const persp = camera.mode !== BABYLON.Camera.ORTHOGRAPHIC_CAMERA;
+        const k = this._computeScreenK(camera);
+        this._screenK = k;
+        this._persp = persp;
+        const T0 = Math.max(1, this.pointSize);
 
         const world = this.rootTransform.getWorldMatrix();
         this._refreshChunkBoxes(world);
@@ -607,69 +654,85 @@ export class ChunkedPointCloudLoader {
         const cam = BABYLON.Vector3.TransformCoordinates(camWorld, invWorld);
         const planes = BABYLON.Frustum.GetPlanes(camera.getTransformationMatrix());
 
-        // ---- 1. visibility + wanted detail per chunk
+        // ---- 1. visibility and screen scale of every chunk
         const visibleChunks = [];
         for (const c of this.chunks) {
             c.visible = ignoreFrustum || c.bb.isInFrustum(planes);
-            if (!c.visible) continue;
-            const dx = Math.max(c.min[0] - cam.x, 0, cam.x - c.max[0]);
-            const dy = Math.max(c.min[1] - cam.y, 0, cam.y - c.max[1]);
-            const dz = Math.max(c.min[2] - cam.z, 0, cam.z - c.max[2]);
-            const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            // Camera inside (or touching) the chunk: refine as much as the budget allows
-            const d = Math.max(dist, 1e-6);
-            c.screenSize = dist <= 1e-6 ? Infinity : c.size * pixelsPerUnit / d;
-            let t = H;
-            if (dist <= 1e-6) {
-                t = nLevels;
+            if (!c.visible) { c.need = c.headPoints; continue; }
+            if (persp) {
+                const dx = Math.max(c.min[0] - cam.x, 0, cam.x - c.max[0]);
+                const dy = Math.max(c.min[1] - cam.y, 0, cam.y - c.max[1]);
+                const dz = Math.max(c.min[2] - cam.z, 0, cam.z - c.max[2]);
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                // Camera inside (or touching) the chunk: refine as much as the budget allows
+                c.ppu = dist <= 1e-6 ? Infinity : k / dist;
             } else {
-                // Highest useful level count: levels < t where spacing(t-1) is still resolvable
-                let l = 0;
-                while (l < nLevels - 1 && (c.size / Math.pow(2, meta.levels.base + l)) * pixelsPerUnit / d > thresholdPx) l++;
-                t = Math.max(H, l + 1);
+                c.ppu = k;
             }
-            c.target = Math.min(nLevels, t);
             visibleChunks.push(c);
         }
-        visibleChunks.sort((a, b) => b.screenSize - a.screenSize);
 
-        // ---- 2. point budget, biggest on screen first
-        // The overview (levels < head) of every chunk is always shown: it counts against the budget
-        let used = meta.head.points;
-        let meshCount = visibleChunks.length;
+        // ---- 2. points needed at pixel threshold T
+        const needAt = (c, T) => {
+            const sMin = c.ppu === Infinity ? 0 : T / c.ppu;
+            return Math.max(c.headPoints, lodCountFor(c.lod, sMin));
+        };
+
+        // ---- 3. one budget factor for the whole cloud
+        // The budget counts the points the shader DRAWS (spacing down to DRAW_MIN_RATIO x threshold): the overview of the
+        // chunks out of view, plus, for every chunk in view, the points that still resolve. There is no floor at the head
+        // here (the head is always LOADED, but the shader drops its fine points too), so a budget smaller than the head
+        // simply raises the threshold until the drawn points fit.
         const budget = this.maxVisiblePoints;
+        const base = meta.head.points;
+        let headInView = 0;
+        for (const c of visibleChunks) headInView += c.headPoints;
+        const drawnAt = (m) => {
+            let t = base - headInView;
+            for (const c of visibleChunks) t += c.ppu === Infinity ? c.points : lodCountFor(c.lod, T0 * m * DRAW_MIN_RATIO / c.ppu);
+            return t;
+        };
+        let m = 1;
+        if (drawnAt(1) > budget) {
+            let lo = 1, hi = MAX_BUDGET_FACTOR;
+            for (let it = 0; it < 14; it++) {
+                const mid = Math.sqrt(lo * hi);
+                if (drawnAt(mid) > budget) lo = mid; else hi = mid;
+            }
+            m = hi;
+        }
+        this.budgetFactor = m;
+        const T = T0 * m;
+        let needTotal = base;   // points to fetch (at the threshold; the budget above counts the points drawn)
         for (const c of visibleChunks) {
-            let t = c.target;
-            while (t > H && used + (c.prefix[t] - c.prefix[H]) > budget) t--;
-            if (meshCount >= this.maxVisibleNodes) t = H;
-            c.wanted = t;
-            used += c.prefix[t] - c.prefix[H];
-            if (t > H) meshCount++;
+            c.need = needAt(c, T);
+            needTotal += c.need - c.headPoints;
         }
 
-        // ---- 3. requests (one per chunk, contiguous missing levels), closest/biggest first
+        // ---- 4. requests: only the chunks whose need exceeds what is loaded, most starved first
         this._pendingLoads = [];
         for (const c of visibleChunks) {
-            if (c.wanted > c.loadedCount && !c.loading) this._pendingLoads.push(c);
+            if (c.loading || c.loaded >= c.points) continue;
+            // Ask as soon as the view needs more than is loaded (a shortfall shows as a density hole);
+            // the request itself prefetches PREFETCH_MARGIN more, so requests per chunk stay logarithmic.
+            if (c.need - c.loaded >= MIN_REQUEST_GAP_POINTS || (c.need > c.loaded && c.loaded < c.headPoints + 1)) this._pendingLoads.push(c);
         }
+        this._pendingLoads.sort((a, b) =>
+            (b.need / Math.max(1, b.loaded)) - (a.need / Math.max(1, a.loaded)) || (a.ppu === b.ppu ? 0 : (b.ppu > a.ppu ? 1 : -1)));
         this._pump();
 
-        // ---- 4. apply visibility to the loaded meshes
-        let totalPoints = 0;
+        // ---- 5. visibility of the loaded meshes: all of a chunk in view; only the overview otherwise
+        let drawn = 0;
+        for (const c of this.chunks) drawn += c.visible ? Math.min(c.loaded, c.need) : c.headPoints;
         for (const [name, mesh] of this.loadedNodes) {
             const info = mesh.metadata.nodeInfo;
             const chunk = this.chunks[info.chunkId];
-            // The overview is never culled (BabylonJS culls what is out of view when drawing); finer
-            // levels are shown only for the chunks in the frustum, up to the level that was asked for
-            const shouldShow = (chunk.visible || info.levelTo < H) && info.levelTo < chunk.wanted;
+            const shouldShow = chunk.visible || info.seqTo <= chunk.headPoints;
             const wasHidden = !mesh.isVisible;
             const targetVisible = shouldShow && anySegmentVisible;
 
             if (mesh.isVisible !== targetVisible) mesh.isVisible = targetVisible;
-            if (shouldShow) {
-                mesh.metadata.lastUsedTick = this._tick;
-                totalPoints += info.numPoints;
-            }
+            if (shouldShow) mesh.metadata.lastUsedTick = this._tick;
 
             if (targetVisible && wasHidden) {
                 this._debugSegment('node-visible', {
@@ -684,10 +747,12 @@ export class ChunkedPointCloudLoader {
             if (targetVisible) { this.activeNodes.add(name); } else { this.activeNodes.delete(name); }
         }
 
+        this._updateLodUniforms();
         this.stats.visibleNodes = this.activeNodes.size;
-        this.stats.totalPointsRendered = totalPoints;
+        this.stats.totalPointsRendered = drawn;
         this.stats.loadingNodes = this.loadingNodes.size;
         this.stats.loadedPoints = this._loadedPoints;
+        this._lodStats = { needTotal, budgetFactor: m, thresholdPx: T };
     }
 
     /** Re-runs update() on the next tick, collapsing bursts (used when a fetch completes). */
@@ -703,39 +768,41 @@ export class ChunkedPointCloudLoader {
     _pump() {
         while (this.loadingNodes.size < this.maxConcurrentLoads && this._pendingLoads.length > 0) {
             const chunk = this._pendingLoads.shift();
-            if (chunk.loading || chunk.wanted <= chunk.loadedCount) continue;
-            this._loadChunkLevels(chunk, chunk.loadedCount, chunk.wanted - 1);
+            if (chunk.loading || chunk.loaded >= chunk.points || chunk.need <= chunk.loaded) continue;
+            const from = chunk.loaded;
+            const target = Math.min(chunk.points, Math.ceil(chunk.need * PREFETCH_MARGIN));
+            const to = Math.min(target, from + MAX_REQUEST_POINTS);
+            if (to > from) this._loadChunkRange(chunk, from, to);
         }
     }
 
-    /** Fetches and builds the mesh of levels [from, to] (>= head) of one chunk. */
-    async _loadChunkLevels(chunk, from, to) {
-        const meta = this.metadata;
-        const H = meta.levels.head;
+    /** Fetches and builds the mesh of the points [from, to) of one chunk's sequence (from >= head). */
+    async _loadChunkRange(chunk, from, to) {
+        const H = chunk.headPoints;
         if (from < H) from = H;
-        if (to < from) return;
-        const name = `c${chunk.id}_l${from}-${to}`;
-        const start = chunk.bodyOffset + (chunk.prefix[from] - chunk.prefix[H]);
-        const count = chunk.prefix[to + 1] - chunk.prefix[from];
-        if (count === 0) { chunk.loadedCount = to + 1; return; }
+        if (to <= from) return;
+        const name = `c${chunk.id}_p${from}-${to}`;
+        const start = chunk.bodyOffset + (from - H);
+        const count = to - from;
 
         chunk.loading = true;
         this.loadingNodes.add(name);
         this.stats.loadingNodes = this.loadingNodes.size;
-        this._debugSegment('node-load-start', { node: name, level: from, expectedPoints: count });
+        this._debugSegment('node-load-start', { node: name, from, expectedPoints: count });
 
         try {
             const result = await this._pool.request({
                 type: 'geom', url: this._geomUrl(), start, count,
-                segments: [{ key: name, from: 0, count }]
+                segments: [{ key: name, from: 0, count, lod: { model: chunk.lod, seqStart: from } }]
             });
             if (this._disposed) return;
             const seg = result.segments[0];
-            const vnode = this._makeVirtualNode(chunk, from, to, start, seg.positions.length / 3);
+            const n = seg.positions.length / 3;
+            const vnode = this._makeVirtualNode(chunk, from, from + n, start);
             this._createMeshFromDecoded(vnode, seg);
             chunk.stack.push(this.loadedNodes.get(name));
-            chunk.loadedCount = to + 1;
-            this._debugSegment('node-load-complete', { node: name, level: from, points: vnode.numPoints });
+            chunk.loaded = from + n;
+            this._debugSegment('node-load-complete', { node: name, from, points: vnode.numPoints });
             this._evictIfNeeded();
         } catch (err) {
             if (!this._disposed) console.error(`❌ Failed to load ${name}:`, err);
@@ -754,9 +821,11 @@ export class ChunkedPointCloudLoader {
 
     /**
      * Keeps the number of loaded points under maxLoadedPoints. Only the TOP mesh of a chunk (its
-     * highest levels) is a candidate, so a chunk never ends up with a hole in its level prefix;
-     * the overview (head) is never evicted. Meshes shown in the last update are kept; among the
-     * others the least recently used goes first.
+     * last points of the sequence) is a candidate, so a chunk never ends up with a hole; the
+     * overview (head) is never evicted. Meshes shown in the last update are kept and, among the
+     * others, the least recently used goes first. Chunks with a request in flight are never touched.
+     * If nothing else is left, a chunk in view gives up its top mesh when what remains still covers
+     * what its view needs.
      */
     _evictIfNeeded() {
         const limit = this.maxLoadedPoints;
@@ -765,15 +834,25 @@ export class ChunkedPointCloudLoader {
             let victim = null, victimChunk = null;
             for (const c of this.chunks) {
                 const top = c.stack[c.stack.length - 1];
-                if (!top) continue;
+                if (!top || c.loading) continue;     // a request in flight extends the prefix that eviction would shorten
                 if (top.metadata.lastUsedTick === this._tick && c.visible) continue;
                 if (victim === null || top.metadata.lastUsedTick < victim.metadata.lastUsedTick) {
                     victim = top; victimChunk = c;
                 }
             }
+            if (!victim) {
+                let bestSurplus = 0;
+                for (const c of this.chunks) {
+                    const top = c.stack[c.stack.length - 1];
+                    if (!top || !c.visible || c.loading) continue;
+                    // evict only if the chunk still holds what its view needs afterwards (no download/evict cycle)
+                    const surplus = c.loaded - top.metadata.nodeInfo.numPoints - c.need;
+                    if (surplus > bestSurplus) { bestSurplus = surplus; victim = top; victimChunk = c; }
+                }
+            }
             if (!victim) break;
             victimChunk.stack.pop();
-            victimChunk.loadedCount = victim.metadata.nodeInfo.level;
+            victimChunk.loaded = victim.metadata.nodeInfo.seqFrom;
             this._disposeMesh(victim);
         }
     }
@@ -800,7 +879,7 @@ export class ChunkedPointCloudLoader {
                 const top = c.stack[c.stack.length - 1];
                 if (this.activeNodes.has(top.metadata.nodeInfo.name)) break;
                 c.stack.pop();
-                c.loadedCount = top.metadata.nodeInfo.level;
+                c.loaded = top.metadata.nodeInfo.seqFrom;
                 this._disposeMesh(top);
             }
         }
@@ -817,16 +896,148 @@ export class ChunkedPointCloudLoader {
     }
 
     /**
-     * Sets a fixed point size for all nodes. Called by the UI slider.
-     * All points use the same size regardless of LOD level or distance.
+     * Sets the point size in pixels (UI slider). It is also the pixel threshold of the continuous LOD
+     * (a point is kept while the spacing of its level projects to at least this many pixels), so
+     * changing it changes how many points are needed: the LOD is re-evaluated.
      */
     setPointSize(size) {
         this.pointSize = Math.max(1, size);
-        for (const mesh of this.loadedNodes.values()) {
-            if (mesh.material && mesh.material !== this._featureShaderMat) mesh.material.pointSize = this.pointSize;
-            if (mesh.metadata?._origMaterial) mesh.metadata._origMaterial.pointSize = this.pointSize;
+        this._updateLodUniforms();
+        if (this._lastCamera) this._requestUpdate();
+    }
+
+    /** Point size grows where the data is coarser than the screen (zoomed in beyond the resolution). */
+    setAdaptivePointSize(enabled) {
+        this.adaptivePointSize = !!enabled;
+        this._updateLodUniforms();
+    }
+
+    // ========== CAMERA ==========
+
+    /**
+     * Re-evaluates the LOD when the view OR the projection changes (orthographic zoom only changes the
+     * projection), the engine is resized, or the camera mode changes. Throttled with a trailing call so
+     * the final position is always evaluated.
+     */
+    attachCamera(camera, { throttleMs = 200 } = {}) {
+        this.detachCamera();
+        this._cameraForObserver = camera;
+        let last = 0;
+        const trigger = () => {
+            if (this._disposed) return;
+            const now = Date.now();
+            if (now - last > throttleMs) {
+                last = now;
+                this.update(camera);
+            } else if (this._throttleTimer === null) {
+                this._throttleTimer = setTimeout(() => {
+                    this._throttleTimer = null;
+                    last = Date.now();
+                    if (!this._disposed) this.update(camera);
+                }, throttleMs);
+            }
+        };
+        this._cameraViewObserver = camera.onViewMatrixChangedObservable.add(trigger);
+        this._cameraProjObserver = camera.onProjectionMatrixChangedObservable.add(trigger);
+        this._resizeObserver = this.scene.getEngine().onResizeObservable.add(trigger);
+    }
+
+    detachCamera() {
+        const cam = this._cameraForObserver;
+        if (cam) {
+            if (this._cameraViewObserver) cam.onViewMatrixChangedObservable.remove(this._cameraViewObserver);
+            if (this._cameraProjObserver) cam.onProjectionMatrixChangedObservable.remove(this._cameraProjObserver);
         }
-        if (this._featureShaderMat) this._featureShaderMat.setFloat('pointSize', this.pointSize);
+        if (this._resizeObserver) this.scene.getEngine().onResizeObservable.remove(this._resizeObserver);
+        this._cameraViewObserver = null;
+        this._cameraProjObserver = null;
+        this._resizeObserver = null;
+        if (this._throttleTimer !== null) { clearTimeout(this._throttleTimer); this._throttleTimer = null; }
+    }
+
+    // ========== CONTINUOUS LOD: UNIFORMS, PICKING, DEBUG ==========
+
+    /** Keeps the screen metric of the shaders equal to the camera's at every frame. */
+    _installRenderObserver() {
+        if (this._renderObserver) return;
+        this._renderObserver = this.scene.onBeforeRenderObservable.add(() => {
+            const cam = this.scene.activeCamera;
+            if (!cam || this._disposed) return;
+            this._screenK = this._computeScreenK(cam);
+            this._persp = cam.mode !== BABYLON.Camera.ORTHOGRAPHIC_CAMERA;
+            this._updateLodUniforms();
+        });
+    }
+
+    _updateLodUniforms() {
+        const T = Math.max(1, this.pointSize) * this.budgetFactor;
+        const mode = this.lodDebug === 'chunk' || this.lodDebug === 'level' ? 1 : (this.lodDebug === 'spacing' ? 2 : 0);
+        const u = this._lodU, adaptive = this.adaptivePointSize ? 1 : 0, persp = this._persp ? 1 : 0;
+        if (u && u[0] === this._screenK && u[1] === persp && u[2] === T && u[3] === adaptive && u[4] === this.maxPointSizePx && u[5] === mode) return;
+        this._lodU = [this._screenK, persp, T, adaptive, this.maxPointSizePx, mode];
+        for (const mat of [this._baseMat, this._featureShaderMat]) {
+            if (!mat) continue;
+            mat.setVector4('pcLod', new BABYLON.Vector4(this._screenK, persp, T, 0));
+            mat.setVector4('pcLod2', new BABYLON.Vector4(adaptive, this.maxPointSizePx, mode, 0));
+        }
+    }
+
+    /** Parameters of the draw test of the shader, for CPU code (picking, probes): see isPointDrawn(). */
+    getDrawParams() {
+        return {
+            k: this._screenK, perspective: this._persp,
+            threshold: Math.max(1, this.pointSize) * this.budgetFactor,
+            minRatio: DRAW_MIN_RATIO
+        };
+    }
+
+    /**
+     * Same test as the vertex shader: is point `i` of `mesh` drawn (not dropped by the continuous LOD)?
+     * `w` is the clip-space w of the point (view depth in perspective; ignored in orthographic).
+     */
+    static isDrawn(lodSpacing, w, params) {
+        const ppu = params.perspective ? params.k / Math.max(w, 1e-6) : params.k;
+        return lodSpacing * ppu >= params.minRatio * params.threshold;
+    }
+
+    /**
+     * Returns `(i) => boolean`: is point i of `mesh` drawn? The buffers, the matrix and the parameters are
+     * read once, so use this (not isPointDrawn) when testing many points of one mesh.
+     */
+    getDrawFilter(mesh) {
+        const lod = mesh.getVerticesData('lodInfo');
+        if (!lod) return () => true;
+        const pos = mesh.getVerticesData('position');
+        const M = mesh.getWorldMatrix().multiply(this.scene.activeCamera.getTransformationMatrix()).m;
+        const params = this.getDrawParams();
+        const persp = this._persp;
+        return (i) => {
+            const x = pos[3 * i], y = pos[3 * i + 1], z = pos[3 * i + 2];
+            const w = x * M[3] + y * M[7] + z * M[11] + M[15];
+            if (persp && !(w > 0)) return false;
+            return ChunkedPointCloudLoader.isDrawn(lod[2 * i], w, params);
+        };
+    }
+
+    /** Single-point convenience; for loops over a mesh use getDrawFilter(mesh). */
+    isPointDrawn(mesh, i) {
+        return this.getDrawFilter(mesh)(i);
+    }
+
+    /** 'off' | 'chunk' (colour per chunk) | 'level' (colour per mesh of a chunk) | 'spacing' (heatmap of projected spacing). */
+    setLodDebug(mode) {
+        this.lodDebug = ['chunk', 'level', 'spacing'].includes(mode) ? mode : 'off';
+        this._updateLodUniforms();
+    }
+
+    /** Per-chunk state of the last update: need, loaded points and spacing projected on the screen. */
+    getLodStats() {
+        const chunks = this.chunks.map(c => ({
+            id: c.id, points: c.points, need: c.need, loaded: c.loaded, visible: c.visible,
+            meshes: c.stack.length + (c.headMesh ? 1 : 0),
+            projectedSpacingPx: c.visible && Number.isFinite(c.ppu) ? lodSpacingAt(c.lod, Math.max(1, c.need)) * c.ppu : null
+        }));
+        return { ...this._lodStats, budgetFactor: this.budgetFactor, chunks };
     }
 
     /**
@@ -1087,11 +1298,9 @@ export class ChunkedPointCloudLoader {
     }
 
     dispose() {
-        if (this._cameraForObserver && this._cameraViewObserver) {
-            this._cameraForObserver.onViewMatrixChangedObservable.remove(this._cameraViewObserver);
-        }
+        this.detachCamera();
         this._cameraForObserver = null;
-        this._cameraViewObserver = null;
+        if (this._renderObserver) { this.scene.onBeforeRenderObservable.remove(this._renderObserver); this._renderObserver = null; }
         this._disposed = true;
 
         if (this._cleanupIntervalId !== null) {
@@ -1118,19 +1327,84 @@ export class ChunkedPointCloudLoader {
         }
     }
 
-    // ========== FEATURE SHADER ==========
+    // ========== SHADERS: CONTINUOUS LOD ==========
 
-    static _featureVertexShader = `
+    /**
+     * Shared by the colour and the feature vertex shaders. The point is kept while the spacing of its
+     * level (lodInfo.x, world units) projects to >= DRAW_MIN * T pixels, T = pcLod.z (point size x
+     * budget factor); between DRAW_MIN*T and T it is drawn smaller. Pixels per unit:
+     *   perspective  ppu = k / w   (w = view depth),   orthographic  ppu = k       (k = P[1][1] * H / 2)
+     * which is exactly what the loader uses to decide what to fetch. NaN positions (hidden points) give
+     * a NaN ratio, which fails the test and is dropped.
+     *   pcLod  = (k, perspective flag, threshold px, -)
+     *   pcLod2 = (adaptive point size flag, max point size px, debug mode, -)
+     */
+    static _lodVertexCommon = `
         precision highp float;
         attribute vec3 position;
-        attribute float featureValue;
+        attribute vec2 lodInfo;
         uniform mat4 worldViewProjection;
-        uniform float pointSize;
+        uniform vec4 pcLod;
+        uniform vec4 pcLod2;
+        uniform vec3 pcMeshColor;
+
+        // false: the point is dropped (outside the clip volume, size 0)
+        bool pcLodVertex(out float ratio) {
+            vec4 p = worldViewProjection * vec4(position, 1.0);
+            float ppu = pcLod.y > 0.5 ? pcLod.x / max(p.w, 1e-6) : pcLod.x;
+            float T = pcLod.z;
+            ratio = lodInfo.x * ppu / T;
+            if (!(ratio >= ${DRAW_MIN_RATIO.toFixed(2)})) {
+                gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+                gl_PointSize = 0.0;
+                return false;
+            }
+            float keep = clamp((ratio - ${DRAW_MIN_RATIO.toFixed(2)}) / ${(1 - DRAW_MIN_RATIO).toFixed(2)}, 0.0, 1.0);
+            float size = T;
+            // Adaptive size: where even the full data is sparser than the point size, grow the points
+            if (pcLod2.x > 0.5) size = max(size, lodInfo.y * ppu);
+            size *= 0.5 + 0.5 * keep;
+            gl_Position = p;
+            gl_PointSize = clamp(size, 1.0, max(pcLod2.y, 1.0));
+            return true;
+        }
+
+        vec3 pcHeat(float ratio) {
+            float t = clamp(log2(max(ratio, 1.0)) / 4.0, 0.0, 1.0);
+            return vec3(t, 1.0 - abs(2.0 * t - 1.0), 1.0 - t);
+        }
+    `;
+
+    static _baseVertexShader = ChunkedPointCloudLoader._lodVertexCommon + `
+        attribute vec4 color;
+        varying vec4 vColor;
+        void main() {
+            float ratio;
+            if (!pcLodVertex(ratio)) { vColor = vec4(0.0); return; }
+            vColor = color;
+            if (pcLod2.z > 0.5 && pcLod2.z < 1.5) vColor = vec4(pcMeshColor, color.a);
+            else if (pcLod2.z > 1.5) vColor = vec4(pcHeat(ratio), color.a);
+        }
+    `;
+
+    static _baseFragmentShader = `
+        precision highp float;
+        varying vec4 vColor;
+        void main() {
+            if (vColor.a < 0.1) discard;     // hidden segments carry alpha 0
+            gl_FragColor = vColor;
+        }
+    `;
+
+    // ========== FEATURE SHADER ==========
+
+    static _featureVertexShader = ChunkedPointCloudLoader._lodVertexCommon + `
+        attribute float featureValue;
         varying float vFeature;
         void main() {
+            float ratio;
             vFeature = featureValue;
-            gl_Position = worldViewProjection * vec4(position, 1.0);
-            gl_PointSize = pointSize;
+            pcLodVertex(ratio);
         }
     `;
 
@@ -1247,12 +1521,12 @@ export class ChunkedPointCloudLoader {
         BABYLON.Effect.ShadersStore['pcFeatureVertexShader'] = ChunkedPointCloudLoader._featureVertexShader;
         BABYLON.Effect.ShadersStore['pcFeatureFragmentShader'] = ChunkedPointCloudLoader._featureFragmentShader;
         const mat = new BABYLON.ShaderMaterial('pcFeatureMat', this.scene, 'pcFeature', {
-            attributes: ['position', 'featureValue'],
-            uniforms: ['worldViewProjection', 'pointSize', 'fmin', 'fmax', 'colormap', 'predictionDiscrete', 'discreteFilterEnabled', 'discreteFilterValue'],
+            attributes: ['position', 'featureValue', 'lodInfo'],
+            uniforms: ['worldViewProjection', 'pcLod', 'pcLod2', 'pcMeshColor', 'fmin', 'fmax', 'colormap', 'predictionDiscrete', 'discreteFilterEnabled', 'discreteFilterValue'],
         });
         mat.pointsCloud = true;
         mat.disableLighting = true;
-        mat.setFloat('pointSize', this.pointSize);
+        mat.setVector3('pcMeshColor', new BABYLON.Vector3(1, 1, 1));
         mat.setFloat('fmin', 0.0);
         mat.setFloat('fmax', 1.0);
         mat.setInt('colormap', this._colormapId);
@@ -1262,6 +1536,9 @@ export class ChunkedPointCloudLoader {
         mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
         mat.alphaCutOff = 0.1;
         this._featureShaderMat = mat;
+        this._lodU = null;
+        this._updateLodUniforms();
+        this._attachDebugBind(mat);
         return mat;
     }
 
@@ -1284,7 +1561,6 @@ export class ChunkedPointCloudLoader {
 
         shaderMat.setInt('colormap', this._colormapId);
         shaderMat.setInt('predictionDiscrete', isPredictionFeature ? 1 : 0);
-        shaderMat.setFloat('pointSize', this.pointSize);
         for (const mesh of this.loadedNodes.values()) {
             if (enable) {
                 if (!mesh.metadata._origMaterial) mesh.metadata._origMaterial = mesh.material;
@@ -1346,22 +1622,40 @@ export class ChunkedPointCloudLoader {
     // ========== MESH CREATION ==========
 
     /**
-     * Base material shared by every node: all points use the same size and the vertex colours
-     * (alpha 0 hides cut segments).
+     * Base material shared by every node: vertex colours (alpha 0 hides cut segments) and the
+     * continuous LOD of the vertex shader (_lodVertexCommon).
      */
     _getBaseMaterial() {
         if (this._baseMat) return this._baseMat;
-        const mat = new BABYLON.StandardMaterial("mat_pc_base", this.scene);
+        BABYLON.Effect.ShadersStore['pcBaseVertexShader'] = ChunkedPointCloudLoader._baseVertexShader;
+        BABYLON.Effect.ShadersStore['pcBaseFragmentShader'] = ChunkedPointCloudLoader._baseFragmentShader;
+        const mat = new BABYLON.ShaderMaterial('mat_pc_base', this.scene, 'pcBase', {
+            attributes: ['position', 'color', 'lodInfo'],
+            uniforms: ['worldViewProjection', 'pcLod', 'pcLod2', 'pcMeshColor']
+        });
         mat.pointsCloud = true;
-        mat.pointSize = this.pointSize;
         mat.disableLighting = true;
-        mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
-        mat.useVertexAlpha = true; // needed for alpha=0 to hide cut segment points
-        // Use ALPHA TEST to discard invisible points efficiently and avoid depth sorting issues
+        mat.setVector3('pcMeshColor', new BABYLON.Vector3(1, 1, 1));
+        // The fragment shader discards alpha < 0.1 itself; ALPHATEST keeps the draw out of the sorted pass
         mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
         mat.alphaCutOff = 0.1;
         this._baseMat = mat;
+        this._lodU = null;
+        this._updateLodUniforms();
+        this._attachDebugBind(mat);
         return mat;
+    }
+
+    /** Per-mesh debug colour (chunk / level views): written on the effect right before each draw. */
+    _attachDebugBind(mat) {
+        mat.onBindObservable.add((mesh) => {
+            if (this.lodDebug !== 'chunk' && this.lodDebug !== 'level') return;
+            const info = mesh.metadata?.nodeInfo;
+            if (!info) return;
+            const c = lodDebugColor(this.lodDebug === 'chunk' ? info.chunkId * 0.6180339887 : (info.seqFrom === 0 ? 0 : this.chunks[info.chunkId].stack.length + 1) * 0.17);
+            const eff = mat.getEffect();
+            if (c && eff) eff.setFloat3('pcMeshColor', c[0], c[1], c[2]);
+        });
     }
 
     /**
@@ -1562,6 +1856,8 @@ export class ChunkedPointCloudLoader {
         vertexData.colors = colors;
         // updatable=true is REQUIRED to update visibility and colors dynamically
         vertexData.applyToMesh(mesh, true);
+        // Per-point spacing of the continuous LOD (pointcloud-lod.js): read by the vertex shader
+        if (decoded.lodInfo) mesh.setVerticesData("lodInfo", decoded.lodInfo, false, 2);
 
         mesh.material = this._getBaseMaterial();
         mesh.hasAlpha = true;
@@ -1572,7 +1868,7 @@ export class ChunkedPointCloudLoader {
 
         mesh.metadata = {
             nodeInfo: {
-                name: node.name, level: node.level, levelTo: node.levelTo,
+                name: node.name, seqFrom: node.seqFrom, seqTo: node.seqTo,
                 numPoints, chunkId: node.chunk.id
             },
             originalPositions,
@@ -3414,25 +3710,7 @@ export async function loadPointCloud(basePath, scene, options = {}) {
             camera.maxZ = radius * 10;
         }
 
-        let lastUpdate = 0;
-        const updateThrottle = 200;
-        let trailing = null;
-
-        loader._cameraForObserver = camera;
-        loader._cameraViewObserver = camera.onViewMatrixChangedObservable.add(() => {
-            const now = Date.now();
-            if (now - lastUpdate > updateThrottle) {
-                loader.update(camera);
-                lastUpdate = now;
-            } else if (trailing === null) {
-                // Make sure the final camera position is always evaluated
-                trailing = setTimeout(() => {
-                    trailing = null;
-                    lastUpdate = Date.now();
-                    if (!loader._disposed) loader.update(camera);
-                }, updateThrottle);
-            }
-        });
+        loader.attachCamera(camera);
     }
 
     scene.pointCloudLoader = loader;
@@ -3452,6 +3730,9 @@ export async function loadPointCloud(basePath, scene, options = {}) {
             window.__frameCameraOnMesh(scene.activeCamera, loader.rootTransform);
         }
     }
+
+    // First LOD pass, once the camera is framed on the cloud: shows the overview and fetches the detail
+    if (scene.activeCamera) loader.update(scene.activeCamera);
 
     console.log(`✅ PointCloudLoader ready: ${loader.loadedNodes.size} nodes loaded, ${loader.activeNodes.size} visible`);
     return loader.getRoot();

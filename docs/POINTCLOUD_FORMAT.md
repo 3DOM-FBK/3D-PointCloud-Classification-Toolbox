@@ -41,31 +41,57 @@ because `boundingBox.min = qMin * scale + offset`).
 * Inside each chunk the points are first **sorted by `POINT_ID`**, then shuffled with a fixed seed (the output is
   deterministic and does **not** depend on the order of the records in the LAS, nor on the execution mode or the
   number of threads: in-memory and out-of-core runs give byte-identical files) and split
-  into **levels** with stratified sampling: for `l = 0 … L-1` a grid of `2^(base+l)` cells per side is laid over the
-  chunk cube; each point, in shuffled order, whose cell is still free goes to level `l`. Points that
-  never find a free cell go to the last level `L`. Defaults: `base = 3`, `L = 6`, i.e. 7 levels.
-  Nominal spacing of level `l` is `size / 2^(base+l)`. Inside a level the order stays random, so any
-  prefix of a level is still a uniform subsample.
+  into **levels** with stratified sampling: for `l = 0, 1, …` a grid of `2^(base+l)` cells per side is laid over the
+  chunk cube; each point, in shuffled order, whose cell is still free goes to level `l`. Points that never find a
+  free cell go to the last level, the **remainder** (always present, possibly empty). The occupancy of a level is a
+  sparse set of cell keys (no dense `R³` array), so the grid can go down to `2^20` cells per side.
+  Nominal spacing of level `l` is `size / 2^(base+l)`. Inside a level (and inside the remainder) the order stays
+  random, so any prefix of a level is still a uniform subsample.
+* **Adaptive number of levels (`formatVersion` 2, the default):** a chunk keeps building levels while its remainder is
+  larger than `max(5 % of its points, 2048)` and the cell is still larger than twice the LAS scale, up to
+  `--max-levels` (16). The number of levels therefore depends on the chunk (`levelPoints` has variable length;
+  `levels.count` is the maximum), and the remainder holds ~1 % of the points instead of the 27 % of the fixed
+  6 levels of `formatVersion` 1 (`--levels N` still builds exactly `N` levels and writes `formatVersion` 1; the
+  loader reads both). Memory and out-of-core runs stay byte-identical.
 * **Layout of the points in the file**: first the *head block* (levels `0 … H-1` of **all** chunks,
-  chunk by chunk), then, for each chunk, its levels `H … L` contiguous. `H` is the largest value such
-  that the points of levels `< H` fit in `--head-budget` (default 1 M points, minimum `H = 1`).
-  The whole overview is a single Range request; any range of consecutive levels `≥ H` of one chunk is
-  contiguous (one request); levels `< H` of one chunk are contiguous inside the head block as well.
+  chunk by chunk), then, for each chunk, its remaining levels contiguous. `H` is the largest value such
+  that the points of levels `< H` fit in `--head-budget` (default 1 M points, minimum `H = 1`; a chunk with
+  fewer than `H` levels has all of its points in the head).
+  The whole overview is a single Range request; any range of consecutive points of one chunk's body is
+  contiguous (one request); the head points of one chunk are contiguous inside the head block as well.
+
+### Continuous level of detail (viewer)
+
+The points of a chunk, read in file order (head, then body), are a sequence whose every prefix is a uniform
+sample. The spacing of the sample made by the first `k` points is a continuous decreasing function of `k`, and the
+viewer uses it instead of whole levels (`static/viewer/js/pointcloud-lod.js`, shared by the loader and the worker):
+
+* inside regular level `l`, for the point at fraction `u = (k - prefix[l]) / levelPoints[l]`:
+  `lodSpacing = size / 2^(base + l + u)`;
+* in the remainder the spacing is extrapolated with `n(s) ∝ s^-D` (`D` from the last two regular levels, clamped to
+  1…3); level-0 points are never dropped.
+
+The worker writes `lodSpacing` and `fullSpacing` (the spacing with every point of the chunk loaded) as the vertex
+attribute `lodInfo`; the vertex shader drops the points whose spacing projects to less than the pixel threshold
+(point size × a budget factor) and enlarges the points where even the full data is sparser than the screen.
+The loader fetches, for every chunk in view, `need` points: those whose spacing at the chunk's nearest point
+still projects to the threshold. All the screen decisions use one metric, `ppu = P[1][1]·H/2 / z` (perspective) or
+`P[1][1]·H/2` (orthographic), computed from the camera projection matrix.
 
 ## meta.json
 
-```json
+```jsonc
 {
-  "format": "pck", "formatVersion": 1, "version": "<geometry token>",
+  "format": "pck", "formatVersion": 2, "version": "<geometry token>",
   "points": 5000000, "scale": [..], "offset": [..], "qMin": [..],
   "boundingBox": {"min": [..], "max": [..]},
   "hasColor": true,
   "geom": {"file": "geom.bin", "recordSize": 20},
   "order": {"file": "point_order.bin", "type": "uint32"},
-  "levels": {"count": 7, "base": 3, "head": 4},
+  "levels": {"count": 9, "base": 3, "head": 4},   // count = longest levelPoints of any chunk
   "head": {"points": 453495},
   "chunks": [{"id": 0, "min": [..], "max": [..], "cubeMin": [..], "size": 32.0,
-              "levelPoints": [81, 321, 1243, 4605, 15103, 23870, 8433],
+              "levelPoints": [81, 321, 1243, 4605, 15103, 23870, 6100, 2100, 233],   // last = remainder
               "headOffset": 0, "bodyOffset": 453495, "points": 53656}],
   "columns": {"NormalX": {"file": "col/NormalX.bin", "type": "float32", "min": -1, "max": 1, "version": "<token>"},
               "prediction": {"file": "col/prediction.bin", "type": "uint8", "missing": 255, "min": 0, "max": 5, "version": "<token>"}}
@@ -74,8 +100,8 @@ because `boundingBox.min = qMin * scale + offset`).
 
 * All offsets are expressed in **points** (bytes = points × element size of the file; geometry 20 B,
   float32 columns 4 B, uint8 columns 1 B).
-* A chunk's levels `0 … H-1` start at `headOffset` (in order), its levels `H … L` at `bodyOffset`.
-  The first point of level `l ≥ H` is `bodyOffset + sum(levelPoints[H..l-1])`.
+* A chunk's head points (levels `0 … H-1`) start at `headOffset` (in order), the rest at `bodyOffset`.
+  The first point of level `l ≥ H` is `bodyOffset + sum(levelPoints[H..l-1])`; the point at position `k ≥ headPoints` of the chunk sequence is at `bodyOffset + k - headPoints`.
 * `min`/`max` are the tight AABB of the chunk's points; `cubeMin`/`size` the octree cube. Both are in
   metres **relative to `boundingBox.min`** (LAS orientation, before the viewer's X mirror).
 * `version` changes whenever the geometry is rebuilt; every column has its own `version`, which

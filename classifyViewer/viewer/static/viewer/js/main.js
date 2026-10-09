@@ -2156,6 +2156,13 @@ function _scanMeshPick(mesh, m, wm, screenX, screenY, stride = 1, bestDist2 = In
     const positions = posCache || mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
     if (!positions) return { found: false, bestDist2 };
 
+    // Points the continuous LOD drops in the vertex shader are not on screen: not pickable either
+    // (same test as the shader, see ChunkedPointCloudLoader.isDrawn)
+    const lod = mesh.getVerticesData('lodInfo');
+    const pcLoader = scene.pointCloudLoader;
+    const drawParams = lod ? pcLoader?.getDrawParams?.() : null;
+    const isDrawn = pcLoader?.constructor?.isDrawn;
+
     let found = false;
     let bestX = 0;
     let bestY = 0;
@@ -2176,6 +2183,7 @@ function _scanMeshPick(mesh, m, wm, screenX, screenY, stride = 1, bestDist2 = In
 
         const w = lx * m[3] + ly * m[7] + lz * m[11] + m[15];
         if (!Number.isFinite(w) || w <= 0) continue;
+        if (drawParams && !isDrawn(lod[2 * i], w, drawParams)) continue;
 
         const sx = (lx * m[0] + ly * m[4] + lz * m[8] + m[12]) / w;
         const sy = (lx * m[1] + ly * m[5] + lz * m[9] + m[13]) / w;

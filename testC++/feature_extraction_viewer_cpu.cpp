@@ -356,6 +356,7 @@ int main(int argc, char** argv)
     bool useAllFeatures = true;
     double memoryBudgetMb = 0;
     std::string tempDir;
+    int spillMode = -1;                          // --spill auto|always|never (always/never: tests)
 
     for (int a = 3; a < argc; a++) {
         std::string arg(argv[a]);
@@ -373,6 +374,9 @@ int main(int argc, char** argv)
             if (c > 0) scalesCount = c;
         } else if (arg == "--memory-budget" && a + 1 < argc) {
             memoryBudgetMb = std::stod(argv[++a]);
+        } else if (arg == "--spill" && a + 1 < argc) {
+            const std::string v = argv[++a];
+            spillMode = v == "always" ? 1 : (v == "never" ? 0 : -1);
         } else if (arg == "--temp-dir" && a + 1 < argc) {
             tempDir = argv[++a];
         }
@@ -550,6 +554,7 @@ int main(int argc, char** argv)
     // 6. Compute the tiles, one at a time (OpenMP inside the tile)
     // ------------------------------------------------------------------
     ooc::RowOutput out(outputFile, offsetToData, (size_t)REC_LEN, N);
+    out.set_spill_mode(spillMode);
     out.set_spill(tmp.path(), std::min<uint64_t>(128ULL << 20, std::max<uint64_t>(8ULL << 20, budget / 16)), std::max<uint64_t>(16ULL << 20, budget / 8));
     out.write_header(headerBuf.data(), headerBuf.size());
     out.patch(headerBuf.size(), vlrBuf.data(), vlrBuf.size());

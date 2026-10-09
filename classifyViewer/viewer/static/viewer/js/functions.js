@@ -119,10 +119,7 @@ export async function reloadPointCloudPreservingState(scene, version, dirName = 
     // Stop the old loader from fetching/updating while the new one loads
     if (oldLoader) {
         oldLoader.stopAutoCleanup();
-        if (oldLoader._cameraForObserver && oldLoader._cameraViewObserver) {
-            oldLoader._cameraForObserver.onViewMatrixChangedObservable.remove(oldLoader._cameraViewObserver);
-            oldLoader._cameraViewObserver = null;
-        }
+        oldLoader.detachCamera();
     }
 
     let pc;
@@ -130,11 +127,7 @@ export async function reloadPointCloudPreservingState(scene, version, dirName = 
         pc = await loadPointCloud(pcUrl, scene, { version, initialState, preserveView: true });
     } catch (err) {
         // New loader failed: re-attach the old one so the viewer keeps working
-        if (oldLoader && oldLoader._cameraForObserver) {
-            oldLoader._cameraViewObserver = oldLoader._cameraForObserver.onViewMatrixChangedObservable.add(() => {
-                oldLoader.update(oldLoader._cameraForObserver);
-            });
-        }
+        if (oldLoader && oldLoader._lastCamera) oldLoader.attachCamera(oldLoader._lastCamera);
         scene.pointCloudLoader = oldLoader;
         throw err;
     }

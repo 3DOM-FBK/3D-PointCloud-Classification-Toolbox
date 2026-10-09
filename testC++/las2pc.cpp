@@ -207,7 +207,10 @@ struct Params {
     std::string input, output, orderedLas, tempDir;
     uint32_t maxChunk = 250000;
     int base = 3;
-    int levels = 6;                // number of regular levels (the last, remainder level is extra)
+    int levels = 0;                // 0: adaptive number of regular levels per chunk (formatVersion 2); N > 0: exactly N (formatVersion 1)
+    int maxLevels = 16;            // cap of the adaptive levels (base + maxLevels <= 20: the cell key fits 60 bits)
+    double remainderFrac = 0.05;   // adaptive: stop when the remainder is below this fraction of the chunk ...
+    uint32_t remainderMin = 2048;  // ... or below this many points
     uint64_t headBudget = 1000000;
     uint64_t seed = 12345;
     int mode = 0;                  // 0 auto, 1 memory, 2 ooc
@@ -280,12 +283,48 @@ void sort_by_pid(std::vector<PI>& v, size_t recLen, RecOf recOf) {
 
 // Per-thread scratch of the level computation
 struct LevelScratch {
-    std::vector<uint8_t> occupied;
+    std::vector<uint64_t> cells;                 // open-addressing set of the occupied cells of a level
     std::vector<uint32_t> perm, remaining, nextRemaining, levelOrder;
+};
+
+// Sparse occupancy: the set of the occupied cells of one level, keyed by the cell index (R^3 can be 2^57,
+// far too big for a dense array). Linear probing, power-of-two capacity >= 2 x the points to place.
+class CellSet {
+public:
+    CellSet(std::vector<uint64_t>& storage, size_t expected) : t_(storage) {
+        size_t cap = 16;
+        while (cap < expected * 2) cap <<= 1;
+        t_.assign(cap, EMPTY);
+        mask_ = cap - 1;
+    }
+    // true if the cell was free (and is now occupied)
+    bool insert(uint64_t key) {
+        size_t h = (size_t)(mix(key) & mask_);
+        while (true) {
+            uint64_t v = t_[h];
+            if (v == EMPTY) { t_[h] = key; return true; }
+            if (v == key) return false;
+            h = (h + 1) & mask_;
+        }
+    }
+private:
+    static constexpr uint64_t EMPTY = ~0ULL;
+    static uint64_t mix(uint64_t x) {
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL; x ^= x >> 33;
+        return x;
+    }
+    std::vector<uint64_t>& t_;
+    size_t mask_;
 };
 
 // q: (point - origin) integer coordinates of the sorted points, n*3. Fills chunk levelPoints / AABB and returns the
 // points in final order as indices into the sorted list.
+//
+// Levels: level l keeps, among the points still free (in permutation order), the first one that finds its cell free
+// in a 2^(base+l) grid. With P.levels > 0 exactly that many regular levels are built; with P.levels == 0 the levels
+// continue while the remainder is larger than max(remainderFrac * n, remainderMin) and the cell is still larger
+// than twice the LAS scale (a finer grid cannot tell the points apart), up to P.maxLevels. The last entry of
+// levelPoints is always the remainder (possibly 0): the points that never found a free cell, in permutation order.
 void levelize(Chunk& c, size_t ci, const std::vector<int32_t>& q, const double* scale, const Params& P,
               LevelScratch& s, std::vector<uint32_t>& order) {
     const uint32_t n = c.points;
@@ -303,39 +342,41 @@ void levelize(Chunk& c, size_t ci, const std::vector<int32_t>& q, const double* 
         }
     for (int k = 0; k < 3; k++) { c.tmin[k] = tmin[k]; c.tmax[k] = tmax[k]; }
 
-    const int L = P.levels;
-    const int nLevels = L + 1;
+    const bool adaptive = P.levels == 0;
+    const int maxRegular = adaptive ? P.maxLevels : P.levels;
+    const uint32_t stopBelow = adaptive ? std::max<uint32_t>(P.remainderMin, (uint32_t)(P.remainderFrac * n)) : 0;
+    const double minScale = std::min(scale[0], std::min(scale[1], scale[2]));
     s.remaining = s.perm;
     s.levelOrder.clear();
     s.levelOrder.reserve(n);
-    c.levelPoints.assign(nLevels, 0);
+    c.levelPoints.clear();
     const double inv = 1.0 / c.size;
-    for (int l = 0; l < L && !s.remaining.empty(); l++) {
-        const int R = 1 << (P.base + l);
-        s.occupied.assign((size_t)R * R * R, 0);
+    for (int l = 0; l < maxRegular && !s.remaining.empty(); l++) {
+        if (adaptive && l > 0 && (s.remaining.size() < stopBelow || c.size / (double)(1ULL << (P.base + l)) < 2.0 * minScale)) break;
+        const uint64_t R = 1ULL << (P.base + l);
+        CellSet occ(s.cells, s.remaining.size());
         s.nextRemaining.clear();
         uint32_t taken = 0;
         for (size_t j = 0; j < s.remaining.size(); j++) {
             const int32_t* qq = &q[(size_t)s.remaining[j] * 3];
-            int cc[3];
+            uint64_t cc[3];
             for (int k = 0; k < 3; k++) {
-                double rel = ((double)qq[k] * scale[k] - c.cubeMin[k]) * inv * R;
-                int v = (int)rel;
-                cc[k] = v < 0 ? 0 : (v >= R ? R - 1 : v);
+                double rel = ((double)qq[k] * scale[k] - c.cubeMin[k]) * inv * (double)R;
+                int64_t v = (int64_t)rel;
+                cc[k] = v < 0 ? 0 : (v >= (int64_t)R ? R - 1 : (uint64_t)v);
             }
-            size_t cell = ((size_t)cc[2] * R + cc[1]) * R + cc[0];
-            if (!s.occupied[cell]) {
-                s.occupied[cell] = 1;
+            const uint64_t cell = (cc[2] * R + cc[1]) * R + cc[0];
+            if (occ.insert(cell)) {
                 s.levelOrder.push_back(s.remaining[j]);
                 taken++;
             } else {
                 s.nextRemaining.push_back(s.remaining[j]);
             }
         }
-        c.levelPoints[l] = taken;
+        c.levelPoints.push_back(taken);
         s.remaining.swap(s.nextRemaining);
     }
-    c.levelPoints[L] = (uint32_t)s.remaining.size();
+    c.levelPoints.push_back((uint32_t)s.remaining.size());      // the remainder
     s.levelOrder.insert(s.levelOrder.end(), s.remaining.begin(), s.remaining.end());
     order = s.levelOrder;
 }
@@ -378,6 +419,9 @@ int main(int argc, char** argv) {
         else if (a == "--max-chunk") P.maxChunk = (uint32_t)std::stoul(next());
         else if (a == "--base") P.base = std::stoi(next());
         else if (a == "--levels") P.levels = std::stoi(next());
+        else if (a == "--max-levels") P.maxLevels = std::stoi(next());
+        else if (a == "--remainder-frac") P.remainderFrac = std::stod(next());
+        else if (a == "--remainder-min") P.remainderMin = (uint32_t)std::stoul(next());
         else if (a == "--head-budget") P.headBudget = std::stoull(next());
         else if (a == "--seed") P.seed = std::stoull(next());
         else if (a == "--memory-budget") P.memoryBudgetMb = std::stod(next());
@@ -390,7 +434,8 @@ int main(int argc, char** argv) {
         }
         else { usage(); return 2; }
     }
-    if (P.input.empty() || P.output.empty() || P.levels < 1 || P.base < 1 || P.base + P.levels > 9 ||
+    if (P.input.empty() || P.output.empty() || P.levels < 0 || P.maxLevels < 1 || P.base < 1 ||
+        P.base + std::max(P.levels, P.maxLevels) > 20 || P.remainderFrac < 0 || P.remainderFrac >= 1 ||
         P.maxChunk < 1000) { usage(); return 2; }
 
     // On SIGTERM (/stop_process/) the temporary folder and the partial outputs are removed
@@ -804,8 +849,7 @@ int main(int argc, char** argv) {
         lap("chunks");
 
         // ---- Stratified levels inside each chunk (points sorted by POINT_ID first)
-        const int L = P.levels;           // regular levels 0..L-1, remainder is level L
-        const int nLevels = L + 1;
+        // Levels per chunk: regular levels 0..k-1 plus the remainder (the last entry); k depends on the chunk (adaptive)
         // Threads used by the per-chunk passes of the ooc mode: each holds ~130 B per point of its chunk
         int workThreads = numThreads;
         if (!memoryMode) {
@@ -874,8 +918,11 @@ int main(int argc, char** argv) {
         if (P.stopAfter == "levels") { std::cout << "stopped after the levels" << std::endl; return 0; }
 
         // ---- Head block size: largest H whose levels < H (all chunks) fit in the budget
+        size_t nLevelsMax = 1;                                    // longest levelPoints of any chunk (meta "levels.count")
+        for (auto& c : chunks) nLevelsMax = std::max(nLevelsMax, c.levelPoints.size());
+        const int nLevels = (int)nLevelsMax;
         std::vector<uint64_t> levelTotals(nLevels, 0);
-        for (auto& c : chunks) for (int l = 0; l < nLevels; l++) levelTotals[l] += c.levelPoints[l];
+        for (auto& c : chunks) for (size_t l = 0; l < c.levelPoints.size(); l++) levelTotals[l] += c.levelPoints[l];
         int H = 1;
         {
             uint64_t acc = levelTotals[0];
@@ -886,7 +933,7 @@ int main(int argc, char** argv) {
         uint64_t headRun = 0, bodyRun = headPoints;
         for (auto& c : chunks) {
             uint64_t hp = 0;
-            for (int l = 0; l < H; l++) hp += c.levelPoints[l];
+            for (int l = 0; l < H && l < (int)c.levelPoints.size(); l++) hp += c.levelPoints[l];
             c.headOffset = headRun;  headRun += hp;
             c.bodyOffset = bodyRun;  bodyRun += c.points - hp;
         }
@@ -918,7 +965,7 @@ int main(int argc, char** argv) {
         {
             Progress prog("las2pc write", N);
             ErrorBox err;
-            auto headPointsOf = [&](const Chunk& c) { uint64_t hp = 0; for (int l = 0; l < H; l++) hp += c.levelPoints[l]; return hp; };
+            auto headPointsOf = [&](const Chunk& c) { uint64_t hp = 0; for (int l = 0; l < H && l < (int)c.levelPoints.size(); l++) hp += c.levelPoints[l]; return hp; };
             if (memoryMode) {
                 OutFile geom(outDir + "/geom.bin", N * 20);
                 OutFile order(outDir + "/point_order.bin", N * 4);
@@ -1022,7 +1069,7 @@ int main(int argc, char** argv) {
             bboxMin[k] = (double)mn[k] * li.scale[k] + li.offset[k];
             bboxMax[k] = (double)mx[k] * li.scale[k] + li.offset[k];
         }
-        js << "{\n  \"format\": \"pck\",\n  \"formatVersion\": 1,\n  \"version\": \"" << version << "\",\n"
+        js << "{\n  \"format\": \"pck\",\n  \"formatVersion\": " << (P.levels == 0 ? 2 : 1) << ",\n  \"version\": \"" << version << "\",\n"
            << "  \"points\": " << N << ",\n"
            << "  \"scale\": " << vec3(li.scale) << ",\n  \"offset\": " << vec3(li.offset) << ",\n"
            << "  \"qMin\": " << vec3(qminD) << ",\n"
@@ -1038,7 +1085,7 @@ int main(int argc, char** argv) {
             js << "    {\"id\": " << ci << ", \"min\": " << vec3(c.tmin) << ", \"max\": " << vec3(c.tmax)
                << ", \"cubeMin\": " << vec3(c.cubeMin) << ", \"size\": " << num(c.size)
                << ", \"levelPoints\": [";
-            for (int l = 0; l < nLevels; l++) js << (l ? ", " : "") << c.levelPoints[l];
+            for (size_t l = 0; l < c.levelPoints.size(); l++) js << (l ? ", " : "") << c.levelPoints[l];
             js << "], \"headOffset\": " << c.headOffset << ", \"bodyOffset\": " << c.bodyOffset
                << ", \"points\": " << c.points << "}" << (ci + 1 < C ? "," : "") << "\n";
         }
