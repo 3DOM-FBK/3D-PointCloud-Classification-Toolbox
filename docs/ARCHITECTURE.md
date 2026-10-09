@@ -12,7 +12,9 @@ processing pipeline, and ML subsystem.
 4. [C++ Processing Pipeline](#c-processing-pipeline)
 5. [Python ↔ C++ Integration](#python--c-integration)
 6. [ML Pipeline](#ml-pipeline)
-7. [Data Storage Layout](#data-storage-layout)
+7. [Out-of-core Server Pipeline](#out-of-core-server-pipeline)
+8. [Browser Memory Model and Limits](#browser-memory-model-and-limits)
+9. [Data Storage Layout](#data-storage-layout)
 
 ---
 
@@ -271,6 +273,62 @@ feature extraction or model training.
 **GPU acceleration:** cuML's `RandomForestClassifier` is a drop-in replacement for
 scikit-learn's. Both training and inference attempt GPU execution first; any import
 error or CUDA exception triggers a graceful fallback to the CPU implementation.
+
+---
+
+## Out-of-core Server Pipeline
+
+The server side must work with a `features.las` that is **bigger than the memory of the container**. Every tool receives
+`--memory-budget MB` (default 50 % of `min(cgroup limit, MemAvailable)`, one setting: `PIPELINE_MEMORY_BUDGET_MB`) and
+`--temp-dir` (`PIPELINE_TEMP_DIR`, default `/tmp/pipeline_work`, never inside `runtime_data/`); see
+[INSTALLATION.md](INSTALLATION.md#memory-scratch-space-and-storage).
+
+**Canonical order.** After the geometry is built, `features.las` is rewritten **in the order of `pc/geom.bin`** (row *r* of the
+LAS is point *r* of the geometry; `POINT_ID` is unchanged) and the backup is taken afterwards. Every later tool preserves the
+order of the records it reads. This is what turns the column updates into sequential copies (no join) and lets a prediction on an
+extracted segment (an ordered subset) be merged with `point_order.bin` in one pass. A LAS in another order is still accepted:
+`pc_columns.py` falls back to an external join through bucket files (`POINT_ID` is always the key; `annotations.bin` stays
+indexed by `POINT_ID`). Nothing else depends on the order of the records.
+
+| Step | Tool | How it stays within the budget |
+|---|---|---|
+| Geometry + canonical LAS | `las2pc` | in memory (28 B/point + LAS in the page cache) when it fits, otherwise out-of-core: sequential count pass, one temp file per chunk, chunks processed by threads, `pwrite` at the final position; both give byte-identical files |
+| Columns | `pc_columns.py` | LAS read once in blocks; `fast` / `merge` / `join` paths |
+| Feature extraction | `feature_extraction_viewer_gpu` / `_cpu` | XY tiles sized from the budget (and the free VRAM): tile files with a buffer, one tile in memory (and on the GPU) at a time, record written at its input row; a tile that fails is split and retried |
+| Classification | `RF_classify.py` | blocks of points; output = input records + `prediction` |
+| Training | `RF_training.py` | only the selected features are loaded; stratified sampling by class above `--max_training_points` |
+| Split / segment extraction | `split_las_by_binary` | one pass, no PDAL; output records = input records (+ `labels`), same order |
+| Normals (`check_point_id`, `ply2las`, `subsample_pc` on LAS) | tile pipeline with a buffer of the search radius | the normals of one tile at a time; PLY read by blocks; voxel subsampling per tile aligned to the voxel grid |
+| `mesh2pc` | — | the memory needed for the requested number of points is checked before starting |
+
+Common primitives live in `testC++/ooc/` (header-only: `LasStreamReader`, `BucketWriter`, `PositionalWriter`, `TempWorkDir`,
+memory budget, tile pipeline, normals) and `viewer/utils_functions/pipeline_common.py`. Large files are read with `pread` and
+`posix_fadvise(DONTNEED)` behind the cursor and written with `pwrite` + `sync_file_range` (no `mmap(MAP_SHARED)` on files bigger than
+the budget: dirty pages of a mapping count in the cgroup limit and cannot be freed before they are written).
+
+**Stopping a job.** `/stop_process/` sends `SIGTERM` to the process group; each tool removes its scratch folder and its partial
+outputs before exiting (the backend also removes `pc_tmp/` on any failure), so nothing is left behind and `runtime_data/` keeps
+its previous state.
+
+## Browser Memory Model and Limits
+
+The point cloud itself is streamed in chunks (`geom.bin` ranges) and only the chunks that are visible are resident. The
+**per-point maps indexed by `POINT_ID`** are not: `ChunkedPointCloudLoader` allocates, once per cloud,
+
+| Array | Type | Size | Used for |
+|---|---|---|---|
+| `_pointSegmentMap` | `Uint16Array(points)` | 2 B/point | segment of every point (with sentinels) |
+| `_pointClassMap` | `Uint8Array(points)` | 1 B/point | class of every point |
+| `buffer`, `handled` (annotation export) | `Uint8Array(2 × points)`, `Uint8Array(points)` | 3 B/point, transient | `annotations.bin` before it is sent to the server |
+
+That is **3 B/point resident and about 6 B/point while exporting**: 300 MB / 600 MB for 100 M points, 3 GB / 6 GB for 1 G points
+in one tab (browsers limit a tab to a few GB; a typed array is also limited to 2³² elements). Up to a few hundred million points
+this is comfortable; beyond that it is the next limit of the system (the server side no longer has one).
+
+*Proposal (not implemented here, see the follow-ups):* index the maps by **row** (position in `geom.bin`, which is also the row of the
+canonical LAS) instead of `POINT_ID`, allocate them **per chunk** the first time the chunk is touched (a chunk is at most 250 000
+rows, so 750 KB), and let the server convert rows → `POINT_ID` when it writes `annotations.bin` with one sequential merge on
+`point_order.bin`. The memory then follows the area the user works on, not the size of the cloud.
 
 ---
 

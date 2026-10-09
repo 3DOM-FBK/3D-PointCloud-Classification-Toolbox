@@ -2394,6 +2394,16 @@ export function showLoadModal() {
                         console.log('✅ LAS ready (POINT_ID checked)');
                     }
 
+                    completeStep(2);
+
+                    // STEP 4: build the chunked point cloud (las2pc + columns)
+                    checkCancelled();
+                    currentStepIdx = 3;
+                    activateStep(3);
+                    console.log("🧠 Step 4: Building the point cloud...");
+                    const pcVersion = await buildPointCloud(lasPath);
+                    // The backup is taken AFTER the build: las2pc rewrites features.las in the order of the point cloud
+                    // (canonical order), and the backup must share it so that a restore only rewrites the columns.
                     console.log("💾 Step 3: Saving backup copy of features.las...");
                     const backupResponse = await fetch('/api/backup-pointcloud/', {
                         method: 'POST',
@@ -2404,14 +2414,6 @@ export function showLoadModal() {
                         throw new Error(errData.message || errData.error || 'Failed to create point cloud backup');
                     }
                     console.log("✅ Point cloud backup saved");
-                    completeStep(2);
-
-                    // STEP 4: build the chunked point cloud (las2pc + columns)
-                    checkCancelled();
-                    currentStepIdx = 3;
-                    activateStep(3);
-                    console.log("🧠 Step 4: Building the point cloud...");
-                    const pcVersion = await buildPointCloud(lasPath);
                     completeStep(3);
                     console.log("✅ Point cloud built");
 

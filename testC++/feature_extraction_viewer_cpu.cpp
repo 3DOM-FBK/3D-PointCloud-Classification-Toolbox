@@ -17,6 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <array>
+#include <sstream>
+#include <exception>
+
+#include "ooc/tile_pipeline.h"
 
 // No PDAL includes needed — all I/O is raw binary
 
@@ -211,7 +216,7 @@ LasHeaderInfo readLasHeader(const std::string& fileName)
 
 bool GetEigenVector(const Eigen::Matrix3f& eigenVectors, unsigned index, double eigenVector[]) {
     if (eigenVector && index < (unsigned)eigenVectors.size()) {
-        for (unsigned i = 0; i < (unsigned)eigenVectors.size(); ++i)
+        for (unsigned i = 0; i < 3; ++i)
             eigenVector[i] = eigenVectors(i, index);
         return true;
     }
@@ -324,6 +329,12 @@ inline float getFeature(const CustomPoint& p, FeatureId fid, int s) {
 // ============================================================
 // main
 // ============================================================
+//
+// Out-of-core: the cloud is never loaded as a whole. The points are distributed into one temporary file per tile
+// (core + buffer), the tiles are computed one at a time, and the record of every core point is written at the SAME ROW it
+// has in the input (the output keeps the order of the input). A tile that fails is split and retried; if a point cannot
+// be written the run fails. The tile size is the requested one (--tile_size, default 50 m) unless a tile would not fit in
+// the memory budget: then it is reduced. See ooc/tile_pipeline.h.
 
 int main(int argc, char** argv)
 {
@@ -333,7 +344,9 @@ int main(int argc, char** argv)
                   << "  --features f1,f2,...    Comma-separated list of features\n"
                   << "  --tile_size S           Tile size in meters (default 50)\n"
                   << "  --buffer B              Buffer in meters (default 4)\n"
-                  << "  --radius r1,r2,...      Radius scales (default 0.8,1.2,2.0,3.0)\n";
+                  << "  --radius r1,r2,...      Radius scales (default 0.8,1.2,2.0,3.0)\n"
+                  << "  --memory-budget MB      Peak memory (default: 50% of the available memory)\n"
+                  << "  --temp-dir DIR          Scratch folder for the tile files\n";
         return 0;
     }
 
@@ -341,6 +354,8 @@ int main(int argc, char** argv)
     const std::string outputFile = argv[2];
     std::set<std::string> requestedFeatures;
     bool useAllFeatures = true;
+    double memoryBudgetMb = 0;
+    std::string tempDir;
 
     for (int a = 3; a < argc; a++) {
         std::string arg(argv[a]);
@@ -356,6 +371,10 @@ int main(int argc, char** argv)
             std::stringstream ss(argv[++a]); std::string t; int c = 0;
             while (std::getline(ss, t, ',') && c < MAX_SCALES) scales[c++] = std::stof(t);
             if (c > 0) scalesCount = c;
+        } else if (arg == "--memory-budget" && a + 1 < argc) {
+            memoryBudgetMb = std::stod(argv[++a]);
+        } else if (arg == "--temp-dir" && a + 1 < argc) {
+            tempDir = argv[++a];
         }
     }
     if (useAllFeatures) {
@@ -372,7 +391,10 @@ int main(int argc, char** argv)
     }
 
     auto global_start = now_t();
+    ooc::TempWorkDir::install_handlers();       // SIGTERM (/stop_process/): remove the scratch folder and the partial output
+    ooc::TempWorkDir::extra_paths().push_back(outputFile);
 
+    try {
     // ------------------------------------------------------------------
     // 1. Read LAS header
     // ------------------------------------------------------------------
@@ -381,6 +403,7 @@ int main(int argc, char** argv)
         std::cerr << "ERROR: No points in file." << std::endl;
         return 1;
     }
+    ooc::LasInfo li = ooc::read_las_info(inputFile);
     std::cout << "Input: " << hdr.point_count << " points" << std::endl;
     std::cout << "Bounds: X[" << hdr.minx << ", " << hdr.maxx << "] Y["
               << hdr.miny << ", " << hdr.maxy << "] Z["
@@ -432,8 +455,9 @@ int main(int argc, char** argv)
     const int REC_LEN   = BASE_SIZE + extraOffset;
 
     // ------------------------------------------------------------------
-    // 3. Write output LAS header + VLR
+    // 3. Output LAS header + VLR (the point count is known up front: every point is written at its own row)
     // ------------------------------------------------------------------
+    const uint64_t N = hdr.point_count;
     uint32_t numVlrs     = 1;
     uint32_t vlrBodySize = (uint32_t)(outExtra.size() * 192);
     uint32_t headerSize  = 227;
@@ -448,6 +472,8 @@ int main(int argc, char** argv)
     wLE<uint32_t>(headerBuf, 100, numVlrs);
     headerBuf[104] = 3;
     wLE<uint16_t>(headerBuf, 105, (uint16_t)REC_LEN);
+    wLE<uint32_t>(headerBuf, 107, (uint32_t)std::min<uint64_t>(N, 0xFFFFFFFFull));
+    wLE<uint32_t>(headerBuf, 111, (uint32_t)std::min<uint64_t>(N, 0xFFFFFFFFull));
     wLE<double>(headerBuf, 131, hdr.scaleX); wLE<double>(headerBuf, 139, hdr.scaleY); wLE<double>(headerBuf, 147, hdr.scaleZ);
     wLE<double>(headerBuf, 155, hdr.offX);   wLE<double>(headerBuf, 163, hdr.offY);   wLE<double>(headerBuf, 171, hdr.offZ);
     wLE<double>(headerBuf, 179, hdr.maxx);   wLE<double>(headerBuf, 187, hdr.minx);
@@ -464,342 +490,200 @@ int main(int argc, char** argv)
         std::memcpy(vlrBuf.data() + 54 + k * 192, rec.data(), 192);
     }
 
-    std::ofstream out(outputFile, std::ios::binary);
-    out.write((char*)headerBuf.data(), headerBuf.size());
-    out.write((char*)vlrBuf.data(),    vlrBuf.size());
-
     // ------------------------------------------------------------------
-    // 4. SINGLE bulk read of entire point data block
+    // 4. Tile size from the memory cap
     // ------------------------------------------------------------------
-    auto t_read = now_t();
-    std::cout << "Reading point data..." << std::flush;
+    const uint64_t budget = ooc::resolve_budget_bytes(memoryBudgetMb);
+    // bytes per tile point: tile record, PCL point, octree, output record, row index
+    const double perPoint = 36.0 + (double)sizeof(CustomPoint) + 48.0 + REC_LEN + 8.0;
+    const uint64_t capPoints = std::max<uint64_t>(100000, (uint64_t)(0.6 * (double)budget / perPoint));
+    std::cout << "Tile cap: " << capPoints << " points (memory budget " << budget / 1048576 << " MB)" << std::endl;
 
-    const uint64_t N = hdr.point_count;
-    const int recLen = hdr.point_record_length;
-    std::vector<uint8_t> rawData((size_t)N * recLen);
-    {
-        std::ifstream fin(inputFile, std::ios::binary);
-        fin.seekg(hdr.offset_to_data);
-        fin.read((char*)rawData.data(), (std::streamsize)rawData.size());
-    }
-    std::cout << " done (" << elapsed(t_read) << "s)" << std::endl;
+    double spanX = std::max(0.0, hdr.maxx - hdr.minx);
+    double spanY = std::max(0.0, hdr.maxy - hdr.miny);
+    ooc::TileGrid grid;
+    grid.minx = hdr.minx; grid.miny = hdr.miny; grid.buffer = BUFFER_SIZE;
+    grid.make(spanX, spanY, TILE_SIZE);
 
-    // ------------------------------------------------------------------
-    // 5. Decode raw points into lightweight RawPoint array + assign tiles
-    // ------------------------------------------------------------------
-    auto t_decode = now_t();
-
-    int gnx = (int)std::ceil((hdr.maxx - hdr.minx) / TILE_SIZE);
-    int gny = (int)std::ceil((hdr.maxy - hdr.miny) / TILE_SIZE);
-    int numTiles = gnx * gny;
-    std::cout << "Grid: " << gnx << " x " << gny << " = " << numTiles << " tiles" << std::endl;
-
-    // For each tile, store indices of points that fall within tile+buffer
-    // We use a flat vector of vectors indexed by tileIdx = ix * gny + iy
-    std::vector<std::vector<uint64_t>> tileIndices(numTiles);
-    // Also store which points are "core" (inside tile without buffer)
-    // We'll mark this during processing, not during distribution
-
-    // Decode all points and distribute
-    std::vector<RawPoint> allPoints(N);
-
-    // Detect LAS format for field offsets
-    // Format 6-10: bytes 14-15 are different from format 0-5
-    bool isNewFormat = (hdr.point_fmt >= 6);
-
-    // Determine if file has RGB (format 2,3,5,7,8,10)
-    bool hasRGB = (hdr.point_fmt == 2 || hdr.point_fmt == 3 || hdr.point_fmt == 5 ||
-                   hdr.point_fmt == 7 || hdr.point_fmt == 8 || hdr.point_fmt == 10);
-    int rgbOffset = 0;
-    if (hasRGB) {
-        // RGB offset depends on format
-        switch (hdr.point_fmt) {
-            case 2: rgbOffset = 20; break;
-            case 3: rgbOffset = 28; break;
-            case 5: rgbOffset = 28; break;
-            case 7: rgbOffset = 30; break;
-            case 8: rgbOffset = 30; break;
-            case 10: rgbOffset = 30; break;
-            default: hasRGB = false; break;
+    // The requested tiling when its largest tile fits the cap; otherwise smaller tiles, from an XY histogram of the cloud.
+    if ((double)N * 1.3 > (double)capPoints) {
+        std::cout << "Counting points per area to size the tiles ..." << std::endl;
+        ooc::XYHistogram hist = ooc::build_histogram(inputFile, li, hdr.minx, hdr.maxx, hdr.miny, hdr.maxy, BUFFER_SIZE);
+        const double minTile = std::max(2.0 * BUFFER_SIZE, 1.0);
+        double t = grid.tile;
+        uint64_t worst = ooc::max_tile_points(hist, hdr.minx, hdr.miny, spanX, spanY, t, BUFFER_SIZE);
+        const double t0 = t;
+        while (worst > capPoints && t > minTile) {
+            t = std::max(minTile, t / 1.5);
+            worst = ooc::max_tile_points(hist, hdr.minx, hdr.miny, spanX, spanY, t, BUFFER_SIZE);
+        }
+        if (worst > capPoints)
+            std::cout << "  [Warning] the densest tile (" << worst << " points) is above the cap even at the minimum tile size "
+                      << minTile << " m: continuing, the tile will be split if its computation fails" << std::endl;
+        if (t < t0) {
+            grid.make(spanX, spanY, t);
+            std::cout << "Tile size reduced from " << t0 << " m to " << t << " m (densest tile ~" << worst << " points)" << std::endl;
         }
     }
+    const size_t numTiles = grid.numTiles();
+    std::cout << "Grid: " << grid.gnx << " x " << grid.gny << " = " << numTiles << " tiles (tile "
+              << grid.tile << " m, buffer " << BUFFER_SIZE << " m)" << std::endl;
 
-    // Decode VLR to find POINT_ID extra dim offset
-    int extraBytesStart = hdr.base_size;
-    int pidExtraOffset = -1;
-    {
-        std::ifstream vf(inputFile, std::ios::binary);
-        uint32_t num_vlrs = 0;
-        vf.seekg(100); vf.read((char*)&num_vlrs, 4);
-        vf.seekg(hdr.header_size);
-        for (uint32_t v = 0; v < num_vlrs; ++v) {
-            uint8_t vlrhdr[54] = {};
-            vf.read((char*)vlrhdr, 54);
-            if (!vf) break;
-            char uid[17] = {};
-            uint16_t rid = 0, rlen = 0;
-            std::memcpy(uid, vlrhdr + 2, 16);
-            std::memcpy(&rid, vlrhdr + 18, 2);
-            std::memcpy(&rlen, vlrhdr + 20, 2);
-            if (std::string(uid) == "LASF_Spec" && rid == 4) {
-                int ndims = rlen / 192;
-                std::vector<uint8_t> vdata(rlen);
-                vf.read((char*)vdata.data(), rlen);
-                int runoff = 0;
-                for (int di = 0; di < ndims; ++di) {
-                    uint8_t dtype = vdata[di * 192 + 2];
-                    char nbuf[33] = {};
-                    std::memcpy(nbuf, vdata.data() + di * 192 + 4, 32);
-                    int sz = 0;
-                    switch (dtype) {
-                        case 1: case 2: sz=1; break;
-                        case 3: case 4: sz=2; break;
-                        case 5: case 6: sz=4; break;
-                        case 7: case 8: sz=8; break;
-                        case 9: sz=4; break;
-                        case 10: sz=8; break;
+    // ------------------------------------------------------------------
+    // 5. Distribute the points into tile files
+    // ------------------------------------------------------------------
+    auto t_part = now_t();
+    const double dup = std::min(4.0, std::pow((grid.tile + 2 * BUFFER_SIZE) / std::max(grid.tile, 1e-6), 2.0));
+    uint64_t needDisk = (uint64_t)((double)N * dup * sizeof(ooc::TilePt)) + (uint64_t)N * ((uint64_t)REC_LEN + 4) + (64ULL << 20);   // tile files + worst-case row spill
+    ooc::TempWorkDir tmp(tempDir, "feat_", needDisk);
+    std::cout << "Temporary folder: " << tmp.path() << " (~" << needDisk / 1000000 << " MB)" << std::endl;
+    int numThreads = 1;
+#ifdef _OPENMP
+    numThreads = omp_get_max_threads();
+#endif
+    ooc::BucketWriter writer(tmp.path(), "t", numTiles, std::max<uint64_t>(16ULL << 20, budget / 8));
+    const uint64_t blockBytes = std::min<uint64_t>(16ULL << 20, std::max<uint64_t>(1ULL << 20, budget / 8 / (uint64_t)(4 * numThreads)));
+    std::vector<uint64_t> tileSize = ooc::partition_input(inputFile, li, grid, writer, blockBytes);
+    std::cout << "Distribution: " << elapsed(t_part) << "s" << std::endl;
+
+    // ------------------------------------------------------------------
+    // 6. Compute the tiles, one at a time (OpenMP inside the tile)
+    // ------------------------------------------------------------------
+    ooc::RowOutput out(outputFile, offsetToData, (size_t)REC_LEN, N);
+    out.set_spill(tmp.path(), std::min<uint64_t>(128ULL << 20, std::max<uint64_t>(8ULL << 20, budget / 16)), std::max<uint64_t>(16ULL << 20, budget / 8));
+    out.write_header(headerBuf.data(), headerBuf.size());
+    out.patch(headerBuf.size(), vlrBuf.data(), vlrBuf.size());
+
+    ooc::ComputeTile compute = [&](const std::vector<ooc::TilePt>& pts, std::vector<uint8_t>& outRecs, std::string& error) -> bool {
+        const int tileN = (int)pts.size();
+        // Build PCL cloud for this tile (core + buffer points)
+        pcl::PointCloud<CustomPoint>::Ptr pclCloud(new pcl::PointCloud<CustomPoint>);
+        pclCloud->width  = tileN;
+        pclCloud->height = 1;
+        pclCloud->points.resize(tileN);
+
+        std::vector<char> isCore(tileN, 0);
+        int coreCount = 0;
+        for (int j = 0; j < tileN; j++) {
+            const ooc::TilePt& rp = pts[j];
+            auto& pt = pclCloud->points[j];
+            std::memset(&pt, 0, sizeof(CustomPoint));
+
+            const double rx = ooc::tp_x(rp, li), ry = ooc::tp_y(rp, li), rz = ooc::tp_z(rp, li);
+            pt.x = (float)(rx - hdr.offX);
+            pt.y = (float)(ry - hdr.offY);
+            pt.z = (float)rz;
+            pt.intensity         = (float)rp.intensity;
+            pt.scan_angle        = (float)rp.scan_angle;
+            pt.class_id          = (float)rp.class_id;
+            pt.return_num        = (float)rp.return_num;
+            pt.number_of_returns = (float)rp.num_returns;
+            pt.r = (float)rp.r * color_bitter;
+            pt.g = (float)rp.g * color_bitter;
+            pt.b = (float)rp.b * color_bitter;
+            pt.raw_point_id = rp.pid;
+            if (rp.core) { isCore[j] = 1; coreCount++; }
+        }
+        std::cout << "Tile " << coreCount << " core / " << tileN << " total" << std::endl;
+
+        // Build search tree (single-threaded, fast)
+        pcl::search::Search<CustomPoint>::Ptr tree =
+            std::make_shared<pcl::search::Octree<CustomPoint>>(0.2);
+        tree->setInputCloud(pclCloud);
+
+        // Compute features with OpenMP
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (int j = 0; j < tileN; j++) {
+            if (isCore[j]) {
+                computeShapeFeatures(j, pclCloud, tree);
+            }
+        }
+
+        outRecs.assign((size_t)coreCount * REC_LEN, 0);
+        std::vector<uint8_t> rec_buf(REC_LEN, 0);
+        size_t w = 0;
+        for (int j = 0; j < tileN; j++) {
+            if (!isCore[j]) continue;
+
+            const CustomPoint& pt = pclCloud->points[j];
+            double wx = pt.x + hdr.offX;
+            double wy = pt.y + hdr.offY;
+
+            std::fill(rec_buf.begin(), rec_buf.end(), 0);
+
+            int32_t ixr = (int32_t)std::round((wx - hdr.offX) / hdr.scaleX);
+            int32_t iyr = (int32_t)std::round((wy - hdr.offY) / hdr.scaleY);
+            int32_t izr = (int32_t)std::round((pt.z - hdr.offZ) / hdr.scaleZ);
+
+            wLE<int32_t>(rec_buf, 0, ixr);
+            wLE<int32_t>(rec_buf, 4, iyr);
+            wLE<int32_t>(rec_buf, 8, izr);
+            wLE<uint16_t>(rec_buf, 12, (uint16_t)pt.intensity);
+            rec_buf[14] = ((uint8_t)pt.return_num & 0x07) |
+                          (((uint8_t)pt.number_of_returns & 0x07) << 3);
+            rec_buf[15] = (uint8_t)pt.class_id;
+            int scan_angle_rank = (int)std::lround(pt.scan_angle);
+            scan_angle_rank = std::max(-128, std::min(127, scan_angle_rank));
+            rec_buf[16] = (uint8_t)((int8_t)scan_angle_rank);
+            wLE<uint16_t>(rec_buf, 28, (uint16_t)(pt.r / color_bitter));
+            wLE<uint16_t>(rec_buf, 30, (uint16_t)(pt.g / color_bitter));
+            wLE<uint16_t>(rec_buf, 32, (uint16_t)(pt.b / color_bitter));
+
+            wLE<uint32_t>(rec_buf, BASE_SIZE + off_pid, pt.raw_point_id);
+
+            for (int f = 0; f < F_COUNT; f++) {
+                if (featureActive[f]) {
+                    for (int s = 0; s < scalesCount; s++) {
+                        float val = getFeature(pt, (FeatureId)f, s);
+                        if (!std::isfinite(val)) val = 0.0f;
+                        wLE<float>(rec_buf, BASE_SIZE + featureByteOffset[f][s], val);
                     }
-                    std::string dname(nbuf, strnlen(nbuf, 32));
-                    std::string lower = dname;
-                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                    if (lower == "point_id" || lower == "pointid")
-                        pidExtraOffset = runoff;
-                    runoff += sz;
-                }
-                break;
-            } else {
-                vf.seekg(rlen, std::ios::cur);
-            }
-        }
-    }
-
-    #pragma omp parallel for schedule(static)
-    for (int64_t pi = 0; pi < (int64_t)N; pi++) {
-        const uint8_t* rec = rawData.data() + (size_t)pi * recLen;
-
-        int32_t ix, iy, iz;
-        std::memcpy(&ix, rec + 0, 4);
-        std::memcpy(&iy, rec + 4, 4);
-        std::memcpy(&iz, rec + 8, 4);
-
-        RawPoint& rp = allPoints[pi];
-        rp.x = ix * hdr.scaleX + hdr.offX;
-        rp.y = iy * hdr.scaleY + hdr.offY;
-        rp.z = iz * hdr.scaleZ + hdr.offZ;
-
-        uint16_t rawIntensity;
-        std::memcpy(&rawIntensity, rec + 12, 2);
-        rp.intensity = (float)rawIntensity;
-
-        if (isNewFormat) {
-            // Format 6+: byte 14 = return/numreturns packed, byte 16 = classification
-            rp.return_num = (float)(rec[14] & 0x0F);
-            rp.number_of_returns = (float)((rec[14] >> 4) & 0x0F);
-            rp.class_id = (float)rec[16];
-            int16_t sa; std::memcpy(&sa, rec + 18, 2);
-            rp.scan_angle = (float)sa;
-        } else {
-            // Format 0-5: byte 14 = return/numreturns, byte 15 = classification
-            rp.return_num = (float)(rec[14] & 0x07);
-            rp.number_of_returns = (float)((rec[14] >> 3) & 0x07);
-            rp.class_id = (float)rec[15];
-            rp.scan_angle = (float)((int8_t)rec[16]);
-        }
-
-        if (hasRGB) {
-            std::memcpy(&rp.r, rec + rgbOffset, 2);
-            std::memcpy(&rp.g, rec + rgbOffset + 2, 2);
-            std::memcpy(&rp.b, rec + rgbOffset + 4, 2);
-        } else {
-            rp.r = rp.g = rp.b = 0;
-        }
-
-        // POINT_ID from extra bytes
-        if (pidExtraOffset >= 0 && extraBytesStart + pidExtraOffset + 4 <= recLen) {
-            std::memcpy(&rp.raw_point_id, rec + extraBytesStart + pidExtraOffset, 4);
-        } else {
-            rp.raw_point_id = (uint32_t)pi;
-        }
-    }
-
-    // Distribute points to tiles (sequential — writing to shared vectors)
-    for (uint64_t pi = 0; pi < N; pi++) {
-        const RawPoint& rp = allPoints[pi];
-
-        // Find all tiles whose (tile+buffer) region contains this point
-        int ix_min = (int)std::floor((rp.x - BUFFER_SIZE - hdr.minx) / TILE_SIZE);
-        int ix_max = (int)std::floor((rp.x + BUFFER_SIZE - hdr.minx) / TILE_SIZE);
-        int iy_min = (int)std::floor((rp.y - BUFFER_SIZE - hdr.miny) / TILE_SIZE);
-        int iy_max = (int)std::floor((rp.y + BUFFER_SIZE - hdr.miny) / TILE_SIZE);
-
-        ix_min = std::max(0, ix_min); ix_max = std::min(gnx - 1, ix_max);
-        iy_min = std::max(0, iy_min); iy_max = std::min(gny - 1, iy_max);
-
-        for (int tix = ix_min; tix <= ix_max; tix++) {
-            for (int tiy = iy_min; tiy <= iy_max; tiy++) {
-                double tx0 = hdr.minx + tix * TILE_SIZE;
-                double tx1 = tx0 + TILE_SIZE;
-                double ty0 = hdr.miny + tiy * TILE_SIZE;
-                double ty1 = ty0 + TILE_SIZE;
-                if (rp.x >= tx0 - BUFFER_SIZE && rp.x < tx1 + BUFFER_SIZE &&
-                    rp.y >= ty0 - BUFFER_SIZE && rp.y < ty1 + BUFFER_SIZE) {
-                    tileIndices[tix * gny + tiy].push_back(pi);
                 }
             }
+
+            wLE<float>(rec_buf, BASE_SIZE + off_nx, 0.0f);
+            wLE<float>(rec_buf, BASE_SIZE + off_ny, 0.0f);
+            wLE<float>(rec_buf, BASE_SIZE + off_nz, 0.0f);
+
+            std::memcpy(outRecs.data() + w * REC_LEN, rec_buf.data(), REC_LEN);
+            w++;
         }
-    }
+        (void)error;
+        return true;
+    };
 
-    std::cout << "Decode + distribute: " << elapsed(t_decode) << "s" << std::endl;
-
-    // Free raw binary data — no longer needed
-    rawData.clear();
-    rawData.shrink_to_fit();
-
-    // ------------------------------------------------------------------
-    // 6. Process tiles with OpenMP on feature computation
-    // ------------------------------------------------------------------
-    uint64_t totalWritten = 0;
-    int tilesProcessed = 0;
+    ooc::TileRunner runner(out, (size_t)REC_LEN, compute, li);
+    runner.set_buffer(BUFFER_SIZE);
     auto t_compute = now_t();
-
-    for (int tix = 0; tix < gnx; tix++) {
-        for (int tiy = 0; tiy < gny; tiy++) {
-            int tileIdx = tix * gny + tiy;
-            auto& indices = tileIndices[tileIdx];
-            if (indices.empty()) continue;
-
-            double tx0 = hdr.minx + tix * TILE_SIZE;
-            double tx1 = tx0 + TILE_SIZE;
-            double ty0 = hdr.miny + tiy * TILE_SIZE;
-            double ty1 = ty0 + TILE_SIZE;
-
-            // Build PCL cloud for this tile (core + buffer points)
-            int tileN = (int)indices.size();
-            pcl::PointCloud<CustomPoint>::Ptr pclCloud(new pcl::PointCloud<CustomPoint>);
-            pclCloud->width  = tileN;
-            pclCloud->height = 1;
-            pclCloud->points.resize(tileN);
-
-            // Mark which points are core (inside tile without buffer)
-            std::vector<bool> isCore(tileN, false);
-
-            for (int j = 0; j < tileN; j++) {
-                const RawPoint& rp = allPoints[indices[j]];
-                auto& pt = pclCloud->points[j];
-                std::memset(&pt, 0, sizeof(CustomPoint));
-
-                pt.x = (float)(rp.x - hdr.offX);
-                pt.y = (float)(rp.y - hdr.offY);
-                pt.z = (float)rp.z;
-                pt.intensity         = rp.intensity;
-                pt.scan_angle        = rp.scan_angle;
-                pt.class_id          = rp.class_id;
-                pt.return_num        = rp.return_num;
-                pt.number_of_returns = rp.number_of_returns;
-                pt.r = (float)rp.r * color_bitter;
-                pt.g = (float)rp.g * color_bitter;
-                pt.b = (float)rp.b * color_bitter;
-                pt.raw_point_id = rp.raw_point_id;
-
-                if (rp.x >= tx0 && rp.x < tx1 && rp.y >= ty0 && rp.y < ty1)
-                    isCore[j] = true;
-            }
-
-            // Count core points
-            int coreCount = 0;
-            for (int j = 0; j < tileN; j++) if (isCore[j]) coreCount++;
-            if (coreCount == 0) continue;
-
-            tilesProcessed++;
-            std::cout << "Tile [" << tix << "," << tiy << "] "
-                      << coreCount << " core / " << tileN << " total" << std::endl;
-
-            // Build search tree (single-threaded, fast)
-            pcl::search::Search<CustomPoint>::Ptr tree =
-                std::make_shared<pcl::search::Octree<CustomPoint>>(0.2);
-            tree->setInputCloud(pclCloud);
-
-            // Compute features with OpenMP
-            #pragma omp parallel for schedule(dynamic, 256)
-            for (int j = 0; j < tileN; j++) {
-                if (isCore[j]) {
-                    computeShapeFeatures(j, pclCloud, tree);
-                }
-            }
-
-            // Write core points to output (sequential)
-            std::vector<uint8_t> rec_buf(REC_LEN, 0);
-            for (int j = 0; j < tileN; j++) {
-                if (!isCore[j]) continue;
-
-                const CustomPoint& pt = pclCloud->points[j];
-                double wx = pt.x + hdr.offX;
-                double wy = pt.y + hdr.offY;
-
-                std::fill(rec_buf.begin(), rec_buf.end(), 0);
-
-                int32_t ixr = (int32_t)std::round((wx - hdr.offX) / hdr.scaleX);
-                int32_t iyr = (int32_t)std::round((wy - hdr.offY) / hdr.scaleY);
-                int32_t izr = (int32_t)std::round((pt.z - hdr.offZ) / hdr.scaleZ);
-
-                wLE<int32_t>(rec_buf, 0, ixr);
-                wLE<int32_t>(rec_buf, 4, iyr);
-                wLE<int32_t>(rec_buf, 8, izr);
-                wLE<uint16_t>(rec_buf, 12, (uint16_t)pt.intensity);
-                rec_buf[14] = ((uint8_t)pt.return_num & 0x07) |
-                              (((uint8_t)pt.number_of_returns & 0x07) << 3);
-                rec_buf[15] = (uint8_t)pt.class_id;
-                int scan_angle_rank = (int)std::lround(pt.scan_angle);
-                scan_angle_rank = std::max(-128, std::min(127, scan_angle_rank));
-                rec_buf[16] = (uint8_t)((int8_t)scan_angle_rank);
-                wLE<uint16_t>(rec_buf, 28, (uint16_t)(pt.r / color_bitter));
-                wLE<uint16_t>(rec_buf, 30, (uint16_t)(pt.g / color_bitter));
-                wLE<uint16_t>(rec_buf, 32, (uint16_t)(pt.b / color_bitter));
-
-                wLE<uint32_t>(rec_buf, BASE_SIZE + off_pid, pt.raw_point_id);
-
-                for (int f = 0; f < F_COUNT; f++) {
-                    if (featureActive[f]) {
-                        for (int s = 0; s < scalesCount; s++) {
-                            float val = getFeature(pt, (FeatureId)f, s);
-                            if (!std::isfinite(val)) val = 0.0f;
-                            wLE<float>(rec_buf, BASE_SIZE + featureByteOffset[f][s], val);
-                        }
-                    }
-                }
-
-                wLE<float>(rec_buf, BASE_SIZE + off_nx, 0.0f);
-                wLE<float>(rec_buf, BASE_SIZE + off_ny, 0.0f);
-                wLE<float>(rec_buf, BASE_SIZE + off_nz, 0.0f);
-
-                out.write((char*)rec_buf.data(), REC_LEN);
-                totalWritten++;
-            }
-
-            // Free tile data
-            indices.clear();
-            indices.shrink_to_fit();
-        }
+    int tileNo = 0;
+    for (size_t t = 0; t < numTiles; t++) {
+        if (tileSize[t] == 0) continue;
+        tileNo++;
+        std::vector<ooc::TilePt> pts = ooc::load_tile(writer.path(t), tileSize[t]);
+        ::unlink(writer.path(t).c_str());
+        runner.process(pts, 0, std::to_string(t));
+        std::cout << "[progress] features " << (100 * (t + 1) / numTiles) << "%" << std::endl;
     }
-
+    runner.finish();
     std::cout << "Compute + write: " << elapsed(t_compute) << "s" << std::endl;
 
-    // ------------------------------------------------------------------
-    // 7. Patch point count in LAS header
-    // ------------------------------------------------------------------
-    uint32_t totalWritten32 = static_cast<uint32_t>(std::min<uint64_t>(totalWritten, 0xFFFFFFFFull));
-    out.seekp(107);
-    out.write((char*)&totalWritten32, 4);
-    out.seekp(111);
-    out.write((char*)&totalWritten32, 4);
-    out.close();
+    if (runner.stats.written != N) {
+        throw std::runtime_error("Only " + std::to_string(runner.stats.written) + " of " + std::to_string(N) +
+                                 " points were written: some points belong to no tile");
+    }
 
     double total = elapsed(global_start);
     int mn = (int)(total / 60), sc = (int)total % 60;
-    std::cout << "\nDone. " << totalWritten << " points, "
-              << tilesProcessed << " tiles in ";
+    std::cout << "\nDone. " << runner.stats.written << " points, "
+              << runner.stats.tilesDone << " tiles in ";
     if (mn > 0) std::cout << mn << "m " << sc << "s" << std::endl;
     else std::cout << sc << "s" << std::endl;
 
+    ooc::TempWorkDir::extra_paths().clear();
     return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << std::endl;
+        std::remove(outputFile.c_str());
+        return 1;
+    }
 }

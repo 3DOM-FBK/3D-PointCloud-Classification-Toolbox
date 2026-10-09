@@ -2,7 +2,7 @@ from django.shortcuts import render
 from django.http import HttpResponse, StreamingHttpResponse, FileResponse, Http404,JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from .functions import launch_training_RF, launch_classify_RF, subsampling_point_cloud, stop_processes, get_voxel_size, check_point_id, inspect_las_header
-from .functions import mesh_to_point_cloud, ply_to_las, feature_extraction, build_pointcloud, update_pointcloud_columns, PointCloudMismatch, split_las_by_store, extract_segment_las
+from .functions import mesh_to_point_cloud, ply_to_las, feature_extraction, build_pointcloud, update_pointcloud_columns, PointCloudMismatch, split_las_by_store, extract_segment_las, job_progress
 import base64
 import os
 import json
@@ -336,6 +336,16 @@ def update_pointcloud_columns_view(request):
             return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
     return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
+
+def job_progress_view(request):
+    """Phase and percentage of the running job: {"running": bool, "phase": str, "percent": int} (from the tool's [progress] lines)."""
+    if request.method == 'GET':
+        p = job_progress()
+        if p:
+            return JsonResponse({"status": "success", "running": True, "phase": p["phase"], "percent": p["percent"]})
+        return JsonResponse({"status": "success", "running": False, "phase": None, "percent": None})
+    return JsonResponse({"status": "error", "message": "Method not allowed"}, status=405)
+
 
 @csrf_exempt
 def stop_process(request):
@@ -1107,18 +1117,27 @@ def package_download_view(request):
                 response['Content-Disposition'] = f'attachment; filename="{model_filename}"'
                 return response
 
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                for arcname, target, is_content in items_to_zip:
-                    if is_content:
-                        zip_file.writestr(arcname, target)
-                    else:
-                        zip_file.write(target, arcname)
+            # The LAS files can be much bigger than the memory: the ZIP is built in a scratch file (the files are streamed into
+            # it) and sent from there. The scratch file disappears when the response is closed.
+            scratch_root = getattr(settings, 'PIPELINE_TEMP_DIR', None) or tempfile.gettempdir()
+            os.makedirs(scratch_root, exist_ok=True)
+            zip_file_obj = tempfile.NamedTemporaryFile(dir=scratch_root, prefix='package_', suffix='.zip')
+            try:
+                with zipfile.ZipFile(zip_file_obj, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zip_file:
+                    for arcname, target, is_content in items_to_zip:
+                        if is_content:
+                            zip_file.writestr(arcname, target)
+                        else:
+                            zip_file.write(target, arcname)
+                zip_file_obj.flush()
+                zip_file_obj.seek(0)
+            except Exception:
+                zip_file_obj.close()
+                raise
 
-            zip_buffer.seek(0)
-            response = HttpResponse(zip_buffer.read(), content_type='application/zip')
             safe_project_name = re.sub(r'[^A-Za-z0-9_\-]+', '_', (project_name or '')).strip('_') or 'download'
-            response['Content-Disposition'] = f'attachment; filename="{safe_project_name}_package.zip"'
+            response = FileResponse(zip_file_obj, content_type='application/zip', as_attachment=True,
+                                    filename=f'{safe_project_name}_package.zip')
             print(f"Prepared ZIP with {len(items_to_zip)} items ( {len(selected_point_cloud_files)} segments, {len(selected_models)} models )")
             return response
 

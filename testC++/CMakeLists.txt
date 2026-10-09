@@ -70,7 +70,8 @@ target_compile_options(feature_extraction_viewer_gpu PRIVATE
 
 # --- Subsample PC ---
 add_executable(subsample_pc subsample_pc.cpp)
-target_link_libraries(subsample_pc PRIVATE Open3D::Open3D)
+target_include_directories(subsample_pc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(subsample_pc PRIVATE Open3D::Open3D OpenMP::OpenMP_CXX)
 set_target_properties(subsample_pc PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "${open3d_lib_dir}"
@@ -79,7 +80,7 @@ set_target_properties(subsample_pc PROPERTIES
 
 # --- Mesh2PC ---
 add_executable(mesh2pc mesh2pc.cpp)
-target_include_directories(mesh2pc PRIVATE ${TINYGLTF_INCLUDE_DIR})
+target_include_directories(mesh2pc PRIVATE ${TINYGLTF_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mesh2pc PRIVATE Open3D::Open3D CGAL::CGAL OpenMP::OpenMP_CXX)
 set_target_properties(mesh2pc PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
@@ -89,35 +90,23 @@ set_target_properties(mesh2pc PROPERTIES
 
 # --- Ply2LAS ---
 add_executable(ply2las ply2las.cpp)
-target_link_libraries(ply2las PRIVATE Open3D::Open3D)
+target_include_directories(ply2las PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ply2las PRIVATE Open3D::Open3D OpenMP::OpenMP_CXX)
 set_target_properties(ply2las PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
     INSTALL_RPATH "${open3d_lib_dir}"
     INSTALL_RPATH_USE_LINK_PATH TRUE
 )
 
-# --- Split LAS by Binary ---
+# --- Split LAS by Binary (streaming, no PDAL: only the standard library) ---
 add_executable(split_las_by_binary split_las_by_binary.cpp)
-target_include_directories(split_las_by_binary PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    /app/PDAL/vendor/nlohmann
-)
-target_link_libraries(split_las_by_binary
-    PRIVATE
-        ${PCL_LIBRARIES}
-        ${PDAL_LIBRARIES}
-        OpenMP::OpenMP_CXX
-)
-target_compile_options(split_las_by_binary PRIVATE ${OpenMP_CXX_FLAGS})
+target_include_directories(split_las_by_binary PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# --- Check POINT ID ---
+# --- Check POINT ID (streaming, no Open3D: only the standard library and OpenMP) ---
 add_executable(check_point_id check_point_id.cpp)
-target_link_libraries(check_point_id PRIVATE Open3D::Open3D)
-set_target_properties(check_point_id PROPERTIES
-    BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "${open3d_lib_dir}"
-    INSTALL_RPATH_USE_LINK_PATH TRUE
-)
+target_include_directories(check_point_id PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(check_point_id PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(check_point_id PRIVATE ${OpenMP_CXX_FLAGS})
 
 # --- LAS -> chunked point cloud (no external dependencies besides OpenMP) ---
 add_executable(las2pc las2pc.cpp)

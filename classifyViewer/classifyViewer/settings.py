@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -142,6 +143,13 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 5242880000  # 5GB in bytes
 
 # 🔧 Optional: also increase the limit for files
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760  # 10MB: larger uploads are spooled to a temporary file instead of RAM
+
+# Out-of-core pipeline (las2pc, pc_columns, RF_classify, ...): every tool gets --memory-budget and --temp-dir from here.
+#   PIPELINE_MEMORY_BUDGET_MB  peak memory a job may use; unset/0 = 50% of min(cgroup limit, MemAvailable)
+#   PIPELINE_TEMP_DIR          scratch folder of the jobs (one sub-folder per job, removed at the end / on stop).
+#                              Keep it on the container filesystem, NOT inside runtime_data/ (see docs/INSTALLATION.md).
+PIPELINE_MEMORY_BUDGET_MB = float(os.environ.get('PIPELINE_MEMORY_BUDGET_MB', '0') or 0) or None
+PIPELINE_TEMP_DIR = os.environ.get('PIPELINE_TEMP_DIR', '/tmp/pipeline_work')
 
 LOGGING = {
     'version': 1,

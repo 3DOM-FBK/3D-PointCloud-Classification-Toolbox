@@ -280,6 +280,12 @@ Convert a LAS file into the chunked point cloud format (see
 `runtime_data/working/pc`. This is needed at import (and when the number of points changes);
 features and classification only rewrite columns.
 
+When the input is the working `features.las`, `las2pc` also rewrites it **in the order of the geometry**
+(`features_ordered.las` replaces `features.las` at the end; row *r* of the LAS is point *r* of `pc/geom.bin`) and the
+frontend takes the backup afterwards, so that later column updates are sequential copies (see
+[POINTCLOUD_FORMAT.md](POINTCLOUD_FORMAT.md#canonical-order-of-featureslas)). The memory and scratch folder come from
+`PIPELINE_MEMORY_BUDGET_MB` / `PIPELINE_TEMP_DIR` (see [INSTALLATION.md](INSTALLATION.md#memory-scratch-space-and-storage)).
+
 **Request body:**
 
 ```json
@@ -394,6 +400,23 @@ Send a termination signal to the currently running C++ or ML subprocess.
 { "status": "success", "message": "Process stopped successfully." }
 ```
 
+The tools remove their scratch folder and their partial outputs before exiting (`SIGTERM` handler), so nothing is left behind.
+
+---
+
+### `GET /api/job-progress/`
+
+Phase and percentage of the job that is running, taken from the `[progress] <phase> <N>%` lines the tools print
+(`las2pc count`, `las2pc distribute`, `las2pc levels`, `las2pc write`, `columns`, `classify`, `features`, `split`, `normals`, ...).
+
+**Response:**
+
+```json
+{ "status": "success", "running": true, "phase": "las2pc write", "percent": 40 }
+```
+
+`running` is `false` (and `phase` / `percent` are `null`) when no tool has printed progress yet.
+
 ---
 
 ## ML Operations
@@ -412,6 +435,9 @@ Train a Random Forest classifier on the annotated point cloud.
   "meta_json":     "runtime_data/working/meta_20240101_120000.json"
 }
 ```
+
+Optional: `max_training_points` – points kept from the training and validation sets; when they have more, they are
+sampled stratified by class (logged). Default: what the memory budget allows.
 
 **Response:**
 

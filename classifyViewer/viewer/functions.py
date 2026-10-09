@@ -22,6 +22,7 @@ class JobManager:
         self._lock = threading.Lock()
         self.result = None
         self.error = None
+        self.progress = None      # last "[progress] <phase> <N>%" line printed by the running tool
 
     # ─────────────────────────────────────────
     #  SUBPROCESS
@@ -31,6 +32,7 @@ class JobManager:
         stdout_lines = []
         self.error = None
         self.result = None
+        self.progress = None
 
         # Convert all command arguments to strings
         command = [str(arg) for arg in command]
@@ -55,6 +57,11 @@ class JobManager:
 
         try:
             for line in process.stdout:
+                if line.startswith("[progress] "):
+                    # "[progress] <phase words> <N>%": phase and percentage for the /api/job-progress/ endpoint
+                    parts = line[len("[progress] "):].strip().rsplit(" ", 1)
+                    if len(parts) == 2 and parts[1].endswith("%") and parts[1][:-1].isdigit():
+                        self.progress = {"phase": parts[0], "percent": int(parts[1][:-1])}
                 if '\r' in line:
                     parts = line.split('\r')
                     print('\r' + parts[-1], end="", flush=True)
@@ -113,6 +120,11 @@ job = JobManager()
 
 
 
+def job_progress():
+    """Phase and percentage of the job that is running (last "[progress]" line of the tool), or None."""
+    return job.progress
+
+
 def stop_processes():
     print("\n[FUNCTION] ---- STOP PROCESSES -----\n")
 
@@ -125,7 +137,7 @@ def subsampling_point_cloud(file_path, out_path, voxel_size=0.002):
     abs_input = os.path.abspath(os.path.join(settings.BASE_DIR, file_path))
     abs_output = os.path.abspath(os.path.join(settings.BASE_DIR, out_path)) if out_path else None
     
-    command = ["/webapp/opt/subsample_pc", abs_input, abs_output, str(voxel_size)]
+    command = ["/webapp/opt/subsample_pc", abs_input, abs_output, str(voxel_size)] + pipeline_args()
     job.launch_subprocess(command)
     
 
@@ -172,7 +184,7 @@ def mesh_to_point_cloud(mesh_path, out_path, num_points=5000000):
     abs_input = os.path.abspath(os.path.join(settings.BASE_DIR, mesh_path))
     abs_output = os.path.abspath(os.path.join(settings.BASE_DIR, out_path)) if out_path else None
     
-    command = ["/webapp/opt/mesh2pc", abs_input, abs_output, str(num_points)]
+    command = ["/webapp/opt/mesh2pc", abs_input, abs_output, str(num_points)] + memory_budget_args()
     job.launch_subprocess(command)
 
 
@@ -183,7 +195,7 @@ def ply_to_las(ply_path, out_path=None):
     abs_input = os.path.abspath(os.path.join(settings.BASE_DIR, ply_path))
     abs_output = os.path.abspath(os.path.join(settings.BASE_DIR, out_path)) if out_path else None
     
-    command = ["/webapp/opt/ply2las", abs_input, abs_output]
+    command = ["/webapp/opt/ply2las", abs_input, abs_output] + pipeline_args()
     job.launch_subprocess(command)
 
 def check_point_id(in_path, out_path=None):
@@ -198,7 +210,7 @@ def check_point_id(in_path, out_path=None):
         # Default: overwrite or same directory
         abs_output = abs_input
 
-    command = ["/webapp/opt/check_point_id", abs_input, abs_output]
+    command = ["/webapp/opt/check_point_id", abs_input, abs_output] + pipeline_args()
     result = job.launch_subprocess(command)
     
     # The tool prints "Output: <path>" on the last line
@@ -245,6 +257,7 @@ def feature_extraction(input_filepath, output_filepath, feature_list, radius_lis
         command = [binary, abs_input, temp_output, "--features", feature_str, "--radius", radius_str]
     else :
         command = [binary, abs_input, temp_output, "--features", feature_str, "--radius", radius_str, "--sampling_resolution", str(sampling)]
+    command += pipeline_args()
     
     try:
         job.launch_subprocess(command)
@@ -274,9 +287,30 @@ def _pc_columns_script():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils_functions", "pc_columns.py")
 
 
+def pipeline_args():
+    """
+    --memory-budget / --temp-dir of the out-of-core tools, from settings (PIPELINE_MEMORY_BUDGET_MB,
+    PIPELINE_TEMP_DIR). Without a budget the tools take 50% of the memory available to the container.
+    """
+    args = []
+    budget = getattr(settings, "PIPELINE_MEMORY_BUDGET_MB", None)
+    if budget:
+        args += ["--memory-budget", str(budget)]
+    temp_dir = getattr(settings, "PIPELINE_TEMP_DIR", None)
+    if temp_dir:
+        args += ["--temp-dir", str(temp_dir)]
+    return args
+
+
+def memory_budget_args():
+    """Only --memory-budget (for the tools that need no scratch folder)."""
+    budget = getattr(settings, "PIPELINE_MEMORY_BUDGET_MB", None)
+    return ["--memory-budget", str(budget)] if budget else []
+
+
 def _run_pc_columns(abs_pc_dir, abs_las=None, only=None, prediction=None, drop_all=False, prune=False):
     """Runs pc_columns.py through the JobManager (so /stop_process/ can kill it)."""
-    command = [sys.executable, _pc_columns_script(), "--pc-dir", abs_pc_dir]
+    command = [sys.executable, _pc_columns_script(), "--pc-dir", abs_pc_dir] + pipeline_args()
     if drop_all:
         command.append("--drop-all")
     if prediction:
@@ -294,12 +328,17 @@ def _run_pc_columns(abs_pc_dir, abs_las=None, only=None, prediction=None, drop_a
         raise
 
 
-def build_pointcloud(input_filepath, output_filepath):
+def build_pointcloud(input_filepath, output_filepath, canonicalize=None):
     """
     Builds the chunked point cloud (las2pc + one column per LAS Extra Byte) with an atomic swap.
 
     las2pc and the column writer work in '<output>_tmp'. Only on success the tmp folder replaces the
     output folder, so on error (or user stop) the previous point cloud stays untouched.
+
+    canonicalize: las2pc also rewrites the LAS in the order of the geometry (row r of the LAS is point r of
+    pc/geom.bin) and that file replaces the input, so that every later step (columns, classification, split)
+    works on the canonical order without a join. Default: only when the input is the working features.las
+    (a classified LAS used for the pc_classified fallback is a deliverable and stays untouched).
 
     Returns:
         str: geometry version token (used as ?v= cache buster by the viewer).
@@ -310,22 +349,38 @@ def build_pointcloud(input_filepath, output_filepath):
     abs_output = _abs_from_base(output_filepath)
     abs_tmp = abs_output + "_tmp"
     abs_old = abs_output + "_old"
+    if canonicalize is None:
+        canonicalize = os.path.basename(abs_input) == "features.las"
+    abs_ordered = os.path.join(os.path.dirname(abs_input), "features_ordered.las") if canonicalize else None
 
-    for leftover in (abs_tmp, abs_old):
-        if os.path.exists(leftover):
+    for leftover in (abs_tmp, abs_old, abs_ordered):
+        if leftover and os.path.isdir(leftover):
             shutil.rmtree(leftover, ignore_errors=True)
+        elif leftover and os.path.exists(leftover):
+            os.remove(leftover)
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
 
     try:
-        job.launch_subprocess(["/webapp/opt/las2pc", "--input", abs_input, "--output", abs_tmp])
+        command = ["/webapp/opt/las2pc", "--input", abs_input, "--output", abs_tmp] + pipeline_args()
+        if abs_ordered:
+            command += ["--ordered-las", abs_ordered]
+        job.launch_subprocess(command)
         # A stopped process returns without error: make sure the geometry really completed
         if not all(os.path.isfile(os.path.join(abs_tmp, f)) for f in ("meta.json", "geom.bin", "point_order.bin")):
             raise RuntimeError("las2pc did not produce a complete point cloud (stopped or failed)")
-        _run_pc_columns(abs_tmp, abs_las=abs_input)
+        if abs_ordered and not os.path.isfile(abs_ordered):
+            raise RuntimeError("las2pc did not produce the ordered LAS (stopped or failed)")
+        _run_pc_columns(abs_tmp, abs_las=abs_ordered or abs_input)
         if not os.path.isfile(os.path.join(abs_tmp, "meta.json")):
             raise RuntimeError("Column writer did not complete (stopped or failed)")
+        if abs_ordered:
+            # The canonical LAS becomes the working file (same filesystem: atomic)
+            os.replace(abs_ordered, abs_input)
+            print(f"{abs_input} rewritten in the order of the point cloud")
     except Exception:
         shutil.rmtree(abs_tmp, ignore_errors=True)
+        if abs_ordered and os.path.exists(abs_ordered):
+            os.remove(abs_ordered)
         raise
 
     # Atomic swap: pc -> pc_old, pc_tmp -> pc, remove pc_old
@@ -399,7 +454,9 @@ def launch_training_RF(data):
         "--output_training_name", output_training_name,
         "--model_savepath", model_savepath,
         "--report_savepath", report_savepath,
-    ]
+    ] + pipeline_args()
+    if data.get('max_training_points'):
+        command += ["--max_training_points", str(int(data['max_training_points']))]
     if use_gpu:
         command.append("--use_gpu")
 
@@ -422,7 +479,7 @@ def launch_classify_RF(data):
         "--model", model_savepath,
         "--test_filepath", test_filepath,
         "--output_classify_name", output_classify_name,
-    ]
+    ] + pipeline_args()
 
     if use_gpu:
         command.append("--use_gpu")
@@ -485,6 +542,7 @@ def split_las_by_store(las_path: str, annotations_path: str, output_dir: str = N
         abs_annot,
         abs_outdir,
     ]
+    command += memory_budget_args()
 
     if exclude_unclassified:
         command.append("--exclude-unclassified")
@@ -517,6 +575,6 @@ def extract_segment_las(las_path: str, annotations_path: str, seg_id: int, out_p
         "--extract-segment",
         str(seg_id),
         abs_out,
-    ]
+    ] + memory_budget_args()
 
     job.launch_subprocess(command)

@@ -100,6 +100,17 @@ docker run -it -p 8000:8000 --gpus all \
 
 Mounting the source directory enables live code reloading without rebuilding the image.
 
+### Memory and scratch space
+
+The server-side pipeline is out-of-core: it works with a `features.las` bigger than the memory of the container. Limit the
+container with `--memory`, optionally set `PIPELINE_MEMORY_BUDGET_MB` (default: 50 % of the available memory) and keep
+`PIPELINE_TEMP_DIR` (default `/tmp/pipeline_work`) on a fast local disk. Do not keep `runtime_data/` on a Windows bind mount or a
+OneDrive folder in production. Details in [docs/INSTALLATION.md](docs/INSTALLATION.md#memory-scratch-space-and-storage).
+
+```bash
+docker run -d -p 8000:8000 --gpus all --memory 8g --memory-swap 8g \n  -e PIPELINE_MEMORY_BUDGET_MB=4096 -v classify_runtime:/webapp/classifyViewer/runtime_data 3d-classify-viewer
+```
+
 ## Project Structure
 
 ```
@@ -120,8 +131,9 @@ Mounting the source directory enables live code reloading without rebuilding the
 │       ├── functions.py            # JobManager and C++ subprocess wrappers
 │       ├── utils_functions/
 │       │   ├── RF_training.py      # Random Forest training
-│       │   ├── RF_classify.py      # Random Forest inference (CPU/GPU)
-│       │   └── pc_columns.py       # Attribute columns of the chunked point cloud
+│       │   ├── RF_classify.py      # Random Forest inference (CPU/GPU), by blocks
+│       │   ├── pc_columns.py       # Attribute columns of the chunked point cloud, by blocks
+│       │   └── pipeline_common.py  # Memory budget, scratch folder, LAS block reader (shared)
 │       ├── static/viewer/
 │       │   ├── js/                 # BabylonJS app, chunked point cloud loader + worker, UI logic
 │       │   ├── css/                # Application and documentation styles

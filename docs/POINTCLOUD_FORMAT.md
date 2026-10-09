@@ -33,9 +33,14 @@ because `boundingBox.min = qMin * scale + offset`).
 
 ## Chunks and levels
 
-* The cubic bounding box is counted on a 128³ grid (256³ above 100 M points), merged bottom-up into an
-  implicit octree; every leaf with at most `--max-chunk` points (default 250 000) is a **chunk**.
-* Inside each chunk the points are shuffled with a fixed seed (the output is deterministic) and split
+* The cubic bounding box (the bbox of the LAS header widened by one cell and verified while counting; measured
+  again only if a point falls outside it) is counted on a 128³ grid (256³ above 100 M points, 512³ above 500 M),
+  merged bottom-up into an implicit octree; every leaf with at most `--max-chunk` points (default 250 000) is a
+  **chunk**. A grid cell that is still denser than `--max-chunk` is split into octants (recursively, at most 14
+  levels below the grid, in place of the cell in the depth-first order), so the size of a chunk is bounded.
+* Inside each chunk the points are first **sorted by `POINT_ID`**, then shuffled with a fixed seed (the output is
+  deterministic and does **not** depend on the order of the records in the LAS, nor on the execution mode or the
+  number of threads: in-memory and out-of-core runs give byte-identical files) and split
   into **levels** with stratified sampling: for `l = 0 … L-1` a grid of `2^(base+l)` cells per side is laid over the
   chunk cube; each point, in shuffled order, whose cell is still free goes to level `l`. Points that
   never find a free cell go to the last level `L`. Defaults: `base = 3`, `L = 6`, i.e. 7 levels.
@@ -84,14 +89,37 @@ because `boundingBox.min = qMin * scale + offset`).
 | `float32` | features and every non-standard Extra Byte of the LAS (including `NormalX/Y/Z`) | `NaN` |
 | `uint8` | `prediction` (Random Forest class) | `255` – RF class ids must stay `< 255` |
 
-The writer (`viewer/utils_functions/pc_columns.py`) builds `by_pid = full(N, missing)`, scatters the
-values of the LAS by `POINT_ID` and writes `by_pid[point_order]`. Because the join key is always the
-`POINT_ID`, the order of the records in the LAS (the GPU feature extractor rewrites the points tile
-by tile) does not matter, and points missing from the LAS keep the missing value.
+The writer (`viewer/utils_functions/pc_columns.py`) never loads a column in memory: it reads the LAS **once, in
+blocks**, extracting every requested column from each block, and appends the values to the column files. The join
+key is the `POINT_ID`, and the strategy depends on how the LAS is ordered (the log prints `path: ...`):
+
+| path | when | cost |
+|---|---|---|
+| `fast` | the LAS is in **canonical order** (see below): row *r* of the LAS is point *r* of `geom.bin` | one sequential read, values written as they are |
+| `merge` | the LAS is an *ordered subset* of the cloud (e.g. a segment extracted for the classification) | sequential merge with `point_order.bin`; points without a value get the missing marker |
+| `join` | any other order (external LAS, files from older versions) | external join through bucket files in the temporary folder (LAS → `(pid, values)` by pid range, `point_order.bin` → `(pid, row)` by pid range, per-range dense join, `(row, values)` by row range, per-range sequential write) |
+
+All three give identical files. Points missing from the LAS keep the missing value.
+
+## Canonical order of `features.las`
+
+`las2pc --ordered-las` also writes the input LAS **in the order of `geom.bin`** (records unchanged, `POINT_ID`
+unchanged, header bbox/counters fixed). The backend (`build_pointcloud`) replaces `features.las` with it before the
+backup is taken, so the working LAS, the backup and the columns share the order. Every later tool preserves the
+order of the records it reads (RF classification, column updates, subsets extracted by `split_las_by_binary` keep
+the relative order), which is what makes the `fast` and `merge` paths possible. `meta.json` has
+`"canonicalLas": true` when the build produced it. Nothing depends on the order for correctness (the `POINT_ID` is
+the key and `annotations.bin` is indexed by it): a LAS out of order is simply joined by the `join` path.
 
 ## Tools
 
-* `las2pc` (C++, `testC++/las2pc.cpp`, `/webapp/opt/las2pc`) – `features.las` → geometry. In memory
-  (about 32 bytes per point); out-of-core conversion is not implemented.
-* `pc_columns.py` – writes/updates/drops columns (`--all`, `--only`, `--prediction`, `--drop-all`).
+* `las2pc` (C++, `testC++/las2pc.cpp`, `/webapp/opt/las2pc`) – `features.las` → geometry (+ canonical LAS).
+  Two modes with the same output: **memory** (the LAS is mapped, about 28 bytes/point of RAM, fastest) and
+  **out-of-core** (sequential passes over the input, one temporary file per chunk, chunks processed by
+  threads, `pwrite` at the final position; memory bounded by `--memory-budget`, scratch space of about
+  *LAS size + 4 B/point* in `--temp-dir`). `--mode auto` (default) picks memory when *LAS size + 28 B/point* fits in
+  the budget (default: 50% of the memory available to the container).
+* `pc_columns.py` – writes/updates/drops columns (`--all`, `--only`, `--prediction`, `--drop-all`); memory O(block).
 * `testC++/bench/verify_pc.py` – consistency check of a converted folder against its LAS.
+* `testC++/bench/compare_pc.py` – byte-for-byte comparison of two `pc/` folders / two LAS (used to check that the
+  out-of-core run equals the in-memory one).

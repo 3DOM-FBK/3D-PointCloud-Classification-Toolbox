@@ -21,7 +21,9 @@ import re
 import copy
 from scipy.spatial import KDTree
 
-import struct # <--- Aggiungi
+import struct
+
+import pipeline_common as pcm
 
 def _read_vlr_extra_names(filepath):
     """ Legge i nomi reali delle Extra Bytes dal binario LAS """
@@ -193,50 +195,80 @@ def write_classification_txt(X_test, Y_test_pred, filename, header):
             out.write('{} {}\n'.format(x_t_as_str, str(Y_test_pred[index])))
 
 
-def read_las_data(filepath, class_las_index):
-    las = laspy.read(filepath)
-    original_metadata = {
-        'offsets': np.array(las.header.offsets),
-        'scales':  np.array(las.header.scales)
-    }
+def available_feature_names(las):
+    """Names a model can be trained on: geometry, standard fields and Extra Bytes of the LAS."""
+    skip = {'gps_time', 'classification', 'labels'}      # not features: the target and the time (as before)
+    names = ['X', 'Y', 'Z'] + [n for n in las.fields if n not in ('X', 'Y', 'Z') and n not in skip]
+    return list(dict.fromkeys(names))
 
-    all_dims = las.point_format.dimension_names
-    columns = []
-    header = []
 
-    raw_x = np.array(las.x, dtype=np.float64)
-    raw_y = np.array(las.y, dtype=np.float64)
-    raw_z = np.array(las.z, dtype=np.float64)
-    
-    # Definiamo cosa ESCLUDERE dalle feature X (perché sono target o metadati irrilevanti)
-    target_names = {class_las_index, 'classification', 'labels', 'gps_time'}
+def max_training_points_for(n_features, budget_bytes):
+    """Points of a labelled set that fit the budget: feature matrix (float32) + one copy made by the fit + labels."""
+    return int(max(100000, budget_bytes * 0.5 / (8 * max(1, n_features) + 8)))
 
-    for dim in all_dims:
-        if dim == 'X':
-            columns.append(raw_x - original_metadata['offsets'][0])
-            header.append(dim)
-        elif dim == 'Y':
-            columns.append(raw_y - original_metadata['offsets'][1])
-            header.append(dim)
-        elif dim == 'Z':
-            columns.append(raw_z - original_metadata['offsets'][2])
-            header.append(dim)
-        # Includiamo intensity e feature extra, ESCLUDENDO il target
-        elif dim not in target_names and not dim.startswith('return_'):
-            try:
-                columns.append(np.array(getattr(las, dim), dtype=np.float32))
-                header.append(dim)
-            except Exception: continue
 
-    X = np.column_stack(columns)
-    
-    # --- Gestione Dinamica Target Y ---
-    if hasattr(las, class_las_index):
-        Y = np.array(getattr(las, class_las_index), dtype=np.int32)
-    else:
-        Y = np.array(las.classification, dtype=np.int32)
-    
-    return X, Y, header, original_metadata
+def read_las_data(filepath, class_las_index, features, budget_bytes, max_points=None, seed=0, what='data'):
+    """
+    Reads a labelled LAS by blocks: only the selected `features` (not every dimension) and the label are loaded.
+    When the set has more points than `max_points` (default: what the budget allows) it is sampled, stratified by
+    class (every class keeps its share, at least min(count, 1000) points), and the sampling is logged.
+
+    Returns X (float32, columns = features found in the LAS, in the order requested), Y (int32), the list of those
+    features and the LAS offsets/scales.
+    """
+    las = pcm.LasFile(filepath)
+    avail = available_feature_names(las)
+    used = []
+    for f in features:
+        if f in avail:
+            used.append(f)
+        else:
+            print(f"Warning: feature '{f}' not found in header")
+    label = class_las_index if class_las_index in las.fields else 'classification'
+    names = list(dict.fromkeys(used + [label]))
+    rows = las.block_rows_for(budget_bytes * 0.2, per_row_extra=8 * len(used) + 16)
+    cap = int(max_points) if max_points else max_training_points_for(len(used), budget_bytes)
+
+    def labels_of(blk):
+        y = np.asarray(blk[label])
+        if label == 'classification' and las.fmt <= 5:
+            y = y & 0x1F
+        return y.astype(np.int32)
+
+    keep_prob = None
+    if las.n > cap:
+        counts = {}
+        for _, blk in las.blocks([label], rows):
+            u, c = np.unique(labels_of(blk), return_counts=True)
+            for k, v in zip(u, c):
+                counts[int(k)] = counts.get(int(k), 0) + int(v)
+        total = sum(counts.values())
+        floor_n = 1000
+        keep_prob = {k: min(1.0, max(cap * v / total, min(v, floor_n)) / v) for k, v in counts.items()}
+        expected = sum(keep_prob[k] * v for k, v in counts.items())
+        print(f"[Info] {what}: {total} points exceed the limit of {cap} (memory budget "
+              f"{budget_bytes // 1048576} MB): stratified sampling by class keeps ~{int(expected)} "
+              f"({', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}). Use --max_training_points to change it.",
+              flush=True)
+    rng = np.random.RandomState(seed)
+    Xs, Ys = [], []
+    for _, blk in pcm.prefetched(las.blocks(names, rows)):
+        y = labels_of(blk)
+        if keep_prob is not None:
+            lut_keys = np.array(sorted(keep_prob), dtype=np.int64)
+            lut_vals = np.array([keep_prob[k] for k in sorted(keep_prob)])
+            p = lut_vals[np.searchsorted(lut_keys, y)]
+            sel = rng.random_sample(len(y)) < p
+        else:
+            sel = slice(None)
+        Xb = np.empty((len(y), len(used)), dtype=np.float32)
+        pcm.build_features(blk, used, las, Xb)
+        Xs.append(Xb[sel])
+        Ys.append(y[sel])
+    X = np.concatenate(Xs) if Xs else np.empty((0, len(used)), dtype=np.float32)
+    Y = np.concatenate(Ys) if Ys else np.empty(0, dtype=np.int32)
+    meta = {'offsets': np.array(las.offset), 'scales': np.array(las.scale)}
+    return X, Y, used, meta
 
 def write_classification_las(X, Y, filename, header, original_metadata):
     xi, yi, zi = header.index('X'), header.index('Y'), header.index('Z')
@@ -317,21 +349,32 @@ def save_model(model, filename):
     with open(filename, 'wb') as out:
         pickle.dump(model, out, pickle.HIGHEST_PROTOCOL)
 
-def get_voxel_size_from_las(filepath, sample_size=10000):
-    with laspy.open(filepath) as fh:
-        las = fh.read()
-        coords = np.vstack((las.x - las.header.offsets[0], 
-                            las.y - las.header.offsets[1], 
-                            las.z - las.header.offsets[2])).T
-
-    # Calcoliamo su TUTTI i punti
+def get_voxel_size_from_las(filepath, budget_bytes, sample_size=2000000):
+    """
+    Median distance to the nearest neighbour (suggested voxel size). Exact when the points and their KD-tree fit the
+    budget (~80 B/point); otherwise estimated on a random sample of `sample_size` points, rescaled by the density
+    ratio (the distance scales with (n_sample / n)^(1/3) in a 3D cloud), and logged as an estimate.
+    """
+    las = pcm.LasFile(filepath)
+    rows = las.block_rows_for(budget_bytes * 0.1, per_row_extra=24)
+    exact = las.n * 80 <= budget_bytes * 0.5
+    rng = np.random.RandomState(1)
+    keep = None if exact else min(1.0, sample_size / float(las.n))
+    parts = []
+    for _, blk in las.blocks(['X', 'Y', 'Z'], rows):
+        sel = slice(None) if keep is None else rng.random_sample(len(blk)) < keep
+        c = np.column_stack([np.asarray(blk[k][sel], dtype=np.float64) * las.scale[i] for i, k in enumerate('XYZ')])
+        parts.append(c)
+    coords = np.concatenate(parts)
     tree = KDTree(coords)
-    # Attenzione: su dataset molto grandi (10M+ punti) questo potrebbe saturare la RAM
     distanze, _ = tree.query(coords, k=2)
-    
-    return np.median(distanze[:, 1])
+    d = float(np.median(distanze[:, 1]))
+    if keep is not None:
+        d *= (len(coords) / float(las.n)) ** (1.0 / 3.0)
+        print(f"[Info] voxel distance estimated on a sample of {len(coords)} of {las.n} points (memory budget)", flush=True)
+    return d
 
-    
+
 def main():
     parser = argparse.ArgumentParser(description='Train the random forest model.')
     parser.add_argument('--selected_features', nargs="+", required = True, help='Selected feature for training')
@@ -346,6 +389,9 @@ def main():
     parser.add_argument('--output_training_name', required = True, help='Name of the predicted test file')
     parser.add_argument('--model_savepath', help='Path to save the model')
     parser.add_argument('--report_savepath', help='Path to save the training report')
+    parser.add_argument('--max_training_points', type=int, default=None,
+                        help='Points kept from the training and validation sets (stratified sampling by class when they have more); default: what the memory budget allows')
+    pcm.add_common_args(parser)
     args= parser.parse_args()
 
     # Crea cartelle per output, modello e report
@@ -376,17 +422,22 @@ def main():
     total_start = time.time()
     t0 = time.time()
 
+    budget = pcm.memory_budget_bytes(args.memory_budget)
+    print(f"Memory budget: {budget // 1048576} MB")
+    # Only the selected features are loaded (and the two sets share the budget)
     print("\nLoading training data...")
-    X_train, Y_train, header, _ = read_las_data(training_filepath, class_las_index)
+    X_train, Y_train, header, _ = read_las_data(training_filepath, class_las_index, selected_features, budget // 2,
+                                                args.max_training_points, what='training set')
 
     # Calculate voxel distance
-    suggested_voxel = get_voxel_size_from_las(training_filepath)
-        
+    suggested_voxel = get_voxel_size_from_las(training_filepath, budget // 2)
+
     print("\nLoading validation data...")
-    X_test, Y_test, header, meta = read_las_data(val_filepath, class_las_index)
-    
-    # print("\nLoading features data...")
-    feat_to_use = get_feature_indices(header, selected_features)
+    X_test, Y_test, header_val, meta = read_las_data(val_filepath, class_las_index, selected_features, budget // 2,
+                                                     args.max_training_points, what='validation set')
+    if header_val != header:
+        raise SystemExit(f"The training and validation sets do not have the same features: {header} vs {header_val}")
+    feat_to_use = list(range(len(header)))      # the matrices already hold only the selected features
 
     t1 = time.time()
     tot_sec = round(t1 - t0, 2)
@@ -413,7 +464,7 @@ def main():
     t2 = time.time()
     
     # X_train[:, feat_to_use] specify only feature needed
-    model, feats_raw = train_model(X_train[:, feat_to_use], Y_train, n_jobs=n_jobs, use_gpu=use_gpu,
+    model, feats_raw = train_model(X_train, Y_train, n_jobs=n_jobs, use_gpu=use_gpu,
                         n_estimators=n_estimators,
                         max_depth=max_depths,
                         min_samples_split=min_samples_split,
@@ -432,9 +483,9 @@ def main():
     print('\nEvaluating on validation set...')
     # Predict depending on whether we used cuML (GPU) or scikit-learn (CPU)
     if use_gpu and GPU_AVAILABLE and cuRF is not None:
-        Y_test_pred = cp.asnumpy(model.predict(cp.asarray(X_test[:, feat_to_use])))
+        Y_test_pred = cp.asnumpy(model.predict(cp.asarray(X_test)))
     else:
-        Y_test_pred = model.predict(X_test[:, feat_to_use])             # Test the model, using only the specified features
+        Y_test_pred = model.predict(X_test)             # Test the model, using only the specified features
     # print(f'\nSaving {output_training_name}')
     # write_classification_las(X_test, Y_test_pred, output_training_name, header, meta)
 

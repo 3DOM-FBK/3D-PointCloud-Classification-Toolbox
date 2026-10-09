@@ -8,8 +8,12 @@
 #include <algorithm>
 #include <cstring>
 
-// Open3D
+
+// Open3D (only for the PLY variants the streaming reader does not support)
 #include <open3d/Open3D.h>
+
+// streaming PLY -> LAS (no Open3D, out-of-core)
+#include "ooc/ply2las_stream.h"
 
 using TimePoint = std::chrono::time_point<std::chrono::high_resolution_clock>;
 TimePoint now_t() { return std::chrono::high_resolution_clock::now(); }
@@ -188,15 +192,51 @@ void write_las(const std::string& out_file,
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input.ply> <output.las> " << std::endl;
+    // optional "--memory-budget MB" and "--temp-dir DIR" anywhere; the input and output paths are positional
+    double memory_budget_mb = 0;
+    std::string temp_dir;
+    std::vector<std::string> pos;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--memory-budget" && i + 1 < argc) memory_budget_mb = std::stod(argv[++i]);
+        else if (a == "--temp-dir" && i + 1 < argc) temp_dir = argv[++i];
+        else pos.push_back(a);
+    }
+    if (pos.size() < 2) {
+        std::cerr << "Usage: " << argv[0] << " <input.ply> <output.las> [--memory-budget MB] [--temp-dir DIR]" << std::endl;
         return 1;
     }
 
-    std::string ply_path = argv[1];
-    std::string out_path = argv[2];
-    
+    std::string ply_path = pos[0];
+    std::string out_path = pos[1];
+
     auto global_start = now_t();
+
+    // Streaming path: the PLY is read in blocks and the normals are computed tile by tile (memory bounded by the budget).
+    try {
+        std::cout << "Loading PLY from " << ply_path << std::endl;
+        std::string why;
+        if (ooc::ply_to_las_streaming(ply_path, out_path, memory_budget_mb, temp_dir, why)) {
+            double total = elapsed(global_start);
+            std::cout << "Point cloud saved as: " << out_path << std::endl;
+            std::cout << "Processing time: " << (int)total / 60 << " min " << (int)total % 60 << " sec" << std::endl;
+            std::cout << out_path << std::endl;
+            return 0;
+        }
+        std::cout << "[Info] streaming reader not used (" << why << "): falling back to Open3D" << std::endl;
+        // The Open3D path holds the whole cloud, its normals, colours and the KD-tree: about 330 bytes per point.
+        ooc::PlyReader probe(ply_path);
+        const uint64_t budget = ooc::resolve_budget_bytes(memory_budget_mb);
+        if (probe.numVertices() > 0 && 330.0 * (double)probe.numVertices() > (double)budget) {
+            std::cerr << "ERROR: this PLY variant needs the whole cloud in memory (~" << (uint64_t)(330.0 * (double)probe.numVertices() / 1e6)
+                      << " MB for " << probe.numVertices() << " points) but the memory budget is " << budget / 1048576
+                      << " MB. Convert it to a binary PLY with x y z (and red green blue) properties only." << std::endl;
+            return 3;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << std::endl;
+        return 2;
+    }
 
     std::cout << "Loading PLY from " << ply_path << std::endl;
     auto pcd = std::make_shared<open3d::geometry::PointCloud>();

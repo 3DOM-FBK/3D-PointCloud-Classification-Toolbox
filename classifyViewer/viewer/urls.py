@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import main_viewer, documentation
-from .request_functions import save_file, launch_RF_training, launch_RF_classify, subsample_pc, stop_process, get_model_voxel_size, checking_point_id, inspect_las_input
+from .request_functions import save_file, launch_RF_training, launch_RF_classify, subsample_pc, stop_process, get_model_voxel_size, checking_point_id, inspect_las_input, job_progress_view
 from .request_functions import mesh2pc, ply2las, feat_extraction, build_pointcloud_view, update_pointcloud_columns_view, _split_las_by_binary, read_text_file, model_exists, models_list, delete_model, extract_segment_las_view
 from .request_functions import serve_range_file, serve_runtime_file, clear_data, upload_data, export_mapping, package_download_view, upload_model, backup_pointcloud, restore_pointcloud_backup
 
@@ -30,6 +30,7 @@ urlpatterns = [
     path("api/update-pointcloud-columns/", update_pointcloud_columns_view),
     path("split_las_by_binary/", _split_las_by_binary),
     path("stop_process/", stop_process),
+    path("api/job-progress/", job_progress_view),
     path('api/read-file/', read_text_file, name='read_text_file'),
     path('api/model-exists/', model_exists, name='model_exists'),
     path('api/models-list/', models_list, name='models_list'),

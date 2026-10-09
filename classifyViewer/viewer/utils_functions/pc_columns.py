@@ -5,37 +5,37 @@ The geometry (pc/geom.bin) is built once by las2pc. Every attribute lives in its
 pc/col/<name>.bin, in the same point order as geom.bin, so computing features, classifying or
 restoring a backup only rewrites the affected columns.
 
-The join key between a LAS and the geometry is always POINT_ID (the GPU feature extractor rewrites
-the records tile by tile, so the position in the file is meaningless).
+The join key between a LAS and the geometry is the POINT_ID. Memory is O(block): the LAS is read once,
+in blocks, extracting every requested column from each block, and the columns are written in sequence.
+Three ways of doing the join, tried in this order (the log says which one was used):
+
+  fast   the LAS is in canonical order (row r of the LAS is row r of geom.bin, as written by las2pc
+         and preserved by every later tool): the values are written as they are;
+  merge  the LAS is an ordered subset of the cloud (e.g. a segment extracted for the classification):
+         sequential merge with point_order.bin, points without a value get the missing marker;
+  join   any other order: external join through bucket files in the temporary folder
+         (LAS -> (pid, values) buckets by pid range, point_order.bin -> (pid, row) buckets, per-range
+         dense join, (row, values) buckets by row range, per-range sequential write).
 
 Usage:
   pc_columns.py --pc-dir DIR [--drop-all] [--las FILE (--all | --only a,b) [--prune]] [--prediction CLASSIFIED.las]
+                [--memory-budget MB] [--temp-dir DIR]
 
 Exit codes: 0 ok, 1 error, 3 the classified LAS does not match the point cloud (prediction mode).
 """
 import argparse
 import json
 import os
-import struct
 import sys
 import time
 
 import numpy as np
 
+import pipeline_common as pcm
+
 PREDICTION_MISSING = 255
 POINT_ID_NAME = 'POINT_ID'
-
-# LAS Extra Bytes data_type -> numpy dtype (scalars only)
-EXTRA_DTYPES = {
-    1: '<u1', 2: '<i1', 3: '<u2', 4: '<i2', 5: '<u4', 6: '<i4',
-    7: '<u8', 8: '<i8', 9: '<f4', 10: '<f8',
-}
-EXTRA_SIZES = {
-    1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 8, 8: 8, 9: 4, 10: 8, 11: 2, 12: 2, 13: 4, 14: 4,
-    15: 8, 16: 8, 17: 16, 18: 16, 19: 8, 20: 16, 21: 3, 22: 3, 23: 6, 24: 6, 25: 12, 26: 12,
-    27: 24, 28: 24, 29: 12, 30: 24,
-}
-BASE_RECORD_SIZES = {0: 20, 1: 28, 2: 26, 3: 34, 4: 57, 5: 63, 6: 30, 7: 36, 8: 38, 9: 59, 10: 67}
+SENTINEL = np.uint32(0xFFFFFFFF)
 
 
 def _new_version():
@@ -43,59 +43,12 @@ def _new_version():
     return str(time.time_ns() // 1000)
 
 
-def read_las_extra_fields(path):
-    """
-    Opens a LAS with np.memmap and returns (records, fields) where `records` is a structured memmap
-    exposing only the Extra Bytes scalar fields (zero-copy views) and `fields` maps name -> numpy dtype.
-    """
-    with open(path, 'rb') as f:
-        head = f.read(375)
-    if head[:4] != b'LASF':
-        raise ValueError(f'Not a LAS file: {path}')
-    header_size, = struct.unpack_from('<H', head, 94)
-    data_offset, = struct.unpack_from('<I', head, 96)
-    num_vlrs, = struct.unpack_from('<I', head, 100)
-    fmt = head[104]
-    if fmt & 0xC0:
-        raise ValueError('Compressed LAS (LAZ) is not supported')
-    fmt &= 0x3F
-    record_len, = struct.unpack_from('<H', head, 105)
-    n_points, = struct.unpack_from('<I', head, 107)
-    if n_points == 0 and head[25] >= 4:
-        n_points, = struct.unpack_from('<Q', head, 247)
-    base = BASE_RECORD_SIZES.get(fmt)
-    if base is None:
-        raise ValueError(f'Unsupported LAS point format {fmt}')
+class Mismatch(Exception):
+    """The LAS does not describe the points of the point cloud (strict / prediction mode)."""
 
-    names, formats, offsets = [], [], []
-    with open(path, 'rb') as f:
-        f.seek(header_size)
-        for _ in range(num_vlrs):
-            hdr = f.read(54)
-            if len(hdr) < 54:
-                break
-            user_id = hdr[2:18].rstrip(b'\x00').decode('latin-1')
-            record_id, = struct.unpack_from('<H', hdr, 18)
-            length, = struct.unpack_from('<H', hdr, 20)
-            body = f.read(length)
-            if user_id.startswith('LASF_Spec') and record_id == 4:
-                cur = base
-                for i in range(length // 192):
-                    rec = body[i * 192:(i + 1) * 192]
-                    dtype, options = rec[2], rec[3]
-                    name = rec[4:36].split(b'\x00')[0].decode('latin-1').strip()
-                    size = options if dtype == 0 else EXTRA_SIZES.get(dtype, 0)
-                    if dtype in EXTRA_DTYPES and name and name not in names:
-                        names.append(name)
-                        formats.append(EXTRA_DTYPES[dtype])
-                        offsets.append(cur)
-                    cur += size
-                break
-    if not names:
-        return None, {}, n_points
-    dt = np.dtype({'names': names, 'formats': formats, 'offsets': offsets, 'itemsize': record_len})
-    records = np.memmap(path, dtype=dt, mode='r', offset=data_offset, shape=(n_points,))
-    return records, {n: np.dtype(f) for n, f in zip(names, formats)}, n_points
+
+def _column_type(name):
+    return 'uint8' if name == 'prediction' else 'float32'
 
 
 class PointCloud:
@@ -105,64 +58,20 @@ class PointCloud:
         with open(self.meta_path, 'r') as f:
             self.meta = json.load(f)
         self.n = int(self.meta['points'])
-        self.order = np.fromfile(os.path.join(pc_dir, self.meta['order']['file']), dtype='<u4')
-        if len(self.order) != self.n:
+        self.order_path = os.path.join(pc_dir, self.meta['order']['file'])
+        if os.path.getsize(self.order_path) != 4 * self.n:
             raise ValueError('point_order.bin does not match meta.json')
-        self._inverse = None
 
-    def rows_for(self, point_ids):
-        """Position (in geom order) of every POINT_ID, -1 when the point is not in the cloud."""
-        pid = np.asarray(point_ids, dtype=np.uint32)
-        max_pid = int(self.order.max()) if self.n else 0
-        if max_pid < 4 * self.n + 1024:
-            if self._inverse is None:
-                inv = np.full(max_pid + 1, -1, dtype=np.int64)
-                inv[self.order] = np.arange(self.n, dtype=np.int64)
-                self._inverse = inv
-            rows = np.full(len(pid), -1, dtype=np.int64)
-            ok = pid <= max_pid
-            rows[ok] = self._inverse[pid[ok]]
-            return rows
-        sorter = np.argsort(self.order, kind='stable')
-        sorted_ids = self.order[sorter]
-        pos = np.searchsorted(sorted_ids, pid)
-        pos[pos >= self.n] = self.n - 1
-        return np.where(sorted_ids[pos] == pid, sorter[pos], -1)
+    def order_slice(self, a, b):
+        return np.fromfile(self.order_path, dtype='<u4', count=b - a, offset=4 * a)
 
-    def write_column(self, name, values, rows, col_type):
-        """Scatter `values` (aligned with `rows`) into a fresh column and register it in meta.json."""
-        missing = PREDICTION_MISSING if col_type == 'uint8' else np.nan
-        out = np.full(self.n, missing, dtype=np.uint8 if col_type == 'uint8' else np.float32)
-        valid = rows >= 0
-        n_bad = int(len(rows) - valid.sum())
-        if n_bad:
-            print(f"[Warning] column '{name}': {n_bad} POINT_ID of the LAS are not in the point cloud (ignored)", flush=True)
-        out[rows[valid]] = values[valid].astype(out.dtype, copy=False)
-        n_set = int(valid.sum())
-        if n_set < self.n:
-            print(f"[Info] column '{name}': {self.n - n_set} points of the cloud have no value", flush=True)
-
-        col_dir = os.path.join(self.dir, 'col')
-        os.makedirs(col_dir, exist_ok=True)
-        rel = f'col/{name}.bin'
-        final = os.path.join(self.dir, rel)
-        tmp = final + '.tmp'
-        out.tofile(tmp)
-        os.replace(tmp, final)
-
-        if col_type == 'uint8':
-            real = out[out != PREDICTION_MISSING]
-            cmin = int(real.min()) if real.size else None
-            cmax = int(real.max()) if real.size else None
-        else:
-            with np.errstate(all='ignore'):
-                finite = out[np.isfinite(out)]
-            cmin = float(finite.min()) if finite.size else None
-            cmax = float(finite.max()) if finite.size else None
-        entry = {'file': rel, 'type': col_type, 'min': cmin, 'max': cmax, 'version': _new_version()}
-        if col_type == 'uint8':
-            entry['missing'] = PREDICTION_MISSING
-        self.meta.setdefault('columns', {})[name] = entry
+    def order_blocks(self, rows):
+        with open(self.order_path, 'rb') as f:
+            a = 0
+            while a < self.n:
+                m = min(rows, self.n - a)
+                yield a, np.fromfile(f, dtype='<u4', count=m)
+                a += m
 
     def drop_all(self):
         col_dir = os.path.join(self.dir, 'col')
@@ -181,17 +90,348 @@ class PointCloud:
         os.replace(tmp, self.meta_path)
 
 
-def _column_type(name):
-    return 'uint8' if name == 'prediction' else 'float32'
+class ColumnSink:
+    """One output column: sequential writer to '<name>.bin.tmp', streaming min/max, atomic commit."""
+
+    def __init__(self, pc, name, col_type):
+        self.pc, self.name, self.col_type = pc, name, col_type
+        self.dtype = np.dtype(np.uint8 if col_type == 'uint8' else np.float32)
+        self.missing = PREDICTION_MISSING if col_type == 'uint8' else np.nan
+        os.makedirs(os.path.join(pc.dir, 'col'), exist_ok=True)
+        self.rel = f'col/{name}.bin'
+        self.final = os.path.join(pc.dir, self.rel)
+        self.tmp = self.final + '.tmp'
+        self.w = pcm.SequentialWriter(self.tmp)
+        self.rows = 0
+        self.cmin = self.cmax = None
+        self.collide = False
+
+    def write_dense(self, values):
+        out = np.ascontiguousarray(values, dtype=self.dtype)
+        if out.size:
+            if self.col_type == 'uint8':
+                real = out[out != PREDICTION_MISSING]
+            else:
+                with np.errstate(all='ignore'):
+                    real = out[np.isfinite(out)]
+            if real.size:
+                lo, hi = real.min(), real.max()
+                self.cmin = lo if self.cmin is None else min(self.cmin, lo)
+                self.cmax = hi if self.cmax is None else max(self.cmax, hi)
+        self.w.write(out.tobytes())
+        self.rows += out.size
+
+    def check(self, raw):
+        """Class ids >= 255 would collide with the missing marker (checked on the values read from the LAS)."""
+        if self.col_type == 'uint8' and len(raw) and int(np.max(raw)) >= PREDICTION_MISSING:
+            self.collide = True
+
+    def write_missing(self, k):
+        step = 1 << 22
+        while k > 0:
+            m = min(k, step)
+            self.write_dense(np.full(m, self.missing, dtype=self.dtype))
+            k -= m
+
+    def abort(self):
+        try:
+            self.w.close()
+        except Exception:
+            pass
+        try:
+            os.remove(self.tmp)
+        except OSError:
+            pass
+
+    def commit(self):
+        if self.rows != self.pc.n:
+            self.abort()
+            raise RuntimeError(f"column '{self.name}': wrote {self.rows} rows, expected {self.pc.n}")
+        self.w.close()
+        os.replace(self.tmp, self.final)
+        isint = self.col_type == 'uint8'
+        entry = {'file': self.rel, 'type': self.col_type,
+                 'min': (int(self.cmin) if isint else float(self.cmin)) if self.cmin is not None else None,
+                 'max': (int(self.cmax) if isint else float(self.cmax)) if self.cmax is not None else None,
+                 'version': _new_version()}
+        if isint:
+            entry['missing'] = PREDICTION_MISSING
+        self.pc.meta.setdefault('columns', {})[self.name] = entry
 
 
-def update_from_las(pc, las_path, names, prune=False):
-    records, fields, n_las = read_las_extra_fields(las_path)
-    if records is None or POINT_ID_NAME not in fields:
+class BucketWriter:
+    """Records of one dtype appended to bucket files (open/append/close), flushed over a memory cap."""
+
+    def __init__(self, folder, prefix, n_buckets, rec_dtype, cap_bytes):
+        self.folder, self.prefix, self.nb, self.dt = folder, prefix, n_buckets, rec_dtype
+        self.cap = cap_bytes
+        self.buf = [[] for _ in range(n_buckets)]
+        self.held = 0
+        self.counts = np.zeros(n_buckets, dtype=np.int64)
+
+    def path(self, k):
+        return os.path.join(self.folder, f'{self.prefix}{k}.bin')
+
+    def add(self, bucket, recs):
+        if not len(recs):
+            return
+        order = np.argsort(bucket, kind='stable')
+        b = bucket[order]
+        r = recs[order]
+        edges = np.flatnonzero(np.diff(b)) + 1
+        starts = np.concatenate(([0], edges))
+        ends = np.concatenate((edges, [len(b)]))
+        for s, e in zip(starts, ends):
+            k = int(b[s])
+            chunk = r[s:e].tobytes()
+            self.buf[k].append(chunk)
+            self.held += len(chunk)
+            self.counts[k] += e - s
+        if self.held >= self.cap:
+            self.flush()
+
+    def flush(self):
+        for k in range(self.nb):
+            if self.buf[k]:
+                with open(self.path(k), 'ab') as f:
+                    f.write(b''.join(self.buf[k]))
+                self.buf[k] = []
+        self.held = 0
+
+    def read(self, k, rows_per_block):
+        p = self.path(k)
+        if not os.path.exists(p):
+            return
+        with open(p, 'rb') as f:
+            while True:
+                a = np.fromfile(f, dtype=self.dt, count=rows_per_block)
+                if not len(a):
+                    break
+                yield a
+
+    def remove(self, k):
+        try:
+            os.remove(self.path(k))
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------- the three join paths
+
+def _pids(blk):
+    return np.ascontiguousarray(blk[POINT_ID_NAME]).astype('<u4', copy=False)
+
+
+def fast_path(pc, las, names, sinks, rpb):
+    """Row r of the LAS is row r of geom.bin. Returns False (sinks to be discarded) at the first difference."""
+    if las.n != pc.n:
+        return False
+    dt_names = [POINT_ID_NAME] + names
+    prog = pcm.Progress('columns', las.n)
+    with open(pc.order_path, 'rb') as of:
+        for start, blk in pcm.prefetched(las.blocks(dt_names, rpb)):
+            order = np.fromfile(of, dtype='<u4', count=len(blk))
+            if not np.array_equal(_pids(blk), order):
+                return False
+            for name, sink in zip(names, sinks):
+                sink.check(blk[name])
+                sink.write_dense(blk[name])
+            prog.update(start + len(blk))
+    return True
+
+
+def merge_path(pc, las, names, sinks, rpb, budget):
+    """The LAS is an ordered subset of the cloud. Returns the number of matched points or None."""
+    if las.n > pc.n or las.n == 0:
+        return None
+    ratio = pc.n / las.n
+    wmax = int(max(1 << 16, min(budget // 24, 64 << 20)))
+    block = int(max(4096, min(rpb, wmax / (2.0 * ratio))))
+    p = 0          # next unconsumed row of the cloud
+    w = 0          # rows already written to the sinks
+    matched = 0
+    for start, blk in las.blocks([POINT_ID_NAME] + names, block):
+        pid = _pids(blk)
+        W = int(min(max(2 * ratio * len(pid), 1 << 16), wmax, pc.n - p))
+        while True:
+            if W <= 0:
+                return None
+            seg = pc.order_slice(p, p + W)
+            srt = np.argsort(seg, kind='stable')
+            ss = seg[srt]
+            pos = np.searchsorted(ss, pid)
+            pos[pos >= len(ss)] = len(ss) - 1
+            if (ss[pos] == pid).all():
+                break
+            if p + W >= pc.n or W >= wmax:
+                return None
+            W = int(min(W * 2, wmax, pc.n - p))
+        rows = p + srt[pos].astype(np.int64)
+        if len(rows) > 1 and (np.diff(rows) <= 0).any():
+            return None
+        span = int(rows[-1]) + 1 - w
+        idx = rows - w
+        for name, sink in zip(names, sinks):
+            sink.check(blk[name])
+            out = np.full(span, sink.missing, dtype=sink.dtype)
+            out[idx] = blk[name]
+            sink.write_dense(out)
+        matched += len(rows)
+        w = p = int(rows[-1]) + 1
+    for sink in sinks:
+        sink.write_missing(pc.n - w)
+    return matched
+
+
+def join_path(pc, las, names, sinks, budget, temp_root, strict, rpb):
+    """External join through bucket files. Returns the number of matched points."""
+    nc = len(names)
+    # pid range of the cloud
+    pmin, pmax = 0xFFFFFFFF, 0
+    for _, o in pc.order_blocks(1 << 22):
+        pmin, pmax = min(pmin, int(o.min())), max(pmax, int(o.max()))
+    span = pmax - pmin + 1
+    W = int(max(1 << 16, min(span, budget // 4 // 5)))           # dense row (4 B) + seen flag (1 B) per pid
+    K = -(-span // W)
+    col_item = [np.dtype(np.uint8 if s.col_type == 'uint8' else np.float32).itemsize for s in sinks]
+    Rw = int(max(1 << 16, min(pc.n, budget // 4 // (sum(col_item) + 1))))
+    Rb = -(-pc.n // Rw)
+    need = pc.n * 8 + las.n * (4 + 4 * nc) * 2
+    pcm.log_phase(f'[pc_columns] join: {K} pid range(s) of {W} ids, {Rb} row range(s) of {Rw} rows, '
+                  f'~{need / 1e9:.1f} GB of temporary files')
+
+    with pcm.TempWorkDir(temp_root, prefix='pccol_', need_bytes=need) as tmp:
+        cap = max(8 << 20, budget // 8)
+        o_dt = np.dtype([('pid', '<u4'), ('row', '<u4')])
+        l_dt = np.dtype([('pid', '<u4'), ('v', '<f4', (nc,))])
+        r_dt = np.dtype([('row', '<u4'), ('v', '<f4', (nc,))])
+        ob = BucketWriter(tmp.path, 'o', K, o_dt, cap)
+        lb = BucketWriter(tmp.path, 'l', K, l_dt, cap)
+        rb = BucketWriter(tmp.path, 'r', Rb, r_dt, cap)
+
+        # (b) point_order.bin -> (pid, row) buckets
+        for a, o in pc.order_blocks(1 << 21):
+            recs = np.empty(len(o), dtype=o_dt)
+            recs['pid'] = o
+            recs['row'] = np.arange(a, a + len(o), dtype=np.uint32)
+            ob.add(((o.astype(np.int64) - pmin) // W), recs)
+        ob.flush()
+
+        # (a) LAS -> (pid, values) buckets
+        bad = 0
+        for start, blk in pcm.prefetched(las.blocks([POINT_ID_NAME] + names, min(rpb, 1 << 21))):
+            pid = _pids(blk)
+            inside = (pid >= pmin) & (pid <= pmax)
+            bad += int((~inside).sum())
+            recs = np.empty(int(inside.sum()), dtype=l_dt)
+            recs['pid'] = pid[inside]
+            for j, name in enumerate(names):
+                sinks[j].check(blk[name])
+                recs['v'][:, j] = blk[name][inside]
+            lb.add((pid[inside].astype(np.int64) - pmin) // W, recs)
+        lb.flush()
+        if strict and bad:
+            raise Mismatch(f'{bad} POINT_ID of the classified LAS are not in the point cloud')
+
+        # (c) per pid range: dense join, emit (row, values) by row range
+        matched = 0
+        for k in range(K):
+            lo = pmin + k * W
+            dense = np.full(W, SENTINEL, dtype=np.uint32)
+            for o in ob.read(k, 1 << 21):
+                dense[o['pid'] - lo] = o['row']
+            ob.remove(k)
+            seen = np.zeros(W, dtype=np.uint8) if strict else None
+            for l in lb.read(k, 1 << 21):
+                idx = l['pid'] - lo
+                rows = dense[idx]
+                ok = rows != SENTINEL
+                if not ok.all():
+                    bad += int((~ok).sum())
+                    if strict:
+                        raise Mismatch(f'{bad} POINT_ID of the classified LAS are not in the point cloud')
+                if strict:
+                    u = np.unique(idx)
+                    if len(u) != len(idx) or seen[u].any():
+                        raise Mismatch('duplicated POINT_ID in the classified LAS')
+                    seen[u] = 1
+                recs = np.empty(int(ok.sum()), dtype=r_dt)
+                recs['row'] = rows[ok]
+                recs['v'] = l['v'][ok]
+                matched += len(recs)
+                rb.add(rows[ok].astype(np.int64) // Rw, recs)
+            lb.remove(k)
+            del dense
+        rb.flush()
+
+        # (d) per row range: fill the slice of every column and write it in sequence
+        for r in range(Rb):
+            lo, hi = r * Rw, min(pc.n, (r + 1) * Rw)
+            cols = [np.full(hi - lo, s.missing, dtype=s.dtype) for s in sinks]
+            for rec in rb.read(r, 1 << 21):
+                idx = rec['row'] - lo
+                for j in range(nc):
+                    cols[j][idx] = rec['v'][:, j].astype(cols[j].dtype, copy=False)
+            rb.remove(r)
+            for s, c in zip(sinks, cols):
+                s.write_dense(c)
+    if bad and not strict:
+        pcm.log_phase(f'[pc_columns] {bad} POINT_ID of the LAS are not in the point cloud (ignored)')
+    return matched
+
+
+def scatter_columns(pc, las, cols, budget, temp_root, strict=False, force_path=None):
+    """
+    Writes the columns `cols` ([(name, type)]) from the LAS. Returns {'path': ..., 'matched': ...}.
+    Raises Mismatch in strict mode when the LAS does not belong to the cloud.
+    """
+    names = [c[0] for c in cols]
+    rpb = las.block_rows_for(budget * 0.3 / 3, per_row_extra=8 + 4 * len(names))   # raw block, x3 with prefetch
+    sinks = [ColumnSink(pc, n, t) for n, t in cols]
+    pending = [s.tmp for s in sinks]
+    pcm.install_term_cleanup(lambda: pending)
+
+    def reset():
+        for s in sinks:
+            s.abort()
+        return [ColumnSink(pc, n, t) for n, t in cols]
+
+    try:
+        path = None
+        matched = None
+        if force_path in (None, 'fast') and las.n == pc.n:
+            if fast_path(pc, las, names, sinks, rpb):
+                path, matched = 'fast', pc.n
+            else:
+                sinks = reset()
+                if force_path == 'fast':
+                    raise RuntimeError('forced fast path but the LAS is not in canonical order')
+        if path is None and force_path in (None, 'merge'):
+            m = merge_path(pc, las, names, sinks, rpb, budget)
+            if m is not None:
+                path, matched = 'merge', m
+            else:
+                sinks = reset()
+        if path is None:
+            matched = join_path(pc, las, names, sinks, budget, temp_root, strict, rpb)
+            path = 'join'
+        for s in sinks:
+            s.commit()
+        return {'path': path, 'matched': int(matched), 'collide': any(s.collide for s in sinks)}
+    except BaseException:
+        for s in sinks:
+            s.abort()
+        raise
+
+
+# ---------------------------------------------------------------------------- operations
+
+def update_from_las(pc, las_path, names, budget, temp_root, prune=False, force_path=None):
+    las = pcm.LasFile(las_path)
+    if POINT_ID_NAME not in las.extra_names:
         raise ValueError(f'{POINT_ID_NAME} extra byte not found in {las_path}')
-    pids = np.asarray(records[POINT_ID_NAME])
-    rows = pc.rows_for(pids)
-    if (names is None):
+    fields = las.extra_names
+    if names is None:
         names = [n for n in fields if n != POINT_ID_NAME]
     else:
         missing = [n for n in names if n not in fields]
@@ -202,10 +442,13 @@ def update_from_las(pc, las_path, names, prune=False):
         known = pc.meta.get('columns', {})
         names += [n for n in fields if n != POINT_ID_NAME and n not in known and n not in names]
     t0 = time.time()
-    for name in names:
-        values = np.asarray(records[name])
-        pc.write_column(name, values, rows, _column_type(name))
-        print(f"  column {name}: {int((rows >= 0).sum())} values", flush=True)
+    if names:
+        info = scatter_columns(pc, las, [(n, _column_type(n)) for n in names], budget, temp_root, force_path=force_path)
+        print(f"[pc_columns] path: {info['path']}", flush=True)
+        for name in names:
+            print(f"  column {name}: {info['matched']} values", flush=True)
+        if info['matched'] < pc.n:
+            print(f"[Info] {pc.n - info['matched']} points of the cloud have no value", flush=True)
     if prune:
         # Columns that no longer exist in the LAS (the extractor rewrites the Extra Bytes) are dropped;
         # 'prediction' comes from the classification, not from features.las: it stays.
@@ -219,24 +462,20 @@ def update_from_las(pc, las_path, names, prune=False):
     print(f"[pc_columns] {len(names)} column(s) written in {time.time() - t0:.2f} s", flush=True)
 
 
-def update_prediction(pc, las_path):
-    records, fields, n_las = read_las_extra_fields(las_path)
-    if records is None or POINT_ID_NAME not in fields or 'prediction' not in fields:
+def update_prediction(pc, las_path, budget, temp_root, force_path=None):
+    las = pcm.LasFile(las_path)
+    if POINT_ID_NAME not in las.extra_names or 'prediction' not in las.extra_names:
         print('PC_COLUMNS_MISMATCH: classified LAS has no POINT_ID/prediction', flush=True)
         return 3
-    pids = np.asarray(records[POINT_ID_NAME])
-    rows = pc.rows_for(pids)
-    if (rows < 0).any():
-        print(f'PC_COLUMNS_MISMATCH: {int((rows < 0).sum())} POINT_ID of the classified LAS are not in the point cloud', flush=True)
+    try:
+        info = scatter_columns(pc, las, [('prediction', 'uint8')], budget, temp_root, strict=True, force_path=force_path)
+    except Mismatch as e:
+        print(f'PC_COLUMNS_MISMATCH: {e}', flush=True)
         return 3
-    if len(np.unique(pids)) != len(pids):
-        print('PC_COLUMNS_MISMATCH: duplicated POINT_ID in the classified LAS', flush=True)
-        return 3
-    pred = np.asarray(records['prediction'])
-    if pred.size and int(pred.max()) >= PREDICTION_MISSING:
+    print(f"[pc_columns] path: {info['path']}", flush=True)
+    if info['collide']:
         print('[Warning] prediction values >= 255 collide with the "no prediction" marker', flush=True)
-    pc.write_column('prediction', pred, rows, 'uint8')
-    print(f"  column prediction: {len(rows)} of {pc.n} points", flush=True)
+    print(f"  column prediction: {info['matched']} of {pc.n} points", flush=True)
     return 0
 
 
@@ -249,8 +488,11 @@ def main():
     ap.add_argument('--prediction')
     ap.add_argument('--drop-all', action='store_true')
     ap.add_argument('--prune', action='store_true', help='drop columns that are not in the LAS any more')
+    ap.add_argument('--force-path', choices=['fast', 'merge', 'join'], help=argparse.SUPPRESS)
+    pcm.add_common_args(ap)
     args = ap.parse_args()
 
+    budget = pcm.memory_budget_bytes(args.memory_budget)
     pc = PointCloud(args.pc_dir)
     code = 0
     if args.drop_all:
@@ -259,9 +501,9 @@ def main():
         if not args.las:
             ap.error('--las is required with --all/--only')
         names = None if args.all else [s for s in args.only.split(',') if s]
-        update_from_las(pc, args.las, names, prune=args.prune)
+        update_from_las(pc, args.las, names, budget, args.temp_dir, prune=args.prune, force_path=args.force_path)
     if args.prediction:
-        code = update_prediction(pc, args.prediction)
+        code = update_prediction(pc, args.prediction, budget, args.temp_dir, force_path=args.force_path)
     if code == 0:
         pc.save_meta()
         print('pc_columns completed', flush=True)

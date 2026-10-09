@@ -24,6 +24,8 @@
 #include "tiny_gltf.h"
 // OpenMP
 #include <omp.h>
+// memory budget helpers (--memory-budget MB)
+#include "ooc/memory_budget.h"
 
 typedef CGAL::Simple_cartesian<double> K;
 typedef K::Point_3 Point_3;
@@ -748,14 +750,35 @@ SubMeshResult process_submesh(
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input.glb> <output.las> [num_points]" << std::endl;
+    // Optional "--memory-budget MB" anywhere; the other arguments are positional.
+    double memoryBudgetMb = 0;
+    std::vector<std::string> pos;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--memory-budget" && i + 1 < argc) memoryBudgetMb = std::stod(argv[++i]);
+        else pos.push_back(a);
+    }
+    if (pos.size() < 2) {
+        std::cerr << "Usage: " << argv[0] << " <input.glb> <output.las> [num_points] [--memory-budget MB]" << std::endl;
         return 1;
     }
 
-    std::string mesh_path = argv[1];
-    std::string out_path = argv[2];
-    int num_points = (argc >= 4) ? std::stoi(argv[3]) : 5000000;
+    std::string mesh_path = pos[0];
+    std::string out_path = pos[1];
+    int num_points = (pos.size() >= 3) ? std::stoi(pos[2]) : 5000000;
+
+    // The sampled cloud lives in memory several times (per-mesh results, merged arrays, the Open3D cloud with colours and
+    // normals, the LAS writer): about 200 bytes per point. Fail before doing any work if it cannot fit.
+    {
+        const double perPoint = 200.0;
+        const uint64_t budget = ooc::resolve_budget_bytes(memoryBudgetMb);
+        if ((double)num_points * perPoint > (double)budget) {
+            std::cerr << "ERROR: sampling " << num_points << " points needs about " << (uint64_t)((double)num_points * perPoint / 1e6)
+                      << " MB but the memory budget is " << budget / 1048576 << " MB: ask for at most "
+                      << (uint64_t)((double)budget / perPoint) << " points (or raise --memory-budget / the container memory)." << std::endl;
+            return 3;
+        }
+    }
 
     auto global_start = now_t();
 
