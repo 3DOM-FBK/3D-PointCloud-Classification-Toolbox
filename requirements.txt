@@ -1,13 +1,13 @@
-django
-scikit-learn
+# Runtime dependencies of the application (Django viewer + the Python pipeline tools).
+# Pinned to the versions the image is built and tested with. GPU Random Forest (cuML) is optional,
+# see the WITH_RAPIDS build argument of the Dockerfile.
+Django==5.2.16
+gunicorn==26.0.0
+whitenoise==6.12.0
 numpy==2.2.6
-pandas
-joblib
-gunicorn
-whitenoise
-tqdm
-open3d
-trimesh
-pygltflib
-rtree
-laspy
+scipy==1.15.3
+scikit-learn==1.7.2
+joblib==1.5.3
+threadpoolctl==3.6.0
+laspy==2.7.0
+tqdm==4.70.0

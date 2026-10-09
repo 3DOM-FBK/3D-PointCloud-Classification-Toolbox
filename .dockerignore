@@ -15,3 +15,8 @@ testC++/
 classifyViewer/staticfiles/
 classifyViewer/db.sqlite3
 classifyViewer/runtime_data/
+tests/
+docs/
+PROMPT_*.md
+*.md
+LICENSE

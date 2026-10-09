@@ -1,213 +1,114 @@
-# ── Seleziona base image in base all'architettura target ───
-# amd64 → CUDA 11.8 full stack  |  arm64 → Ubuntu base (no CUDA)
-# Docker buildx imposta automaticamente TARGETARCH (amd64 / arm64).
-# Per build normali senza --platform il default è amd64.
-ARG TARGETARCH=amd64
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04 AS builder-amd64
-FROM ubuntu:22.04                                 AS builder-arm64
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# 3D Classify Viewer — lean runtime image (linux/amd64)
+#
+# What the code really needs at runtime:
+#   * Python 3.10 + Django/gunicorn/whitenoise + numpy/scipy/scikit-learn/laspy/tqdm
+#   * opt/ binaries (prebuilt, x86-64):
+#       las2pc, split_las_by_binary, check_point_id   libgomp only (no PDAL, no Open3D)
+#       feature_extraction_viewer_cpu                 libpcl_common 1.12 (+ libgomp)
+#       feature_extraction_viewer_gpu                 libgomp; the CUDA runtime is linked statically and
+#                                                     the driver (libcuda) is injected by the NVIDIA
+#                                                     container toolkit (docker run --gpus all)
+#       ply2las, subsample_pc, mesh2pc                libOpen3D.so (+ libtbb, libc++, libGL, libX11);
+#                                                     mesh2pc also GMP/MPFR/libomp
+#   * the three BabylonJS bundles the page loads (the rest of the BabylonJS distribution is dev tooling)
+# Nothing is compiled here: no CUDA toolkit, GDAL, PDAL, LASzip, PCL/CGAL/Qt/VTK development packages,
+# torch or RAPIDS. GPU Random Forest (cuML) is an opt-in:  --build-arg WITH_RAPIDS=1
+# =============================================================================
+ARG BASE=ubuntu:22.04
 
-# ============================================================
-# STAGE 1 — builder
-# Compila GDAL, PDAL, LASzip, laz-perf da sorgente.
-# Questa immagine NON finisce in produzione.
-# ============================================================
-FROM builder-${TARGETARCH} AS builder
-
+# ── Stage 1: Python environment (a venv copied as a whole into the later stages) ──
+FROM ${BASE} AS pydeps
 ENV DEBIAN_FRONTEND=noninteractive
-ARG NUM_THREADS=8
-
-# Dipendenze di compilazione (solo quanto serve per build)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common ca-certificates gnupg && \
-    add-apt-repository universe && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    git build-essential cmake ninja-build \
-    libflann-dev libjpeg-dev libpng-dev libtiff-dev \
-    libpcl-dev libpq-dev \
-    libx11-dev libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev \
-    wget curl unzip \
-    libgomp1 libomp-dev liblaszip-dev \
-    libtbb-dev \
-    # Solo i moduli Boost necessari a GDAL/PDAL
-    libboost-filesystem-dev libboost-iostreams-dev \
-    libboost-program-options-dev libboost-system-dev \
-    libboost-thread-dev libboost-regex-dev \
-    libcgal-dev \
-    python3.10 python3.10-dev python3-pip \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+        python3.10 python3.10-venv ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt /tmp/requirements.txt
+ARG WITH_RAPIDS=0
+RUN python3.10 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
+    # opt-in GPU Random Forest. RAPIDS 25.06 is the last release with CUDA 11 wheels (dropped in 25.08);
+    # the old nightly index (pypi.anaconda.org/rapidsai-wheels-nightly) is no longer used.
+    && if [ "$WITH_RAPIDS" = "1" ]; then \
+         /opt/venv/bin/pip install --no-cache-dir cupy-cuda11x "cuml-cu11==25.6.*" --extra-index-url https://pypi.nvidia.com; \
+       fi \
+    # runtime only: no pip/setuptools, no bytecode caches, no test suites (numpy.testing imports
+    # numpy/_core/tests at runtime, so numpy keeps its tests)
+    && cd /opt/venv/lib/python3.10/site-packages \
+    && rm -rf pip pip-* setuptools setuptools-* pkg_resources _distutils_hack distutils-precedence.pth \
+    && find /opt/venv -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && find scipy sklearn joblib laspy -type d -name tests -prune -exec rm -rf {}  +
 
-# LASzip
-RUN git clone --depth 1 https://github.com/LASzip/LASzip.git /tmp/LASzip && \
-    cmake -S /tmp/LASzip -B /tmp/LASzip/build -DCMAKE_BUILD_TYPE=Release && \
-    make -C /tmp/LASzip/build -j${NUM_THREADS} install && \
-    rm -rf /tmp/LASzip
+# ── Stage 2: Open3D shared library only (the "devel" tarball is ~1 GB with headers/cmake/static libs) ──
+FROM ${BASE} AS open3d
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+ARG OPEN3D_VERSION=0.19.0
+ARG OPEN3D_SHA256=2e525fd2afe7e80907d2b6e3c66b69e2ef1481dbceed5727b749a6e65cba5720
+RUN set -eux; \
+    T=open3d-devel-linux-x86_64-cxx11-abi-${OPEN3D_VERSION}.tar.xz; \
+    wget -q -O /tmp/$T https://github.com/isl-org/Open3D/releases/download/v${OPEN3D_VERSION}/$T; \
+    echo "$OPEN3D_SHA256  /tmp/$T" | sha256sum -c -; \
+    L=/o3d/lib; mkdir -p $L; \
+    tar -xJf /tmp/$T -C $L --strip-components=2 --wildcards '*/lib/libOpen3D.so.0.19.0' '*/lib/libtbb.so.12.12'; \
+    ln -s libOpen3D.so.0.19.0 $L/libOpen3D.so.0.19; ln -s libOpen3D.so.0.19 $L/libOpen3D.so; \
+    ln -s libtbb.so.12.12 $L/libtbb.so.12; \
+    rm -f /tmp/$T
 
-# laz-perf
-RUN git clone --depth 1 https://github.com/hobu/laz-perf.git /tmp/laz-perf && \
-    cmake -S /tmp/laz-perf -B /tmp/laz-perf/build -DCMAKE_BUILD_TYPE=Release && \
-    make -C /tmp/laz-perf/build -j${NUM_THREADS} install && \
-    rm -rf /tmp/laz-perf
-
-# GDAL 3.6.2
-RUN git clone --depth 1 --branch v3.6.2 https://github.com/OSGeo/gdal.git /tmp/gdal && \
-    cmake -S /tmp/gdal -B /tmp/gdal/build -DCMAKE_BUILD_TYPE=Release && \
-    make -C /tmp/gdal/build -j${NUM_THREADS} install && \
-    rm -rf /tmp/gdal
-
-# PDAL 2.7.1
-RUN git clone --depth 1 --branch 2.7.1 https://github.com/PDAL/PDAL.git /tmp/PDAL && \
-    cmake -S /tmp/PDAL -B /tmp/PDAL/build \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DBUILD_PLUGIN_PCL=ON \
-    -DBUILD_PLUGIN_PYTHON=OFF \
-    -DBUILD_PLUGIN_PGPOINTCLOUD=OFF \
-    -DBUILD_PLUGIN_GREYHOUND=OFF \
-    -DBUILD_PLUGIN_ICEBRIDGE=OFF \
-    -DWITH_TESTS=OFF && \
-    ninja -C /tmp/PDAL/build -j${NUM_THREADS} install && \
-    rm -rf /tmp/PDAL
-
-# ============================================================
-# STAGE 2 — runtime finale
-# Base runtime (no compiler), copia solo i binari compilati.
-# ============================================================
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS runtime-amd64
-FROM ubuntu:22.04                                   AS runtime-arm64
-FROM runtime-${TARGETARCH}
-
-# ARG deve essere re-dichiarato dentro ogni stage per essere usabile nei RUN
-ARG TARGETARCH=amd64
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive \
-    CUPY_CACHE_DIR=/tmp/.cupy \
-    LD_LIBRARY_PATH=/app/open3d-devel-linux-x86_64-cxx11-abi-0.19.0/lib:/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-
-WORKDIR /app
-
-# Solo runtime di sistema — niente *-dev, niente compiler
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common ca-certificates gnupg && \
-    add-apt-repository universe && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 python3.10-venv python3-pip \
-    wget curl unzip xz-utils \
-    libgomp1 libomp5 \
-    libgl1 libgl1-mesa-glx libglu1-mesa \
-    libglib2.0-0 libsm6 libxrender1 libxext6 libx11-6 \
-    libstdc++6 libgcc-s1 \
-    # Runtime Boost (solo .so, non gli header -dev)
-    libboost-filesystem1.74.0 libboost-iostreams1.74.0 \
-    libboost-program-options1.74.0 libboost-system1.74.0 \
-    libboost-thread1.74.0 libboost-regex1.74.0 \
-    # Runtime PCL esteso + Librerie Matematiche
-    libpcl-common1.12 libpcl-io1.12 libpcl-filters1.12 libpcl-dev \
-    libqhull-r8.0 libarmadillo10 \
-    # Runtime VTK e Qt5 (richiesti da libpcl_visualization)
-    libqt5opengl5 libqt5widgets5 libqt5gui5 libqt5core5a \
-    # GDAL runtime avanzato (Formati vari, Database, GIS)
-    libproj22 libcurl4 libsqlite3-0 libxml2 zlib1g \
-    libgeotiff5 unixodbc libblosc1 libxerces-c3.2 libheif1 libpoppler118 \
-    libgif7 libcfitsio9 libopenjp2-7 libkmlbase1 libkmldom1 libkmlengine1 \
-    libfyba0 libspatialite7 libmysqlclient21 libfreexl1 \
-    libgeos-c1v5 libhdf4-0-alt \
-    # LASzip runtime (per PDAL)
-    liblaszip8 \
-    # TBB runtime
-    libtbb2 \
-    # Runtime GMP/MPFR/CGAL — richiesti dal binario mesh2pc
-    libgmp10 libgmpxx4ldbl \
-    libmpfr6 \
-    libcgal-dev \
-    # LLVM libc++ — richiesto dal binario mesh2pc
-    libc++1 libc++abi1 \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
-
-# Python di default e upgrade pip
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
-    update-alternatives --install /usr/bin/python  python  /usr/bin/python3.10 1 && \
-    python3 -m pip install --upgrade pip --no-cache-dir
-
-# ── Copia binari compilati dallo stage builder ─────────────
-COPY --from=builder /usr/local/lib     /usr/local/lib
-COPY --from=builder /usr/local/bin     /usr/local/bin
-COPY --from=builder /usr/local/share   /usr/local/share
-COPY --from=builder /usr/local/include /usr/local/include
-
-COPY requirements.txt /app/
-
-# ── STEP 1: Pacchetti standard da PyPI ────────────────────
-# --ignore-installed evita il conflitto con pacchetti di sistema installati
-# via apt/distutils (es. blinker 1.4) che pip non può disinstallare.
-RUN python3 -m pip install --no-cache-dir --ignore-installed -r /app/requirements.txt
-
-# ── STEP 2: PyTorch (CUDA su amd64, CPU-only su arm64) ────
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-        python3 -m pip install --no-cache-dir \
-            torch==2.3.0+cu118 \
-            torchvision==0.18.0+cu118 \
-            --index-url https://download.pytorch.org/whl/cu118; \
-    else \
-        python3 -m pip install --no-cache-dir \
-            torch==2.3.0 \
-            torchvision==0.18.0; \
-    fi
-
-# ── STEP 3: CuPy e RAPIDS (solo amd64/CUDA, non disponibili su arm64) ──
-# Separato da Torch per evitare conflitti di risoluzione delle dipendenze.
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-        python3 -m pip install --no-cache-dir \
-            cupy-cuda11x \
-            cuml-cu11 \
-            --extra-index-url https://pypi.anaconda.org/rapidsai-wheels-nightly/simple; \
-    fi
-
-# Pulisce cache bytecode
-RUN find /usr/local/lib/python3.10 -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-
-# Aggiorna cache librerie dinamiche
-# Rimuoviamo la liblaszip custom (causa crash nei lettori LAS) e usiamo quella di sistema
-RUN rm -f /usr/local/lib/liblaszip* && \
-    if [ "$TARGETARCH" = "amd64" ]; then \
-        ln -s /usr/lib/x86_64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so; \
-    else \
-        ln -s /usr/lib/aarch64-linux-gnu/liblaszip.so.8 /usr/local/lib/liblaszip.so; \
-    fi && \
-    echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
-
-# ── Open3D precompilata (solo amd64, nessun prebuilt ufficiale per arm64) ──
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-        wget -q https://github.com/isl-org/Open3D/releases/download/v0.19.0/open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
-        tar -xf open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz && \
-        rm    open3d-devel-linux-x86_64-cxx11-abi-0.19.0.tar.xz; \
-    fi
-
-# ── tinygltf / stb headers ─────────────────────────────────
-RUN mkdir -p /app/tinygltf && \
-    wget -q https://raw.githubusercontent.com/syoyo/tinygltf/master/tiny_gltf.h     -O /app/tinygltf/tiny_gltf.h && \
-    wget -q https://raw.githubusercontent.com/syoyo/tinygltf/master/json.hpp        -O /app/tinygltf/json.hpp && \
-    wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image.h       -O /app/tinygltf/stb_image.h && \
-    wget -q https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h -O /app/tinygltf/stb_image_write.h
-
-# Aggiorna cache librerie dinamiche
-RUN echo "/usr/local/lib" > /etc/ld.so.conf.d/local.conf && ldconfig
-
-# ── Progetto Django e cartella opt ────────────────────────
+# ── Stage 3: application tree with the static files already collected ──
+# (done in its own stage so that the BabylonJS distribution, its source maps and the uncollected
+#  copy of the static files never become layers of the final image)
+FROM ${BASE} AS app
+ENV DEBIAN_FRONTEND=noninteractive PYTHONDONTWRITEBYTECODE=1 PATH=/opt/venv/bin:$PATH
+RUN apt-get update && apt-get install -y --no-install-recommends python3.10 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=pydeps /opt/venv /opt/venv
 COPY classifyViewer/ /webapp/classifyViewer/
-COPY opt/            /webapp/opt/
-RUN chmod +x /webapp/opt/*
+WORKDIR /webapp/classifyViewer
+RUN set -eux; \
+    B=viewer/static/viewer/js/babylon_js; \
+    # keep only what viewer_page.html loads: babylon.js, materialsLibrary/, loaders/ (no editors, inspector, physics, codecs, maps, typings)
+    find $B -mindepth 1 -maxdepth 1 ! -name babylon.js ! -name materialsLibrary ! -name loaders -exec rm -rf {} +; \
+    find $B \( -name '*.map' -o -name '*.d.ts' \) -delete; \
+    python manage.py collectstatic --noinput; \
+    # whitenoise serves STATIC_ROOT only
+    rm -rf viewer/static
 
+# ── Stage 4: runtime ──
+FROM ${BASE}
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/opt/venv/bin:$PATH \
+    # GPU feature extraction: the NVIDIA container toolkit mounts the driver (libcuda) for these
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Shared libraries only (no -dev packages, no compilers).
+# libGL.so.1 is only needed to LOAD libOpen3D (the tools never open a GL context). In jammy libglx0 hard-depends
+# on Mesa (libglx-mesa0 -> libgl1-mesa-dri -> LLVM 15, ~190 MB), so the three GLVND packages are installed
+# with dpkg --force-depends instead; apt is not used afterwards.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.10 \
+        libgomp1 \
+        libpcl-common1.12 \
+        libomp5 libc++1 libc++abi1 \
+        libgmp10 libgmpxx4ldbl libmpfr6 \
+        libx11-6 \
+    && cd /tmp && apt-get download libglvnd0 libgl1 libglx0 \
+    && dpkg -i --force-depends ./libglvnd0_*.deb ./libgl1_*.deb ./libglx0_*.deb \
+    && rm -rf /tmp/*.deb /var/lib/apt/lists/*
+
+COPY --from=pydeps /opt/venv /opt/venv
+# Same path the binaries were linked with (RPATH), so no LD_LIBRARY_PATH is needed
+COPY --from=open3d /o3d/lib /app/open3d-devel-linux-x86_64-cxx11-abi-0.19.0/lib
+
+# Application (last: it is what changes most often)
+COPY --chmod=755 opt/ /webapp/opt/
+COPY --from=app /webapp/classifyViewer /webapp/classifyViewer
 WORKDIR /webapp/classifyViewer
 
-RUN python3 manage.py collectstatic --noinput
-
 EXPOSE 8000
-
-# Run Django development server
-# ENTRYPOINT [ "python", "manage.py", "runserver", "0.0.0.0:8000" ]
-
-# Run Django production server
-ENTRYPOINT [ "gunicorn", "classifyViewer.wsgi:application", "--config", "config/gunicorn.conf.py" ]
+ENTRYPOINT ["gunicorn", "classifyViewer.wsgi:application", "--config", "config/gunicorn.conf.py"]

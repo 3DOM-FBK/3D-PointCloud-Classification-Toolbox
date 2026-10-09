@@ -71,11 +71,9 @@ Skip this step if you are using the pre-built image from Docker Hub.
 docker build -t 3d-classify-viewer .
 ```
 
-To speed up the C++ compilation stage, increase the number of parallel build threads:
-
-```bash
-docker build --build-arg NUM_THREADS=16 -t 3d-classify-viewer .
-```
+The image is lean (~0.8 GB, linux/amd64): it contains only the runtime libraries the code uses and
+the prebuilt binaries of `opt/`; nothing is compiled during the build. GPU Random Forest (RAPIDS cuML) is an
+opt-in, see [docs/INSTALLATION.md](docs/INSTALLATION.md): `--build-arg WITH_RAPIDS=1`.
 
 ### 2. Run in production
 
@@ -115,7 +113,7 @@ docker run -d -p 8000:8000 --gpus all --memory 8g --memory-swap 8g \n  -e PIPELI
 
 ```
 3D-PointCloud-Classification-Toolbox/
-├── Dockerfile                      # Multi-stage build: CUDA 11.8 builder → runtime image
+├── Dockerfile                      # Lean multi-stage build: Python venv + Open3D lib + app → ubuntu:22.04 runtime
 ├── requirements.txt                # Python dependencies
 ├── classifyViewer/
 │   ├── manage.py
@@ -172,9 +170,7 @@ Key Python packages (`requirements.txt` for the full list):
 | Django | Web framework |
 | Gunicorn + Whitenoise | Production WSGI server and static file serving |
 | scikit-learn | Random Forest training and inference (CPU) |
-| numpy, pandas | Numerical computation and data handling |
-| laspy | LAS/LAZ point cloud I/O |
-| open3d | Point cloud processing utilities |
-| trimesh, pygltflib | Mesh file I/O (GLB/GLTF/OBJ) |
-| torch (CUDA 11.8) | GPU compute backend |
-| cupy-cuda11x, cuml-cu11 | GPU-accelerated ML via RAPIDS |
+| numpy, scipy | Numerical computation (scipy: KD-tree of the training sampler) |
+| laspy | LAS point cloud I/O |
+| joblib, tqdm | Model persistence, progress bars |
+| cupy-cuda11x, cuml-cu11 (optional) | GPU Random Forest via RAPIDS, `--build-arg WITH_RAPIDS=1` |

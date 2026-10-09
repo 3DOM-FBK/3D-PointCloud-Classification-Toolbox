@@ -57,14 +57,25 @@ sudo systemctl restart docker
 
 ## Building the Docker Image
 
-The `Dockerfile` uses a **multi-stage build**:
+The `Dockerfile` builds a **lean runtime image (linux/amd64, ~0.8 GB)** on `ubuntu:22.04`.
+Nothing is compiled during the build: the eight C++ binaries are the prebuilt ones in `opt/`.
 
-- **Stage 1 — builder** (`nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04`): compiles
-  LASzip, laz-perf, GDAL 3.6.2, and PDAL 2.7.1 from source, then builds all eight
-  C++ processing binaries.
-- **Stage 2 — runtime** (`nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04`): installs
-  Python 3.10, runtime system libraries, and Python packages (including PyTorch 2.3.0
-  + CUDA 11.8 and RAPIDS cuML), then copies the compiled binaries from Stage 1.
+- **`pydeps`**: a Python 3.10 virtual environment with the packages of `requirements.txt`
+  (Django, gunicorn, whitenoise, numpy, scipy, scikit-learn, joblib, laspy, tqdm), without
+  pip/setuptools and test suites.
+- **`open3d`**: downloads the Open3D 0.19 release (SHA-256 checked) and keeps only
+  `libOpen3D.so` and `libtbb`, used by `ply2las`, `subsample_pc` and `mesh2pc`.
+- **`app`**: the Django project with the static files already collected; of the BabylonJS
+  distribution only the three bundles loaded by the page are kept (no editors, inspector,
+  physics, codecs, source maps).
+- **runtime**: Python 3.10 and the shared libraries the binaries link against (libgomp,
+  libpcl-common 1.12, libomp/libc++, GMP/MPFR, libX11 and the GLVND libGL — without Mesa/LLVM).
+
+There is no CUDA toolkit or CUDA runtime in the image: `feature_extraction_viewer_gpu` links the
+CUDA runtime statically and only needs the NVIDIA driver, which the NVIDIA Container Toolkit
+injects with `--gpus all` (the image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility`).
+Not included any more: PDAL/GDAL/LASzip, PyTorch, pandas, trimesh, pygltflib, rtree and the Python
+Open3D wheel (none is used by the code).
 
 ### Standard build
 
@@ -72,18 +83,22 @@ The `Dockerfile` uses a **multi-stage build**:
 docker build -t 3d-classify-viewer .
 ```
 
-### Build with parallel compilation (recommended)
+### Optional: GPU Random Forest (RAPIDS cuML)
 
-Set `NUM_THREADS` to the number of available CPU cores to speed up the C++ compilation:
+Training/classification with `--use_gpu` uses cuML when it is installed; without it the code
+falls back to scikit-learn on the CPU (a model pickled by cuML cannot be loaded without cuML).
+cuML adds several GB to the image, so it is opt-in:
 
 ```bash
-docker build --build-arg NUM_THREADS=16 -t 3d-classify-viewer .
+docker build --build-arg WITH_RAPIDS=1 -t 3d-classify-viewer .
 ```
 
-> **Note:** The first build takes 20–40 minutes depending on network speed and CPU
-> core count, as it compiles GDAL, PDAL, and multiple C++ binaries from source.
-> Subsequent builds benefit from Docker layer cache and complete significantly faster
-> when only Python or Django files are changed.
+RAPIDS 25.06 is the last release with CUDA 11 wheels, so the build pins `cuml-cu11==25.6.*`
+and the CUDA 11.8 setup of the C++ GPU binary stays untouched. This path is not exercised by the
+default build.
+
+> **Note:** a build takes a few minutes (it only downloads packages and the Open3D release);
+> Docker caches each stage, so changing `classifyViewer/` or `opt/` rebuilds only the last layers.
 
 ---
 
@@ -215,10 +230,10 @@ Expected: the NVIDIA GPU, driver version, and CUDA version are listed.
 ### Check runtime libraries
 
 ```bash
-docker exec classify-viewer ldconfig -p | grep -E 'gdal|pdal|laszip|pcl'
+docker exec classify-viewer sh -c 'for f in /webapp/opt/*; do echo "$f: $(ldd $f | grep -c "not found") missing"; done'
 ```
 
-Expected: entries for `libgdal`, `libpdal_base`, `liblaszip`, and `libpcl_*`.
+Expected: `0 missing` for every binary (they link only against libgomp, `libpcl_common`, Open3D, libc++, GMP/MPFR and libGL).
 
 ### Check C++ binaries
 
@@ -226,18 +241,19 @@ Expected: entries for `libgdal`, `libpdal_base`, `liblaszip`, and `libpcl_*`.
 docker exec classify-viewer ls -la /webapp/opt/
 ```
 
-Expected: seven executable files — `feature_extraction_viewer_gpu`,
+Expected: eight executable files — `las2pc`, `feature_extraction_viewer_gpu`,
 `feature_extraction_viewer_cpu`, `subsample_pc`, `mesh2pc`, `ply2las`,
 `split_las_by_binary`, `check_point_id`.
 
-### Check Python / CUDA environment
+### Check Python and the GPU driver
 
 ```bash
-docker exec classify-viewer python3 -c "import torch; print(torch.cuda.is_available())"
+docker exec classify-viewer python3 -c "import django, numpy, scipy, sklearn, laspy; print('python ok')"
+docker exec classify-viewer ls /usr/lib/x86_64-linux-gnu/libcuda.so.1
 ```
 
-Expected output: `True` when a CUDA-capable GPU is present and the driver is correctly
-configured.
+Expected: `python ok`, and `libcuda.so.1` present when the container was started with `--gpus all`
+(it is injected by the NVIDIA Container Toolkit; it is not part of the image).
 
 ---
 

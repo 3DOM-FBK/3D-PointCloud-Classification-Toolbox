@@ -8,3 +8,4 @@
 # Benchmark and test harness of the out-of-core pipeline (Docker-based, not part of the application)
 /testC++/bench/
 /testC++/ooc/
+/tests/
