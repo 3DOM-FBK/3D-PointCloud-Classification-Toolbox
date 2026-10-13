@@ -24,9 +24,10 @@
 | CPU | Multi-core (≥ 8 cores recommended to speed up the C++ build stage) |
 | Disk | ≥ 20 GB free for the Docker image plus runtime data |
 
-> **CPU-only mode:** The application automatically falls back to the CPU binary
-> (`feature_extraction_viewer_cpu`) when no CUDA-capable GPU is detected. Feature
-> extraction and Random Forest inference will be significantly slower.
+> **CPU-only mode:** `feature_extraction_viewer` falls back to its CPU backend by itself
+> (`--backend auto`) when no usable CUDA device is detected. The CPU backend uses all the
+> CPUs the container may use (`--cpus` is honoured) and AVX2/AVX-512 when the CPU has them;
+> it is slower than the GPU, and Random Forest inference stays CPU-bound anyway.
 
 ---
 
@@ -69,9 +70,9 @@ Nothing is compiled during the build: the eight C++ binaries are the prebuilt on
   distribution only the three bundles loaded by the page are kept (no editors, inspector,
   physics, codecs, source maps).
 - **runtime**: Python 3.10 and the shared libraries the binaries link against (libgomp,
-  libpcl-common 1.12, libomp/libc++, GMP/MPFR, libX11 and the GLVND libGL — without Mesa/LLVM).
+  libomp/libc++, GMP/MPFR, libX11 and the GLVND libGL — without Mesa/LLVM).
 
-There is no CUDA toolkit or CUDA runtime in the image: `feature_extraction_viewer_gpu` links the
+There is no CUDA toolkit or CUDA runtime in the image: `feature_extraction_viewer` links the
 CUDA runtime statically and only needs the NVIDIA driver, which the NVIDIA Container Toolkit
 injects with `--gpus all` (the image sets `NVIDIA_DRIVER_CAPABILITIES=compute,utility`).
 Not included any more: PDAL/GDAL/LASzip, PyTorch, pandas, trimesh, pygltflib, rtree and the Python
@@ -233,7 +234,7 @@ Expected: the NVIDIA GPU, driver version, and CUDA version are listed.
 docker exec classify-viewer sh -c 'for f in /webapp/opt/*; do echo "$f: $(ldd $f | grep -c "not found") missing"; done'
 ```
 
-Expected: `0 missing` for every binary (they link only against libgomp, `libpcl_common`, Open3D, libc++, GMP/MPFR and libGL).
+Expected: `0 missing` for every binary (they link only against libgomp, Open3D, libc++, GMP/MPFR and libGL).
 
 ### Check C++ binaries
 
@@ -241,8 +242,8 @@ Expected: `0 missing` for every binary (they link only against libgomp, `libpcl_
 docker exec classify-viewer ls -la /webapp/opt/
 ```
 
-Expected: eight executable files — `las2pc`, `feature_extraction_viewer_gpu`,
-`feature_extraction_viewer_cpu`, `subsample_pc`, `mesh2pc`, `ply2las`,
+Expected: seven executable files — `las2pc`, `feature_extraction_viewer`,
+`subsample_pc`, `mesh2pc`, `ply2las`,
 `split_las_by_binary`, `check_point_id`.
 
 ### Check Python and the GPU driver

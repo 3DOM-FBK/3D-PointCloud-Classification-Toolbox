@@ -140,8 +140,7 @@ docker run -d -p 8000:8000 --gpus all --memory 8g --memory-swap 8g \n  -e PIPELI
 │           ├── viewer_page.html    # Main 3D viewer page
 │           └── docs_page.html      # In-app documentation page
 └── opt/                            # Pre-compiled C++ processing binaries
-    ├── feature_extraction_viewer_gpu
-    ├── feature_extraction_viewer_cpu
+    ├── feature_extraction_viewer
     ├── subsample_pc
     ├── mesh2pc
     ├── ply2las

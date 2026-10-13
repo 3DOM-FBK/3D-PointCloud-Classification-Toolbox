@@ -2860,8 +2860,118 @@ if (navFileBtn && fileDropdown) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FRAME PROFILER (console):  pcPerf.start()  ... zoom / pan ...  pcPerf.stop()
+// Explains the "[Violation] 'requestAnimationFrame' handler took N ms" messages: they only say that scene.render()
+// (plus everything that runs inside it) blocked the main thread for more than ~50 ms. Per frame this records
+//   js        time of scene.render() on the main thread (what Chrome reports)
+//   active    Babylon's evaluation of the active meshes (culling, world matrices)
+//   update    ChunkedPointCloudLoader.update() when it ran INSIDE the frame (camera observers call it from render())
+//   gpu       GPU time of the frame (EXT_disjoint_timer_query; only where the browser exposes it)
+//   draws / meshes / points  draw calls, active meshes, points the loader asked to draw
+// and, outside the frames, how long the loader needed to build meshes (the main-thread cost of a chunk arriving).
+// pcPerf.stop() prints a table (median / p95 / max) and the slowest frames, and returns the raw data.
+// ---------------------------------------------------------------------------
+window.pcPerf = (() => {
+    let on = false, frames = [], cur = null, sceneInst = null, gpuInst = null;
+    let updMs = 0, updOutsideMs = 0, updCalls = 0, meshBuilds = [], colorApplies = [];
+    let restore = [];
+    const q = (a, p) => { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+    const wrap = (obj, name, fn) => {
+        const orig = obj[name];
+        obj[name] = function (...args) { return fn(orig, this, args); };
+        restore.push(() => { obj[name] = orig; });
+    };
+    return {
+        get active() { return on; },
+        start() {
+            if (on) return 'already running';
+            on = true; frames = []; meshBuilds = []; colorApplies = []; updMs = 0; updOutsideMs = 0; updCalls = 0;
+            try {
+                sceneInst = new BABYLON.SceneInstrumentation(scene);
+                sceneInst.captureFrameTime = true;
+                sceneInst.captureRenderTime = true;
+                sceneInst.captureActiveMeshesEvaluationTime = true;
+            } catch (e) { sceneInst = null; }
+            try {
+                gpuInst = new BABYLON.EngineInstrumentation(engine);
+                gpuInst.captureGPUFrameTime = true;
+            } catch (e) { gpuInst = null; }
+            const L = scene.pointCloudLoader;
+            if (L) {
+                wrap(L, 'update', (orig, self, args) => {
+                    const t = performance.now();
+                    try { return orig.apply(self, args); } finally {
+                        const d = performance.now() - t;
+                        updCalls++;
+                        if (cur) updMs += d; else updOutsideMs += d;
+                    }
+                });
+                wrap(L, '_applyColorModeToMesh', (orig, self, args) => {
+                    const t = performance.now();
+                    try { return orig.apply(self, args); } finally { colorApplies.push({ ms: performance.now() - t, points: args[0]?.getTotalVertices ? args[0].getTotalVertices() : 0, inFrame: !!cur }); }
+                });
+                wrap(L, '_createMeshFromDecoded', (orig, self, args) => {
+                    const t = performance.now();
+                    try { return orig.apply(self, args); } finally {
+                        meshBuilds.push({ ms: performance.now() - t, points: args[1]?.positions ? args[1].positions.length / 3 : 0 });
+                    }
+                });
+            }
+            return 'pcPerf running: zoom / pan now, then call pcPerf.stop()';
+        },
+        // called by the render loop around scene.render()
+        frame(renderFn) {
+            if (!on) { renderFn(); return; }
+            cur = { };
+            updMs = 0;
+            const t = performance.now();
+            renderFn();
+            const js = performance.now() - t;
+            const L = scene.pointCloudLoader;
+            frames.push({
+                js, update: updMs,
+                active: sceneInst ? sceneInst.activeMeshesEvaluationTimeCounter.current : 0,
+                render: sceneInst ? sceneInst.renderTimeCounter.current : 0,
+                gpu: gpuInst ? gpuInst.gpuFrameTimeCounter.current / 1e6 : 0,
+                draws: sceneInst ? sceneInst.drawCallsCounter.current : 0,
+                meshes: scene.getActiveMeshes().length,
+                points: L ? L.stats.totalPointsRendered : 0,
+                t: performance.now()
+            });
+            cur = null;
+        },
+        stop() {
+            if (!on) return 'not running';
+            on = false;
+            restore.forEach(r => r()); restore = [];
+            const hasGpu = frames.some(f => f.gpu > 0);
+            try { sceneInst && sceneInst.dispose(); gpuInst && gpuInst.dispose(); } catch (e) { /* ignore */ }
+            const col = (k) => frames.map(f => f[k]);
+            const row = (name, k, unit = ' ms') => ({ metric: name + unit, median: +q(col(k), 0.5).toFixed(2), p95: +q(col(k), 0.95).toFixed(2), max: +q(col(k), 1).toFixed(2) });
+            const table = [row('js (scene.render)', 'js'), row('active meshes', 'active'), row('loader.update in frame', 'update'),
+                row('render (babylon)', 'render'), hasGpu ? row('gpu', 'gpu') : { metric: 'gpu: not available in this browser', median: 0, p95: 0, max: 0 },
+                row('draw calls', 'draws', ''), row('active meshes (count)', 'meshes', ''), row('points drawn', 'points', '')];
+            const slow = frames.filter(f => f.js > 50).sort((a, b) => b.js - a.js).slice(0, 8)
+                .map(f => ({ js: +f.js.toFixed(1), update: +f.update.toFixed(1), active: +f.active.toFixed(1), gpu: +f.gpu.toFixed(1), draws: f.draws, meshes: f.meshes, points: f.points }));
+            const builds = meshBuilds.map(b => b.ms);
+            const summary = {
+                frames: frames.length, slowFramesOver50ms: frames.filter(f => f.js > 50).length,
+                updateCalls: updCalls, updateInFrameTotalMs: +frames.reduce((s, f) => s + f.update, 0).toFixed(1), updateOutsideFramesMs: +updOutsideMs.toFixed(1),
+                meshBuilds: meshBuilds.length, meshBuildMedianMs: +q(builds, 0.5).toFixed(1), meshBuildMaxMs: +q(builds, 1).toFixed(1),
+                meshBuildMaxPoints: meshBuilds.reduce((m, b) => Math.max(m, b.points), 0),
+                colorReapplies: colorApplies.length, colorReapplyTotalMs: +colorApplies.reduce((s, c) => s + c.ms, 0).toFixed(1), colorReapplyPoints: colorApplies.reduce((s, c) => s + c.points, 0)
+            };
+            console.table(table);
+            console.log('slowest frames (> 50 ms):'); console.table(slow);
+            console.log('loader:', summary);
+            return { table, slow, summary, frames };
+        }
+    };
+})();
+
 engine.runRenderLoop(() => {
-    scene.render();
+    window.pcPerf.frame(() => scene.render());
     if (fpsCounterDisplay) {
         fpsCounterDisplay.textContent = engine.getFps().toFixed(0);
     }

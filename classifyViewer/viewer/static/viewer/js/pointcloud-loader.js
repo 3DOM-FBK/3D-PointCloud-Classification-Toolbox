@@ -23,6 +23,7 @@ import { makeLodModel, lodCountFor, lodSpacingAt } from './pointcloud-lod.js';
 /** A point is dropped when its projected spacing is below DRAW_MIN_RATIO * threshold; between that
  *  and the threshold it is drawn smaller (transition band). */
 const DRAW_MIN_RATIO = 0.7;
+const EMPTY_LIST = Object.freeze([]);   // default deselection list (a stable identity: the matcher cache is keyed on it)
 const PREFETCH_MARGIN = 1.25;            // fetch up to need * margin
 const MIN_REQUEST_GAP_POINTS = 1024;     // a shortfall smaller than this is not worth a request (each request prefetches 25 % more)
 const MAX_REQUEST_POINTS = 256 * 1024;   // points per request (keeps one connection from being monopolised)
@@ -227,6 +228,10 @@ export class ChunkedPointCloudLoader {
         this.debugWatchPointId = Number.isInteger(options.debugWatchPointId)
             ? options.debugWatchPointId : null;
         this._segmentRevision = 0;
+        // Bumped whenever something that changes the vertex colours changes (colour mode, selection, classes). A mesh that comes
+        // back into view is recoloured only if its metadata.colorRev is older: re-running the per-point colour pass (up to 256 k
+        // points and a GPU upload per mesh) on every zoom step blocked the render loop for 100-250 ms.
+        this._colorRev = 0;
 
         // Kept for API compatibility: eviction is now driven by the point budget (maxLoadedPoints)
         this.autoCleanupEnabled = options.autoCleanupEnabled === true;
@@ -366,6 +371,7 @@ export class ChunkedPointCloudLoader {
      * Per-point maps are only transferred if the point count is identical.
      */
     importState(state) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (!state) return;
         const sameCloud = state.points === null || state.points === this.metadata.points;
 
@@ -740,7 +746,7 @@ export class ChunkedPointCloudLoader {
                     meshRevision: mesh.metadata?.segmentRevision,
                     currentRevision: this._segmentRevision
                 });
-                this._applyColorModeToMesh(mesh);
+                if (mesh.metadata.colorRev !== this._colorRev) this._applyColorModeToMesh(mesh);
                 this._applySegmentVisibilityToMesh(mesh);
             }
 
@@ -1054,6 +1060,7 @@ export class ChunkedPointCloudLoader {
      * so newly loaded LOD nodes immediately use the correct colors.
      */
     setColorMode(mode) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         const wasFeature = this.colorMode.startsWith('feature:');
         const isFeature = mode.startsWith('feature:');
         this.colorMode = mode;
@@ -1248,6 +1255,7 @@ export class ChunkedPointCloudLoader {
      * colours always hold the classification / original colours.)
      */
     _applyColorModeToMesh(mesh) {
+        if (mesh.metadata) mesh.metadata.colorRev = this._colorRev;
         const colors = mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
         if (!colors) return;
 
@@ -1885,6 +1893,7 @@ export class ChunkedPointCloudLoader {
             nodeBoundingBox: node.boundingBox,
             segmentRevision: this._segmentRevision,
             lastUsedTick: this._tick,
+            colorRev: this._colorRev,
             featureName: null,
             featureEpoch: -1,
             featureReady: false
@@ -1917,46 +1926,197 @@ export class ChunkedPointCloudLoader {
         );
     }
 
-    _matchesSelectionEntry(localVector, selections, deselections = [], inverted = false) {
-        const worldMatrix = this.rootTransform.getWorldMatrix();
-        this._tmpProj = this._tmpProj || new BABYLON.Vector3();
+    // ----- screen-space tests of the selection regions -----
+    //
+    // BABYLON.Vector3.ProjectToRef rebuilds the viewport matrix and multiplies world x transform x viewport (two 4x4
+    // products) at EVERY call, and the polygon test allocated an array per point and walked every vertex: with millions of
+    // loaded points a selection or a delete blocked the main thread for hundreds of ms. Here the matrix is built once per
+    // mesh and region, and a polygon gets a bitmap of its bounding box whose cells are inside / outside / on the outline; only
+    // the outline cells run the exact vertex loop, so the answers are those of the original test.
 
-        let selected = false;
-        for (const sel of selections) {
-            BABYLON.Vector3.ProjectToRef(localVector, worldMatrix, sel.transformMatrix, sel.viewport, this._tmpProj);
-            if (sel.type === "rect") {
-                if (this._tmpProj.x >= sel.area.x && this._tmpProj.x <= sel.area.x + sel.area.width &&
-                    this._tmpProj.y >= sel.area.y && this._tmpProj.y <= sel.area.y + sel.area.height) {
-                    selected = true;
-                    break;
-                }
-            } else if (sel.type === "lasso" || sel.type === "polygon") {
-                if (this._isPointInPoly(sel.area, [this._tmpProj.x, this._tmpProj.y])) {
-                    selected = true;
-                    break;
+    /** world x transform x viewport, the same three factors (and rounding) as BABYLON.Vector3.ProjectToRef. */
+    _projectionMatrix(world, transform, viewport) {
+        const vp = BABYLON.Matrix.FromValues(
+            viewport.width / 2, 0, 0, 0,
+            0, -viewport.height / 2, 0, 0,
+            0, 0, 0.5, 0,
+            viewport.x + viewport.width / 2, viewport.height / 2 + viewport.y, 0.5, 1);
+        const m = new BABYLON.Matrix();
+        world.multiplyToRef(transform, m);
+        m.multiplyToRef(vp, m);
+        return m.m;
+    }
+
+    /** Same result as the ray-casting test the loader always used (no allocation). */
+    _polyContains(poly, x, y) {
+        let inside = false;
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            const xi = poly[i][0], yi = poly[i][1];
+            const xj = poly[j][0], yj = poly[j][1];
+            if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+        }
+        return inside;
+    }
+
+    _isPointInPoly(poly, pt) {
+        return this._polyContains(poly, pt[0], pt[1]);
+    }
+
+    /**
+     * Bounding box (and, for polygons with many vertices, the inside/outside/outline bitmap) of the screen area of a
+     * selection entry. Cached per entry: entries are immutable once pushed to a history.
+     */
+    _areaInfo(entry) {
+        if (!this._areaInfoCache) this._areaInfoCache = new WeakMap();
+        let info = this._areaInfoCache.get(entry);
+        if (info) return info;
+        info = { minX: -Infinity, maxX: Infinity, minY: -Infinity, maxY: Infinity, width: 0, height: 0, mask: null };
+        const a = entry.area;
+        if (entry.type === 'rect') {
+            info.minX = a.x; info.maxX = a.x + a.width; info.minY = a.y; info.maxY = a.y + a.height;
+        } else if ((entry.type === 'lasso' || entry.type === 'polygon') && a.length > 0) {
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+            for (const p of a) {
+                if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0];
+                if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1];
+            }
+            info.minX = minX; info.maxX = maxX; info.minY = minY; info.maxY = maxY;
+            const width = Math.floor(maxX - minX) + 1, height = Math.floor(maxY - minY) + 1;
+            if (a.length > 8 && width * height <= 8e6) {
+                info.width = width; info.height = height;
+                info.mask = this._buildPolyMask(a, minX, minY, width, height);
+            }
+        }
+        this._areaInfoCache.set(entry, info);
+        return info;
+    }
+
+    /** 0 = outside, 1 = inside, 2 = the outline passes through (or next to) the cell: use the exact test. */
+    _buildPolyMask(poly, minX, minY, width, height) {
+        const mask = new Uint8Array(width * height);
+        const n = poly.length;
+        // outline cells: a sample every 0.5 px along every edge marks its cell and the 8 around it, so a cell touched by an
+        // edge (even by a corner) is always an outline cell
+        for (let i = 0, j = n - 1; i < n; j = i++) {
+            const x0 = poly[j][0], y0 = poly[j][1], x1 = poly[i][0], y1 = poly[i][1];
+            const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 0.5) + 1;
+            for (let s = 0; s <= steps; s++) {
+                const t = s / steps;
+                const cx = Math.floor(x0 + (x1 - x0) * t - minX), cy = Math.floor(y0 + (y1 - y0) * t - minY);
+                for (let dy = -1; dy <= 1; dy++) {
+                    const yy = cy + dy;
+                    if (yy < 0 || yy >= height) continue;
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const xx = cx + dx;
+                        if (xx >= 0 && xx < width) mask[yy * width + xx] = 2;
+                    }
                 }
             }
         }
-
-        if (selected) {
-            for (const dsel of deselections) {
-                BABYLON.Vector3.ProjectToRef(localVector, worldMatrix, dsel.transformMatrix, dsel.viewport, this._tmpProj);
-                if (dsel.type === "rect") {
-                    if (this._tmpProj.x >= dsel.area.x && this._tmpProj.x <= dsel.area.x + dsel.area.width &&
-                        this._tmpProj.y >= dsel.area.y && this._tmpProj.y <= dsel.area.y + dsel.area.height) {
-                        selected = false;
-                        break;
-                    }
-                } else if (dsel.type === "lasso" || dsel.type === "polygon") {
-                    if (this._isPointInPoly(dsel.area, [this._tmpProj.x, this._tmpProj.y])) {
-                        selected = false;
-                        break;
-                    }
-                }
+        // the other cells: no edge crosses them, so the parity at the cell centre (same rule as the exact test) holds for the cell
+        const xs = [];
+        for (let cy = 0; cy < height; cy++) {
+            const yc = minY + cy + 0.5;
+            xs.length = 0;
+            for (let i = 0, j = n - 1; i < n; j = i++) {
+                const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+                if ((yi > yc) !== (yj > yc)) xs.push((xj - xi) * (yc - yi) / (yj - yi) + xi);
+            }
+            if (xs.length === 0) continue;
+            xs.sort((p, q) => p - q);
+            let k = 0;
+            const row = cy * width;
+            for (let cx = 0; cx < width; cx++) {
+                const xc = minX + cx + 0.5;
+                while (k < xs.length && xs[k] <= xc) k++;
+                if (mask[row + cx] !== 2 && ((xs.length - k) & 1)) mask[row + cx] = 1;
             }
         }
+        return mask;
+    }
 
-        return inverted ? !selected : selected;
+    /** Is the screen point (sx, sy) inside the area of `entry`? `info` = this._areaInfo(entry). NaN is never inside. */
+    _inArea(entry, info, sx, sy) {
+        if (!(sx >= info.minX && sx <= info.maxX && sy >= info.minY && sy <= info.maxY)) return false;
+        if (entry.type === 'rect') return true;
+        if (entry.type !== 'lasso' && entry.type !== 'polygon') return false;
+        if (info.mask) {
+            const v = info.mask[Math.floor(sy - info.minY) * info.width + Math.floor(sx - info.minX)];
+            if (v !== 2) return v === 1;
+        }
+        return this._polyContains(entry.area, sx, sy);
+    }
+
+    /**
+     * False only when NO point of `mesh` can be inside the entry: the screen box of the mesh's bounding box does not meet the
+     * area (a corner behind the camera disables the test). Lets a selection skip the meshes that are out of the region.
+     */
+    _entryMayTouchMesh(mesh, m, info) {
+        const bb = mesh.getBoundingInfo()?.boundingBox;
+        if (!bb) return true;
+        const lo = bb.minimum, hi = bb.maximum;
+        let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+        for (let c = 0; c < 8; c++) {
+            const x = (c & 1) ? hi.x : lo.x, y = (c & 2) ? hi.y : lo.y, z = (c & 4) ? hi.z : lo.z;
+            const w = x * m[3] + y * m[7] + z * m[11] + m[15];
+            if (!(w > 0)) return true;
+            const rw = 1 / w;
+            const sx = (x * m[0] + y * m[4] + z * m[8] + m[12]) * rw;
+            const sy = (x * m[1] + y * m[5] + z * m[9] + m[13]) * rw;
+            if (sx < x0) x0 = sx; if (sx > x1) x1 = sx;
+            if (sy < y0) y0 = sy; if (sy > y1) y1 = sy;
+        }
+        // a box whose corners are NaN (e.g. a refreshed bounding box of hidden points) compares false: keep the mesh
+        return !(x1 < info.minX || x0 > info.maxX || y1 < info.minY || y0 > info.maxY);
+    }
+
+    /**
+     * (x, y, z) => boolean for points in the local space of the root transform; the same answer as the original
+     * per-point test: in some selection region, in none of the deselection regions, flipped when `inverted`.
+     */
+    _selectionMatcher(selections, deselections, inverted, world) {
+        const prep = (list) => list.map(e => ({
+            e, info: this._areaInfo(e), m: this._projectionMatrix(world, e.transformMatrix, e.viewport)
+        }));
+        const S = prep(selections), D = deselections.length ? prep(deselections) : [];
+        const inAny = (list, x, y, z) => {
+            for (let k = 0; k < list.length; k++) {
+                const m = list[k].m;
+                const rw = 1 / (x * m[3] + y * m[7] + z * m[11] + m[15]);
+                if (this._inArea(list[k].e, list[k].info, (x * m[0] + y * m[4] + z * m[8] + m[12]) * rw, (x * m[1] + y * m[5] + z * m[9] + m[13]) * rw)) return true;
+            }
+            return false;
+        };
+        return (x, y, z) => {
+            let selected = inAny(S, x, y, z);
+            if (selected && D.length && inAny(D, x, y, z)) selected = false;
+            return inverted ? !selected : selected;
+        };
+    }
+
+    /** False only when the selection (not inverted) cannot contain any point of the mesh. */
+    _selectionMayTouchMesh(mesh, selections, inverted, world) {
+        if (inverted) return true;
+        for (const e of selections) {
+            if (this._entryMayTouchMesh(mesh, this._projectionMatrix(world, e.transformMatrix, e.viewport), this._areaInfo(e))) return true;
+        }
+        return false;
+    }
+
+    _matchesSelectionEntry(localVector, selections, deselections = EMPTY_LIST, inverted = false) {
+        const world = this.rootTransform.getWorldMatrix();
+        if (!this._matcherCache) this._matcherCache = new WeakMap();
+        // the history arrays are mutated in place (push): the length and the last entry are part of the key
+        let c = this._matcherCache.get(selections);
+        if (!c || c.deselections !== deselections || c.nS !== selections.length || c.nD !== deselections.length ||
+            c.last !== selections[selections.length - 1] || c.inverted !== inverted || c.world !== world || c.flag !== world.updateFlag) {
+            c = {
+                deselections, nS: selections.length, nD: deselections.length, last: selections[selections.length - 1],
+                inverted, world, flag: world.updateFlag, fn: this._selectionMatcher(selections, deselections, inverted, world)
+            };
+            this._matcherCache.set(selections, c);
+        }
+        return c.fn(localVector.x, localVector.y, localVector.z);
     }
 
     /**
@@ -2008,18 +2168,6 @@ export class ChunkedPointCloudLoader {
         return finalCls;
     }
 
-    _isPointInPoly(poly, pt) {
-        const x = pt[0], y = pt[1];
-        let inside = false;
-        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-            const xi = poly[i][0], yi = poly[i][1];
-            const xj = poly[j][0], yj = poly[j][1];
-            const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-            if (intersect) inside = !inside;
-        }
-        return inside;
-    }
-
     // ========== CLASSIFICATION ==========
 
     /**
@@ -2045,6 +2193,7 @@ export class ChunkedPointCloudLoader {
      * @returns {number} total points classified
      */
     applyClassToLoadedNodes(classId, r, g, b) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (this.selectionHistory.length === 0) {
             console.warn("⚠️ No active selection to classify. Select points first.");
             return 0;
@@ -2062,7 +2211,7 @@ export class ChunkedPointCloudLoader {
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         let anyClassified = false;
 
-        const tmpVec = new BABYLON.Vector3();
+        const matches = this._selectionMatcher(this.selectionHistory, this.deselectionHistory, this.selectionInverted, worldMatrix);
 
         this.loadedNodes.forEach((mesh) => {
             const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
@@ -2078,14 +2227,7 @@ export class ChunkedPointCloudLoader {
                 // Skip invisible points (NaN-masked)
                 if (isNaN(positions[i * 3])) continue;
 
-                tmpVec.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
-
-                const isInside = this._matchesSelectionEntry(
-                    tmpVec,
-                    this.selectionHistory,
-                    this.deselectionHistory,
-                    this.selectionInverted
-                );
+                const isInside = matches(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
 
                 if (isInside) {
                     const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
@@ -2170,6 +2312,7 @@ export class ChunkedPointCloudLoader {
      * Store a selection region and highlight matching points in red.
      */
     applySelection(type, area, append = false) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (!this.scene.activeCamera) return 0;
 
         // A new drag-selection starts a new selection session.
@@ -2189,30 +2332,23 @@ export class ChunkedPointCloudLoader {
 
         let totalSelected = 0;
 
-        const tmpVec = new BABYLON.Vector3();
-        const tmpProj = new BABYLON.Vector3();
+        const entry = this.selectionHistory[this.selectionHistory.length - 1];
+        const info = this._areaInfo(entry);
 
         this.loadedNodes.forEach((mesh) => {
             const colors = mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
             const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
             if (!colors || !positions) return;
 
+            const m = this._projectionMatrix(mesh.getWorldMatrix(), transformMatrix, viewport);
+            if (!this._entryMayTouchMesh(mesh, m, info)) return;   // the mesh is entirely outside the region
+
             let modified = false;
-            const meshWorldMatrix = mesh.getWorldMatrix();
-
-            for (let i = 0; i < positions.length / 3; i++) {
-                tmpVec.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
-                BABYLON.Vector3.ProjectToRef(tmpVec, meshWorldMatrix, transformMatrix, viewport, tmpProj);
-
-                let isInside = false;
-                if (type === "rect") {
-                    isInside = (tmpProj.x >= area.x && tmpProj.x <= area.x + area.width &&
-                        tmpProj.y >= area.y && tmpProj.y <= area.y + area.height);
-                } else if (type === "lasso" || type === "polygon") {
-                    isInside = this._isPointInPoly(area, [tmpProj.x, tmpProj.y]);
-                }
-
-                if (isInside) {
+            const n = positions.length / 3;
+            for (let i = 0; i < n; i++) {
+                const x = positions[i * 3], y = positions[i * 3 + 1], z = positions[i * 3 + 2];
+                const rw = 1 / (x * m[3] + y * m[7] + z * m[11] + m[15]);
+                if (this._inArea(entry, info, (x * m[0] + y * m[4] + z * m[8] + m[12]) * rw, (x * m[1] + y * m[5] + z * m[9] + m[13]) * rw)) {
                     colors[i * 4 + 0] = 1.0;
                     colors[i * 4 + 1] = 0.0;
                     colors[i * 4 + 2] = 0.0;
@@ -2232,6 +2368,7 @@ export class ChunkedPointCloudLoader {
      * @param {string} hexColor - The new hex color string.
      */
     updateClassColor(classId, hexColor) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         // 1. Convert hex to RGB float
         const h = hexColor.replace('#', '');
         const r = parseInt(h.slice(0, 2), 16) / 255;
@@ -2283,6 +2420,7 @@ export class ChunkedPointCloudLoader {
      * @returns {number} number of points affected in loaded meshes.
      */
     removeClass(classId) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         // Remove all events of this class from history (also affects future LOD nodes).
         this.classificationHistory = this.classificationHistory.filter(entry => entry.classId !== classId);
         this._classColorLUT.delete(classId);
@@ -2366,6 +2504,7 @@ export class ChunkedPointCloudLoader {
      * @returns {{ segmentId: number, count: number } | null}
      */
     cutSelection() {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (this.selectionHistory.length === 0) {
             console.warn("⚠️ No active selection to cut.");
             return null;
@@ -2378,11 +2517,15 @@ export class ChunkedPointCloudLoader {
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         let anyAssigned = false;
 
-        const tmpVec = new BABYLON.Vector3();
+        const world = this.rootTransform.getWorldMatrix();
+        const inverted = this.selectionInverted;
 
         this.loadedNodes.forEach((mesh) => {
             const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
             if (!positions) return;
+            // a mesh that no region reaches has nothing to cut and no highlight to restore
+            if (!this._selectionMayTouchMesh(mesh, this.selectionHistory, inverted, world)) return;
+            const matches = this._selectionMatcher(this.selectionHistory, this.deselectionHistory, inverted, world);
 
             if (!mesh.metadata.segmentIds) {
                 mesh.metadata.segmentIds = new Int32Array(positions.length / 3);
@@ -2397,13 +2540,7 @@ export class ChunkedPointCloudLoader {
                 // which would wrongly capture every previously hidden point.
                 if (isNaN(positions[i * 3])) continue;
 
-                tmpVec.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
-                const isInside = this._matchesSelectionEntry(
-                    tmpVec,
-                    this.selectionHistory,
-                    this.deselectionHistory,
-                    this.selectionInverted
-                );
+                const isInside = matches(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
 
                 if (isInside) {
                     const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
@@ -2777,6 +2914,7 @@ export class ChunkedPointCloudLoader {
      * Does NOT touch classificationHistory — classifications are permanent until clearClassifications().
      */
     clearSelection() {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         this.selectionHistory = [];
         this.deselectionHistory = [];
         this.selectionInverted = false;
@@ -2817,6 +2955,7 @@ export class ChunkedPointCloudLoader {
      * Sets a flag so newly loaded LOD nodes are colored correctly too.
      */
     invertSelection() {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (this.selectionHistory.length === 0) {
             console.warn("⚠️ No active selection to invert.");
             return;
@@ -2872,6 +3011,7 @@ export class ChunkedPointCloudLoader {
      *   overlaps — keeping the history consistent.
      */
     removeSelection(type, area) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         if (!this.scene.activeCamera) return 0;
 
         const camera = this.scene.activeCamera;
@@ -2944,6 +3084,7 @@ export class ChunkedPointCloudLoader {
      * Clear all classifications. Resets classificationHistory and per-mesh class data.
      */
     clearClassifications() {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         this.classificationHistory = [];
         this._classColorLUT.clear();
         if (this._pointClassMap) this._pointClassMap.fill(0);
@@ -3426,11 +3567,16 @@ export class ChunkedPointCloudLoader {
         let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
         let anyAssigned = false;
 
-        const tmpVec = new BABYLON.Vector3();
+        const world = this.rootTransform.getWorldMatrix();
+        const inverted = this.selectionInverted;
 
         this.loadedNodes.forEach((mesh) => {
             const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
             if (!positions) return;
+            // a mesh that no region reaches has nothing to delete and no highlight to reset
+            if (!this._selectionMayTouchMesh(mesh, this.selectionHistory, inverted, world)) return;
+            const matches = this._selectionMatcher(this.selectionHistory, this.deselectionHistory, inverted, world);
+            let meshAssigned = false;
 
             if (!mesh.metadata.segmentIds) {
                 mesh.metadata.segmentIds = new Int32Array(positions.length / 3);
@@ -3440,13 +3586,7 @@ export class ChunkedPointCloudLoader {
             for (let i = 0; i < positions.length / 3; i++) {
                 if (isNaN(positions[i * 3])) continue; // already hidden — skip
 
-                tmpVec.set(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
-                const isInside = this._matchesSelectionEntry(
-                    tmpVec,
-                    this.selectionHistory,
-                    this.deselectionHistory,
-                    this.selectionInverted
-                );
+                const isInside = matches(positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]);
 
                 if (!isInside) continue;
 
@@ -3465,9 +3605,10 @@ export class ChunkedPointCloudLoader {
                 positions[i * 3 + 1] = NaN;
                 positions[i * 3 + 2] = NaN;
                 anyAssigned = true;
+                meshAssigned = true;
             }
 
-            if (anyAssigned) {
+            if (meshAssigned) {
                 this._setMeshPositionsAndNotify(mesh, positions);
             }
 
@@ -3646,6 +3787,7 @@ export class ChunkedPointCloudLoader {
     }
 
     _resetSelectionColors(mesh) {
+        this._colorRev++;   // hidden meshes are refreshed lazily when they come back into view (see update())
         const colors = mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
         if (!colors) return;
         const orgClrs = mesh.metadata.originalColors;

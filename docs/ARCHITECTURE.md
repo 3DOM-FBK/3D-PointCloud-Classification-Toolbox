@@ -140,8 +140,7 @@ arguments, and write all output to `runtime_data/working/`.
 
 | Binary | Purpose | Input | Output |
 |---|---|---|---|
-| `feature_extraction_viewer_gpu` | GPU-accelerated per-point geometric feature extraction (tiled, Thrust) | LAS | LAS with Extra Bytes |
-| `feature_extraction_viewer_cpu` | CPU-only feature extraction fallback (OpenMP) | LAS | LAS with Extra Bytes |
+| `feature_extraction_viewer` | Per-point geometric feature extraction (tiled, pipelined; CUDA GPU backend and CPU backend in one program, chosen at run time) | LAS | LAS with Extra Bytes |
 | `subsample_pc` | Voxel-grid downsampling | PLY / LAS | Subsampled file |
 | `mesh2pc` | Surface mesh → point cloud (uniform sampling) | GLB / GLTF / OBJ | LAS |
 | `ply2las` | PLY → LAS format conversion | PLY | LAS |
@@ -306,7 +305,7 @@ indexed by `POINT_ID`). Nothing else depends on the order of the records.
 |---|---|---|
 | Geometry + canonical LAS | `las2pc` | in memory (28 B/point + LAS in the page cache) when it fits, otherwise out-of-core: sequential count pass, one temp file per chunk, chunks processed by threads, `pwrite` at the final position; both give byte-identical files |
 | Columns | `pc_columns.py` | LAS read once in blocks; `fast` / `merge` / `join` paths |
-| Feature extraction | `feature_extraction_viewer_gpu` / `_cpu` | XY tiles sized from the budget (and the free VRAM): tile files with a buffer, one tile in memory (and on the GPU) at a time, record written at its input row; a tile that fails is split and retried |
+| Feature extraction | `feature_extraction_viewer` (GPU or CPU backend) | XY tiles sized from the budget (and the free VRAM): tile files with a buffer, one tile in memory (and on the GPU) at a time, record written at its input row; a tile that fails is split and retried |
 | Classification | `RF_classify.py` | blocks of points; output = input records + `prediction` |
 | Training | `RF_training.py` | only the selected features are loaded; stratified sampling by class above `--max_training_points` |
 | Split / segment extraction | `split_las_by_binary` | one pass, no PDAL; output records = input records (+ `labels`), same order |

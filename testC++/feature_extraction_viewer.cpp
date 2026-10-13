@@ -1,10 +1,10 @@
-// feature_extraction_viewer_gpu.cpp
-// GPU-accelerated tiled feature extraction for massive point clouds
-// No PCL dependency — all computation is done via CUDA kernels
+// feature_extraction_viewer.cpp (one program: GPU or CPU backend)
+// Tiled feature extraction for massive point clouds
+// No PCL dependency: the features are computed by ooc/feature_math.h on the GPU (gpu_features.cu) or the CPU (cpu_features.cpp)
 //
 // Out-of-core: the cloud is never loaded as a whole. The tile size comes from a point cap derived from the memory
-// budget and from the free VRAM, the points are distributed into one temporary file per tile (core + buffer), and the
-// tiles are computed one at a time (only that tile is uploaded to the GPU). The record of every core point is written
+// budget (and the free VRAM on the GPU), the points are distributed into one temporary file per tile (core + buffer), and
+// the tiles are computed by a pipeline (reader thread, up to --slots tiles in flight on the GPU or one on the CPU, writer thread). The record of every core point is written
 // at the SAME ROW it has in the input, so the output keeps the order of the input. A tile that fails is split and
 // retried; if a point cannot be written the run fails (it never leaves holes). See ooc/tile_pipeline.h.
 
@@ -23,11 +23,19 @@
 #include <array>
 #include <cstring>
 #include <sstream>
+#include <thread>
+#include <exception>
 
-#include <cuda_runtime.h>
 
+#include "cpu_features.h"
+#include "ooc/cpu_info.h"
+#ifdef FEATURES_WITH_CUDA
 #include "gpu_features.cuh"
+#endif
+#include "ooc/async_queue.h"
 #include "ooc/tile_pipeline.h"
+
+static const int kExitNoGpu = 3;      // no usable CUDA device: the caller falls back to the CPU extractor
 
 using TimePoint = std::chrono::time_point<std::chrono::high_resolution_clock>;
 TimePoint now_t() { return std::chrono::high_resolution_clock::now(); }
@@ -213,6 +221,18 @@ static std::array<uint8_t, 192> makeVlrDimRecord(const std::string& name, uint8_
 
 int main(int argc, char** argv)
 {
+    if (argc >= 2 && std::string(argv[1]) == "--probe") {      // GPU available? (exit code 0) -- used by the web app to choose the backend
+        std::cout << "cpus " << ooc::available_cpus() << std::endl;
+#ifdef FEATURES_WITH_CUDA
+        GpuDeviceInfo d = gpuQueryDevice();
+        if (!d.ok) { std::cout << "gpu none: " << d.error << std::endl; return kExitNoGpu; }
+        std::cout << "gpu " << d.name << " cc " << d.ccMajor << "." << d.ccMinor << " free_mb " << d.freeBytes / 1048576 << " total_mb " << d.totalBytes / 1048576 << std::endl;
+        return 0;
+#else
+        std::cout << "gpu none: built without CUDA" << std::endl;
+        return kExitNoGpu;
+#endif
+    }
     if (argc < 3) {
         std::cout << "\nUsage: " << argv[0] << " <input_file> <output_file> [options]\n"
                   << "Options:\n"
@@ -221,6 +241,9 @@ int main(int argc, char** argv)
                   << "  --target_tiles N        Auto-tiling target tile count (default 16)\n"
                   << "  --buffer B              Buffer in meters (default 4)\n"
                   << "  --radius r1,r2,...      Radius scales (default 0.8,1.2,2.0,3.0)\n"
+                  << "  --backend auto|gpu|cpu  Compute on the GPU when there is one (auto, default), always, or never\n"
+                  << "  --threads N             Host threads (default: the CPUs this process may use)\n"
+                  << "  --slots N               Tiles in flight on the GPU (default 2)\n"
                   << "  --memory-budget MB      Peak host memory (default: 50% of the available memory)\n"
                   << "  --temp-dir DIR          Scratch folder for the tile files\n";
         return 0;
@@ -234,6 +257,10 @@ int main(int argc, char** argv)
     double memoryBudgetMb = 0;
     std::string tempDir;
     int spillMode = -1;                          // --spill auto|always|never (always/never: tests)
+    int slotsOpt = 0;                            // --slots N: tiles in flight on the GPU
+    size_t failAbove = 0;                        // --test-fail-above N: tiles of more than N points "fail" (tests of the retry/split path)
+    std::string backendOpt = "auto";             // --backend auto|gpu|cpu
+    int threadsOpt = 0;                          // --threads N (default: the CPUs the process may use)
 
     for (int a = 3; a < argc; a++) {
         std::string arg(argv[a]);
@@ -257,6 +284,14 @@ int main(int argc, char** argv)
         } else if (arg == "--spill" && a + 1 < argc) {
             const std::string v = argv[++a];
             spillMode = v == "always" ? 1 : (v == "never" ? 0 : -1);
+        } else if (arg == "--backend" && a + 1 < argc) {
+            backendOpt = argv[++a];
+        } else if (arg == "--threads" && a + 1 < argc) {
+            threadsOpt = std::stoi(argv[++a]);
+        } else if (arg == "--test-fail-above" && a + 1 < argc) {
+            failAbove = (size_t)std::stoull(argv[++a]);
+        } else if (arg == "--slots" && a + 1 < argc) {
+            slotsOpt = std::stoi(argv[++a]);
         } else if (arg == "--temp-dir" && a + 1 < argc) {
             tempDir = argv[++a];
         }
@@ -375,20 +410,78 @@ int main(int argc, char** argv)
     // 4. Tile size from the memory caps (host budget and free VRAM)
     // ------------------------------------------------------------------
     const uint64_t budget = ooc::resolve_budget_bytes(memoryBudgetMb);
-    size_t vramFree = 0, vramTotal = 0;
-    if (cudaMemGetInfo(&vramFree, &vramTotal) != cudaSuccess) {
-        std::cerr << "ERROR: no CUDA device available" << std::endl;
-        return 1;
+
+    // Threads: the CPUs this process may really use (affinity and container quota), also for the host stages of the GPU path.
+    const int numThreads = threadsOpt > 0 ? threadsOpt : ooc::available_cpus();
+#ifdef _OPENMP
+    omp_set_num_threads(numThreads);
+#endif
+
+    // Backend: the GPU when a usable CUDA device exists (and --backend allows it), the CPU otherwise.
+    bool useGpu = false;
+#ifdef FEATURES_WITH_CUDA
+    GpuDeviceInfo dev;
+    if (backendOpt != "cpu") {
+        dev = gpuQueryDevice();
+        useGpu = dev.ok;
+        if (!dev.ok) {
+            if (backendOpt == "gpu") {
+                std::cerr << "ERROR: no usable CUDA device: " << dev.error << std::endl;
+                return kExitNoGpu;
+            }
+            std::cout << "No usable CUDA device (" << dev.error << "): using the CPU" << std::endl;
+        }
     }
-    // bytes per tile point: host (tile record, xyz, isCore, features, output record, row index, bbox copy) /
-    // device (xyz, isCore, cell ids, sorted idx, sorted xyz, features)
-    const double hostPerPoint = 36.0 + 24.0 + 4.0 + 4.0 * GPU_F_COUNT * scalesCount + REC_LEN + 8.0 + 24.0;
-    const double vramPerPoint = 24.0 + 4.0 + 8.0 + 24.0 + 4.0 * GPU_F_COUNT * scalesCount;
+#else
+    if (backendOpt == "gpu") {
+        std::cerr << "ERROR: this build has no CUDA support" << std::endl;
+        return kExitNoGpu;
+    }
+#endif
+    if (useGpu) {
+#ifdef FEATURES_WITH_CUDA
+        std::cout << "Backend: GPU " << dev.name << " (cc " << dev.ccMajor << "." << dev.ccMinor << ", " << dev.multiprocessors
+                  << " SMs, " << dev.freeBytes / 1048576 << " MB free), " << numThreads << " host threads" << std::endl;
+#endif
+    } else {
+        std::cout << "Backend: CPU, " << numThreads << " threads" << std::endl;
+    }
+
+    // output columns of the (feature, scale) pairs, in the order of the extra bytes of the record
+    FeatureConfig gcfg;
+    gcfg.numScales = scalesCount;
+    for (int s = 0; s < scalesCount; s++) gcfg.scales[s] = scales[s];
+    for (int f = 0; f < FE_F_COUNT; f++) for (int s = 0; s < 10; s++) gcfg.slotOf[f][s] = -1;
+    for (int f = 0; f < F_COUNT; f++)
+        if (featureActive[f])
+            for (int s = 0; s < scalesCount; s++) gcfg.slotOf[f][s] = gcfg.numSlots++;
+
+    // Tiles in flight: on the GPU (--slots, default 2) the host prepares tile k+1 and writes tile k-1 while tile k
+    // computes; the CPU computes with all its threads, only the reading and the writing overlap with it.
+    const int numSlotsInFlight = useGpu ? std::max(1, std::min(4, slotsOpt > 0 ? slotsOpt : 2)) : 1;
+    // bytes per tile point: host (tile records of the tiles in flight, output record + row index of 2 tiles, engine staging)
+    // and device (workspace of every slot)
+    double hostPerPoint = 36.0 * (numSlotsInFlight + 1) + 2.0 * (REC_LEN + 12.0);
+    double vramPerPoint = 0;
+    if (useGpu) {
+#ifdef FEATURES_WITH_CUDA
+        hostPerPoint += (13.0 + 4.0 * ((gcfg.numSlots + 3) / 4 * 4)) * numSlotsInFlight;      // pinned staging
+        vramPerPoint = GpuEngine::deviceBytesPerPoint(gcfg) * numSlotsInFlight;
+#endif
+    } else {
+        hostPerPoint += cpuBytesPerPoint(gcfg) * numSlotsInFlight;
+    }
     const uint64_t capHost = (uint64_t)(0.6 * (double)budget / hostPerPoint);
-    const uint64_t capVram = (uint64_t)(0.7 * (double)vramFree / vramPerPoint);
+    uint64_t capVram = ~0ULL;
+#ifdef FEATURES_WITH_CUDA
+    if (useGpu) capVram = (uint64_t)(0.7 * (double)dev.freeBytes / vramPerPoint);
+#endif
     const uint64_t capPoints = std::max<uint64_t>(100000, std::min(capHost, capVram));
-    std::cout << "Tile cap: " << capPoints << " points (host budget " << budget / 1048576 << " MB -> " << capHost
-              << ", free VRAM " << vramFree / 1048576 << " MB -> " << capVram << ")" << std::endl;
+    std::cout << "Tile cap: " << capPoints << " points (host budget " << budget / 1048576 << " MB -> " << capHost;
+#ifdef FEATURES_WITH_CUDA
+    if (useGpu) std::cout << ", free VRAM " << dev.freeBytes / 1048576 << " MB -> " << capVram;
+#endif
+    std::cout << ")" << std::endl;
 
     if (!manualTileSize) {
         TILE_SIZE = computeDynamicTileSizeFromBbox(hdr, BUFFER_SIZE, TARGET_TILES);
@@ -434,10 +527,6 @@ int main(int argc, char** argv)
     uint64_t needDisk = (uint64_t)((double)N * dup * sizeof(ooc::TilePt)) + (uint64_t)N * ((uint64_t)REC_LEN + 4) + (64ULL << 20);   // tile files + worst-case row spill
     ooc::TempWorkDir tmp(tempDir, "feat_", needDisk);
     std::cout << "Temporary folder: " << tmp.path() << " (~" << needDisk / 1000000 << " MB)" << std::endl;
-    int numThreads = 1;
-#ifdef _OPENMP
-    numThreads = omp_get_max_threads();
-#endif
     ooc::BucketWriter writer(tmp.path(), "t", numTiles, std::max<uint64_t>(16ULL << 20, budget / 8));
     const uint64_t blockBytes = std::min<uint64_t>(16ULL << 20, std::max<uint64_t>(1ULL << 20, budget / 8 / (uint64_t)(4 * numThreads)));
     std::vector<uint64_t> tileSize = ooc::partition_input(inputFile, li, grid, writer, blockBytes);
@@ -448,105 +537,228 @@ int main(int argc, char** argv)
     // ------------------------------------------------------------------
     ooc::RowOutput out(outputFile, offsetToData, (size_t)REC_LEN, N);
     out.set_spill_mode(spillMode);
+    if (spillMode < 0) out.set_memory_mode(budget / 5);   // --spill always/never are test hooks: they keep the old paths
     out.set_spill(tmp.path(), std::min<uint64_t>(128ULL << 20, std::max<uint64_t>(8ULL << 20, budget / 16)), std::max<uint64_t>(16ULL << 20, budget / 8));
     out.write_header(headerBuf.data(), headerBuf.size());
     out.patch(headerBuf.size(), vlrBuf.data(), vlrBuf.size());
 
-    double gpuTimeTotal = 0;
-    ooc::ComputeTile compute = [&](const std::vector<ooc::TilePt>& pts, std::vector<uint8_t>& outRecs, std::string& error) -> bool {
+    uint64_t maxTilePts = 0;
+    size_t numNonEmpty = 0;
+    for (uint64_t v : tileSize) { maxTilePts = std::max(maxTilePts, v); if (v) numNonEmpty++; }
+    // slots 0..S-1 run the pipeline; the last one is only used to retry (and split) a tile that failed
+    std::unique_ptr<FeatureEngine> enginePtr;
+#ifdef FEATURES_WITH_CUDA
+    if (useGpu) enginePtr.reset(new GpuEngine(gcfg, numSlotsInFlight + 1));
+#endif
+    if (!enginePtr) enginePtr = makeCpuEngine(gcfg, numSlotsInFlight + 1, numThreads);
+    FeatureEngine& engine = *enginePtr;
+    // A tile above the point cap (the densest tile can be, see the tile size warning) does not get a pipeline slot: it goes
+    // straight to the synchronous path, which allocates for it and splits it when that fails.
+    const size_t slotCap = (size_t)std::max<uint64_t>(1, std::min<uint64_t>(maxTilePts, capPoints));
+    for (int k = 0; k < numSlotsInFlight; k++)
+        if (!engine.reserve(k, slotCap))
+            throw std::runtime_error(std::string("cannot reserve memory for the tiles: ") + engine.lastError());
+    const int fbSlot = numSlotsInFlight;
+    const int rowStride = engine.rowStride();
+    const size_t featBytes = (size_t)gcfg.numSlots * 4;
+
+    // ---- host stages (all OpenMP-parallel inside the tile)
+    struct Prepared { int nCore = 0; double unit = 0; int64_t extent[3] = {0, 0, 0}; };
+    // bounding box, integer coordinates (ticks) and core flags into the staging buffers of the slot
+    auto prepare = [&](int slot, const std::vector<ooc::TilePt>& pts) -> Prepared {
         const int tileN = (int)pts.size();
-        std::vector<double> xyz((size_t)tileN * 3);
-        std::vector<int> h_isCore(tileN, 0);
+        double mn[3] = {1e300, 1e300, 1e300}, mx[3] = {-1e300, -1e300, -1e300};
         int coreCount = 0;
-        for (int j = 0; j < tileN; j++) {
-            xyz[(size_t)j * 3 + 0] = ooc::tp_x(pts[j], li);
-            xyz[(size_t)j * 3 + 1] = ooc::tp_y(pts[j], li);
-            xyz[(size_t)j * 3 + 2] = ooc::tp_z(pts[j], li);
-            h_isCore[j] = pts[j].core;
-            coreCount += pts[j].core;
-        }
-        std::vector<float> h_features((size_t)GPU_F_COUNT * scalesCount * tileN, 0.0f);
-
-        GpuFeatureParams params;
-        params.numPoints = tileN;
-        params.numScales = scalesCount;
-        std::memcpy(params.scales, scales, sizeof(float) * scalesCount);
-        params.gridCellSize = maxScale;
-
-        auto t_gpu = now_t();
-        int gpuErr = computeFeaturesGPU(xyz.data(), h_isCore.data(), params, h_features.data());
-        double gpuTime = elapsed(t_gpu);
-        if (gpuErr != 0) {
-            cudaGetLastError();
-            error = "GPU error";
-            return false;
-        }
-        gpuTimeTotal += gpuTime;
-        std::cout << "- " << coreCount << " core / " << tileN << " total, GPU time: " << gpuTime << "s" << std::endl;
-
-        outRecs.assign((size_t)coreCount * REC_LEN, 0);
-        std::vector<uint8_t> rec_buf(REC_LEN, 0);
-        size_t w = 0;
-        for (int j = 0; j < tileN; j++) {
-            if (!h_isCore[j]) continue;
-            const ooc::TilePt& rp = pts[j];
-            std::fill(rec_buf.begin(), rec_buf.end(), 0);
-
-            double px = ooc::tp_x(rp, li), py = ooc::tp_y(rp, li), pz = ooc::tp_z(rp, li);
-            int32_t ixr = (int32_t)std::round((px - hdr.offX) / hdr.scaleX);
-            int32_t iyr = (int32_t)std::round((py - hdr.offY) / hdr.scaleY);
-            int32_t izr = (int32_t)std::round((pz - hdr.offZ) / hdr.scaleZ);
-
-            wLE<int32_t>(rec_buf, 0, ixr);
-            wLE<int32_t>(rec_buf, 4, iyr);
-            wLE<int32_t>(rec_buf, 8, izr);
-            wLE<uint16_t>(rec_buf, 12, rp.intensity);
-            rec_buf[14] = (rp.return_num & 0x07) | ((rp.num_returns & 0x07) << 3);
-            rec_buf[15] = rp.class_id;
-            int scan_angle_rank = (int)rp.scan_angle;
-            scan_angle_rank = std::max(-128, std::min(127, scan_angle_rank));
-            rec_buf[16] = (uint8_t)((int8_t)scan_angle_rank);
-            wLE<uint16_t>(rec_buf, 28, rp.r);
-            wLE<uint16_t>(rec_buf, 30, rp.g);
-            wLE<uint16_t>(rec_buf, 32, rp.b);
-
-            wLE<uint32_t>(rec_buf, BASE_SIZE + off_pid, rp.pid);
-
-            // Layout of h_features: [featureId * numScales * N + scaleIdx * N + pointIdx]
-            for (int f = 0; f < F_COUNT; f++) {
-                if (featureActive[f]) {
-                    for (int s = 0; s < scalesCount; s++) {
-                        float val = h_features[(size_t)f * scalesCount * tileN + (size_t)s * tileN + j];
-                        if (!std::isfinite(val)) val = 0.0f;
-                        wLE<float>(rec_buf, BASE_SIZE + featureByteOffset[f][s], val);
-                    }
-                }
+#pragma omp parallel
+        {
+            double lmn[3] = {1e300, 1e300, 1e300}, lmx[3] = {-1e300, -1e300, -1e300};
+            int lc = 0;
+#pragma omp for nowait
+            for (int j = 0; j < tileN; j++) {
+                const double c[3] = {ooc::tp_x(pts[j], li), ooc::tp_y(pts[j], li), ooc::tp_z(pts[j], li)};
+                for (int k = 0; k < 3; k++) { lmn[k] = std::min(lmn[k], c[k]); lmx[k] = std::max(lmx[k], c[k]); }
+                lc += pts[j].core;
             }
-
-            // Normals (zeros)
-            wLE<float>(rec_buf, BASE_SIZE + off_nx, 0.0f);
-            wLE<float>(rec_buf, BASE_SIZE + off_ny, 0.0f);
-            wLE<float>(rec_buf, BASE_SIZE + off_nz, 0.0f);
-
-            std::memcpy(outRecs.data() + w * REC_LEN, rec_buf.data(), REC_LEN);
-            w++;
+#pragma omp critical(feat_bbox)
+            {
+                for (int k = 0; k < 3; k++) { mn[k] = std::min(mn[k], lmn[k]); mx[k] = std::max(mx[k], lmx[k]); }
+                coreCount += lc;
+            }
         }
-        return true;
+        // ticks from the minimum of the tile: the unit is the smallest LAS scale (exact for data quantised on the LAS
+        // grid), enlarged when the tile is so large that the ticks would overflow int32
+        const double lasUnit = std::min(li.scale[0], std::min(li.scale[1], li.scale[2]));
+        const double ext = std::max(mx[0] - mn[0], std::max(mx[1] - mn[1], mx[2] - mn[2]));
+        Prepared pr;
+        pr.nCore = coreCount;
+        pr.unit = std::max(lasUnit, ext / 1.0e9);
+        int32_t* hx = engine.hostXyz(slot);
+        uint8_t* hc = engine.hostCore(slot);
+#pragma omp parallel for schedule(static)
+        for (int j = 0; j < tileN; j++) {
+            hx[3 * (size_t)j + 0] = (int32_t)std::llround((ooc::tp_x(pts[j], li) - mn[0]) / pr.unit);
+            hx[3 * (size_t)j + 1] = (int32_t)std::llround((ooc::tp_y(pts[j], li) - mn[1]) / pr.unit);
+            hx[3 * (size_t)j + 2] = (int32_t)std::llround((ooc::tp_z(pts[j], li) - mn[2]) / pr.unit);
+            hc[j] = pts[j].core ? 1 : 0;
+        }
+        for (int k = 0; k < 3; k++) pr.extent[k] = (int64_t)std::llround((mx[k] - mn[k]) / pr.unit) + 1;
+        return pr;
+    };
+    // LAS records of the core points (zero-filled, then the base fields and the columns computed by the GPU)
+    auto pack = [&](int slot, const std::vector<ooc::TilePt>& pts, int coreCount, std::vector<uint8_t>& outRecs,
+                    std::vector<std::pair<uint32_t, uint32_t>>* rowsOut) {
+        const int tileN = (int)pts.size();
+        outRecs.assign((size_t)coreCount * REC_LEN, 0);
+        std::vector<uint32_t> corePos((size_t)coreCount);
+        {
+            size_t w = 0;
+            for (int j = 0; j < tileN; j++) if (pts[j].core) corePos[w++] = (uint32_t)j;
+        }
+        if (rowsOut) {
+            rowsOut->resize((size_t)coreCount);
+            for (int c = 0; c < coreCount; c++) (*rowsOut)[(size_t)c] = {pts[corePos[(size_t)c]].row, (uint32_t)c};
+        }
+        const float* rows = engine.hostRows(slot);
+#pragma omp parallel for schedule(static)
+        for (int64_t c = 0; c < (int64_t)coreCount; c++) {
+            const ooc::TilePt& rp = pts[corePos[(size_t)c]];
+            uint8_t* rec = outRecs.data() + (size_t)c * REC_LEN;
+            auto put = [&](size_t off, const auto& v) { std::memcpy(rec + off, &v, sizeof v); };
+
+            const double px = ooc::tp_x(rp, li), py = ooc::tp_y(rp, li), pz = ooc::tp_z(rp, li);
+            put(0, (int32_t)std::round((px - hdr.offX) / hdr.scaleX));
+            put(4, (int32_t)std::round((py - hdr.offY) / hdr.scaleY));
+            put(8, (int32_t)std::round((pz - hdr.offZ) / hdr.scaleZ));
+            put(12, rp.intensity);
+            rec[14] = (rp.return_num & 0x07) | ((rp.num_returns & 0x07) << 3);
+            rec[15] = rp.class_id;
+            int scan_angle_rank = std::max(-128, std::min(127, (int)rp.scan_angle));
+            rec[16] = (uint8_t)((int8_t)scan_angle_rank);
+            put(28, rp.r);
+            put(30, rp.g);
+            put(32, rp.b);
+            put((size_t)BASE_SIZE + off_pid, rp.pid);
+            // the requested columns are consecutive in the record (right after POINT_ID), in the order of the rows
+            std::memcpy(rec + BASE_SIZE + 4, rows + (size_t)c * rowStride, featBytes);
+            // normals stay zero
+        }
     };
 
+    // synchronous computation of one tile (the runner calls it for a tile that failed in the pipeline and for its halves)
+    ooc::ComputeTile compute = [&](const std::vector<ooc::TilePt>& pts, std::vector<uint8_t>& outRecs, std::string& error) -> bool {
+        if (failAbove && pts.size() > failAbove) { error = "simulated failure (--test-fail-above)"; return false; }
+        if (!engine.reserve(fbSlot, pts.size())) { error = engine.lastError(); return false; }
+        Prepared pr = prepare(fbSlot, pts);
+        if (engine.submit(fbSlot, (int)pts.size(), pr.nCore, pr.unit, pr.extent) != 0 || engine.wait(fbSlot) != 0) {
+            error = engine.lastError();
+            return false;
+        }
+        pack(fbSlot, pts, pr.nCore, outRecs, nullptr);
+        return true;
+    };
+    auto t_pipeline = now_t();
     ooc::TileRunner runner(out, (size_t)REC_LEN, compute, li);
     runner.set_buffer(BUFFER_SIZE);
-    int tileNo = 0;
-    for (size_t t = 0; t < numTiles; t++) {
-        if (tileSize[t] == 0) continue;
-        tileNo++;
-        std::cout << "\nTile [ " << tileNo << " / " << numTiles << " ]:" << std::endl;
-        std::vector<ooc::TilePt> pts = ooc::load_tile(writer.path(t), tileSize[t]);
-        ::unlink(writer.path(t).c_str());
-        runner.process(pts, 0, std::to_string(t));
-        std::cout << "[progress] features " << (100 * (t + 1) / numTiles) << "%" << std::endl;
+
+    // ---- pipeline: reader thread -> (prepare + compute, `numSlotsInFlight` tiles in flight) -> pack -> writer thread
+    struct TileJob { size_t t = 0; std::vector<ooc::TilePt> pts; };
+    struct WriteJob { std::vector<std::pair<uint32_t, uint32_t>> rows; std::vector<uint8_t> recs; uint32_t nc = 0; };
+    struct Flight { bool active = false; TileJob job; int nCore = 0; };
+    ooc::BoundedQueue<TileJob> readQ(1);
+    ooc::BoundedQueue<WriteJob> writeQ(1);
+    std::exception_ptr readErr, writeErr;
+    double loadTotal = 0, prepTotal = 0, submitTotal = 0, waitTotal = 0, packTotal = 0;
+
+    std::thread reader([&] {
+        try {
+            for (size_t t = 0; t < numTiles; t++) {
+                if (tileSize[t] == 0) continue;
+                auto t_load = now_t();
+                TileJob job;
+                job.t = t;
+                job.pts = ooc::load_tile(writer.path(t), tileSize[t]);
+                ::unlink(writer.path(t).c_str());
+                loadTotal += elapsed(t_load);
+                if (!readQ.push(std::move(job))) break;
+            }
+        } catch (...) { readErr = std::current_exception(); }
+        readQ.close();
+    });
+    std::thread writerThread([&] {
+        WriteJob w;
+        while (writeQ.pop(w)) {
+            if (!writeErr) {
+                try { runner.commit(w.rows, w.recs.data(), w.nc); } catch (...) { writeErr = std::current_exception(); }
+            }
+            std::vector<uint8_t>().swap(w.recs);
+        }
+    });
+
+    auto retrySync = [&](TileJob& job, const std::string& why) {
+        std::cout << "  [Warning] tile " << job.t << " failed in the pipeline (" << why << "): retrying it synchronously" << std::endl;
+        runner.process(job.pts, 0, std::to_string(job.t));
+    };
+    std::vector<Flight> fl((size_t)numSlotsInFlight);
+    int nextSlot = 0, tileNo = 0;
+    auto progress = [&] { std::cout << "[progress] features " << (100 * (uint64_t)tileNo / std::max<size_t>(1, numNonEmpty)) << "%" << std::endl; };
+    auto finishFlight = [&](int slot) {
+        Flight& f = fl[(size_t)slot];
+        if (!f.active) return;
+        f.active = false;
+        auto t_w = now_t();
+        const int rc = engine.wait(slot);
+        waitTotal += elapsed(t_w);
+        if (rc != 0) { retrySync(f.job, engine.lastError()); return; }
+        auto t_p = now_t();
+        WriteJob w;
+        w.nc = (uint32_t)f.nCore;
+        pack(slot, f.job.pts, f.nCore, w.recs, &w.rows);
+        std::vector<ooc::TilePt>().swap(f.job.pts);
+        packTotal += elapsed(t_p);
+        writeQ.push(std::move(w));
+    };
+
+    try {
+        TileJob job;
+        while (readQ.pop(job)) {
+            tileNo++;
+            if (job.pts.size() > slotCap) {
+                retrySync(job, "larger than the tile cap");
+                progress();
+                continue;
+            }
+            const int slot = nextSlot;
+            nextSlot = (nextSlot + 1) % numSlotsInFlight;
+            finishFlight(slot);                       // the slot is reused: collect the tile it was computing
+            auto t_p = now_t();
+            Prepared pr = prepare(slot, job.pts);
+            prepTotal += elapsed(t_p);
+            if (pr.nCore > 0) {
+                auto t_s = now_t();
+                const int rc = (failAbove && job.pts.size() > failAbove) ? -1 : engine.submit(slot, (int)job.pts.size(), pr.nCore, pr.unit, pr.extent);
+                submitTotal += elapsed(t_s);
+                if (rc != 0) retrySync(job, failAbove ? "simulated failure" : engine.lastError());
+                else { Flight& f = fl[(size_t)slot]; f.active = true; f.nCore = pr.nCore; f.job = std::move(job); }
+            }
+            progress();
+            if (writeErr) break;
+        }
+        for (int k = 0; k < numSlotsInFlight; k++) finishFlight((nextSlot + k) % numSlotsInFlight);   // in submission order
+    } catch (...) {
+        readQ.close(); writeQ.close();
+        reader.join(); writerThread.join();
+        throw;
     }
+    writeQ.close();
+    writerThread.join();
+    readQ.close();
+    reader.join();
+    if (readErr) std::rethrow_exception(readErr);
+    if (writeErr) std::rethrow_exception(writeErr);
+    const double pipelineSec = elapsed(t_pipeline);
+    auto t_finish = now_t();
     runner.finish();
+    std::cout << "Pipeline: " << pipelineSec << " s, final row merge (spill): " << elapsed(t_finish) << " s" << std::endl;
 
     if (runner.stats.written != N) {
         throw std::runtime_error("Only " + std::to_string(runner.stats.written) + " of " + std::to_string(N) +
@@ -554,6 +766,8 @@ int main(int argc, char** argv)
     }
     std::cout << "Output rows written: " << runner.stats.written << " (tiles split after errors: " << runner.stats.splits << ")" << std::endl;
     std::cout << "Host time: compute " << runner.stats.computeSec << " s, row writes " << runner.stats.writeSec << " s in " << runner.stats.writeRuns << " writes" << std::endl;
+    std::cout << "Profile (s): read tiles " << loadTotal << " (reader thread), host prep " << prepTotal << ", gpu submit " << submitTotal << ", waiting for the GPU " << waitTotal << ", record pack " << packTotal << ", row writes " << runner.stats.writeSec << " (writer thread)" << std::endl;
+    if (useGpu && gpuProfileEnabled()) { const StageTimes g = engine.times(); std::cout << "GPU stages (s): h2d " << g.h2d << ", grid " << g.grid << ", sort " << g.sort << ", kernel " << g.kernel << ", d2h " << g.d2h << " (" << g.tiles << " tiles)" << std::endl; }
 
     double total = elapsed(global_start);
     int mn = (int)(total / 60), sc = (int)total % 60;

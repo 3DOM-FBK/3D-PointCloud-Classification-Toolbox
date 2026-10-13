@@ -20,54 +20,77 @@ On `SIGTERM` (`/stop_process/`) every tool removes its scratch folder and its pa
 Source of the shared primitives: `testC++/ooc/` (header only). The Python tools use
 `viewer/utils_functions/pipeline_common.py`.
 
-**Build dependencies:** PCL 1.9 (CPU feature extraction), Open3D 0.19.0 (PLY branch of `subsample_pc`, `mesh2pc`, fallback of
-`ply2las`), CGAL (`mesh2pc`), CUDA 11.8 + Thrust (GPU binary only), OpenMP. `las2pc`, `split_las_by_binary` and
+**Build dependencies:** Open3D 0.19.0 (PLY branch of `subsample_pc`, `mesh2pc`, fallback of
+`ply2las`), CGAL (`mesh2pc`), CUDA 12.8 (feature extraction; the program also builds without CUDA), OpenMP. `las2pc`, `split_las_by_binary` and
 `check_point_id` need nothing but the C++ standard library (and OpenMP).
 
 ---
 
-## `feature_extraction_viewer_gpu`
+## `feature_extraction_viewer`
 
-**Purpose:** Per-point geometric features of a LAS with CUDA kernels, tile by tile. This is the primary feature
-extraction binary used in production.
+**Purpose:** Per-point geometric features of a LAS, tile by tile, on the GPU (CUDA) or on the CPU. One program with both
+backends (it replaces `feature_extraction_viewer_gpu` and `feature_extraction_viewer_cpu`, which no longer exist); the web
+app runs it with `--backend auto` when the GPU switch is on and `--backend cpu` otherwise.
 
 **Input:** LAS (the tool reads x, y, z, intensity, returns, class, scan angle, RGB and `POINT_ID`)  
 **Output:** LAS (point format 3) with `POINT_ID`, one Extra Byte per feature and radius (`<feature>_<radius>`, e.g.
 `planarity_1_2`) and `normal_x/y/z` (zeros). **One record per input point, in the order of the input** (the record of
-input row *r* is written at output row *r*).
+input row *r* is written at output row *r*). The output is reproducible: same input and options, same bytes.
 
 **CLI:**
 
 ```
-feature_extraction_viewer_gpu <input.las> <output.las>
+feature_extraction_viewer <input.las> <output.las>
     [--features f1,f2,...] [--radius r1,r2,...] [--buffer B]
     [--tile_size S] [--target_tiles N]
+    [--backend auto|gpu|cpu] [--threads N] [--slots N]
     [--memory-budget MB] [--temp-dir DIR]
+feature_extraction_viewer --probe          # prints the usable CPUs and GPU; exit code 3 when there is no usable GPU
 ```
 
 | Argument | Description |
 |---|---|
 | `--features` | Comma-separated features (default: all): `anisotropy, omnivariance, sphericity, planarity, linearity, verticality, surface_variation, neighbours, vertical_range, height_above, height_below` |
-| `--radius` | Neighbourhood radii in metres (default `0.8,1.2,2.0,3.0`); the buffer is at least `max(radius) + 0.5` |
+| `--radius` | Neighbourhood radii in metres (default `0.8,1.2,2.0,3.0`, at most 10); the buffer is at least `max(radius) + 0.5` |
 | `--buffer` | Buffer around every tile in metres (default 4) |
 | `--tile_size` | Fixed tile size in metres (overrides the automatic one) |
 | `--target_tiles` | Tiles wanted by the automatic sizing of small clouds (default 16) |
+| `--backend` | `auto` (default): the GPU when the machine has a usable CUDA device, the CPU otherwise; `gpu`: the GPU or exit code 3; `cpu`: never touches the GPU |
+| `--threads` | Host threads (default: the CPUs this process may use: affinity mask and container quota, so `docker run --cpus 2` really uses 2) |
+| `--slots` | Tiles in flight on the GPU (default 2; 1 = no overlap) |
+
+**Algorithm (the same on both backends, `testC++/ooc/feature_math.h`).** Coordinates are integers (ticks of the smallest LAS
+scale, counted from the minimum of the tile), so the radius test `d² ≤ r²` is exact and identical to the previous versions
+(points exactly at distance `r` are inside). A uniform grid (cell = largest radius / 2) is sorted by cell with x fastest, so
+the cells of a row are one contiguous range. The neighbours of the *largest* radius are visited **once**; every neighbour is
+added to the shell of the smallest radius that contains it and the shells are summed cumulatively, so all the scales come
+from one traversal. The moments (`n, Σd, Σd·dᵀ, min/max y`) are accumulated relative to the query point in `float`, the
+eigenvalues come from a trigonometry-free Jacobi solver. Y is the vertical axis (verticality, height features). Omnivariance is
+`(e0·e1·e2)^(1/3)` and a neighbourhood with fewer than 3 points gives zeros (only `neighbours` is reported).
+
+**Pipeline.** A reader thread loads the next tile from disk, the GPU computes tile *k* while the host prepares tile *k+1*
+and packs tile *k−1*, and a writer thread writes the rows of the previous tile. The CPU backend computes with all its threads
+while the reader and writer threads overlap the I/O. Pinned staging buffers and the device workspace are allocated once.
 
 **Memory.** The cloud is distributed in XY tiles (core points plus a buffer of copies) in temporary files
-(`36 bytes × points × buffer overhead`); a tile is loaded, uploaded to the GPU and computed alone, so the host memory and the
-VRAM no longer depend on the size of the cloud. The tile size is the one it always was (about 16 tiles) as long as the
-densest tile fits the point cap derived from the memory budget (`60 %` of it) and from the free VRAM (`70 %`); otherwise the
-tiles are made smaller from an XY histogram of the cloud. A tile whose computation fails (GPU out of memory, grid too large) is
-split in two and retried; if it still fails the run stops with a message (it never leaves holes in the output: the number of
-rows written is checked). Points exactly on the upper edge of the grid belong to the last tile (the previous CPU version
-dropped them silently; the GPU one already included them).
+(`36 bytes × points × buffer overhead`); only the tiles in flight are in memory (and on the GPU), so the host memory and the
+VRAM do not depend on the size of the cloud. The tile size is the one it always was (about 16 tiles) as long as the
+densest tile fits the point cap derived from the memory budget (`60 %` of it, divided among the tiles in flight) and from the
+free VRAM (`70 %`); otherwise the tiles are made smaller from an XY histogram of the cloud. A tile whose computation fails (GPU
+out of memory, grid too large) is split in two and retried; if it still fails the run stops with a message (it never leaves holes in the output: the number of rows
+written is checked).
 
-**GPU requirements:** NVIDIA GPU with Compute Capability ≥ 7.5, CUDA 11.8 runtime.
+**Portability.** The program is built with CUDA 12.8 for `sm_61 … sm_120` (Pascal to Blackwell) plus PTX for the newest
+architecture, so it also starts on GPUs released later (the driver compiles the PTX); the driver must support CUDA 12
+(minor-version compatibility starts at 525; Blackwell GPUs need a driver that knows them, 570 or newer; these limits come from
+NVIDIA's compatibility rules and were not tested here beyond a driver 610 with an sm_75 GPU). The CPU code is compiled for generic
+x86-64 and selects SSE2, AVX2 or AVX-512 when it starts (`target_clones`). No GPU, no driver, a GPU without code for its
+architecture, or no free VRAM: with `--backend auto` it simply runs on the CPU (the message says why).
 
 **Example:**
 
 ```bash
-/webapp/opt/feature_extraction_viewer_gpu \
+/webapp/opt/feature_extraction_viewer \
   runtime_data/working/features.las \
   runtime_data/working/features_temp.las \
   --features anisotropy,linearity,planarity,sphericity \
@@ -76,26 +99,14 @@ dropped them silently; the GPU one already included them).
 
 **Common errors:**
 
-- `no CUDA device available` — run the container with `--gpus all`, or use the CPU binary.
-- `Tile ... could not be computed` — the tile stayed too big for the GPU even after being split ten times; lower the radii.
+- `no usable CUDA device` with `--backend gpu` (exit code 3) — run the container with `--gpus all`, or use `--backend auto`/`cpu`.
+- `Tile ... could not be computed` — the tile stayed too big even after being split ten times; lower the radii.
 - `Not enough free space in the temporary folder` — set `PIPELINE_TEMP_DIR` to a bigger volume.
 
----
-
-## `feature_extraction_viewer_cpu`
-
-**Purpose:** CPU-only fallback of the previous binary (same features, same output layout), with PCL octree radius searches
-and OpenMP inside every tile. Expect much longer processing times on large clouds.
-
-**CLI:** the same as the GPU binary, without `--target_tiles`; `--tile_size` defaults to 50 m. The tile size is reduced
-automatically when a tile would not fit in the memory budget (about 650 bytes per tile point).
-
-```bash
-/webapp/opt/feature_extraction_viewer_cpu runtime_data/working/features.las runtime_data/working/features_temp.las \
-  --features anisotropy,linearity --radius 0.5,1.0
-```
-
-**Dependencies:** PCL, OpenMP, Eigen (no CUDA).
+**Reference numbers (RTX 2080 Ti, i7-9700, 3 GB budget, input and output on the same NVMe through Docker):** 5 M points,
+radii 0.5/1/2: 8–12 s (previous GPU version 17 s, previous CPU/PCL version 241 s; the new CPU backend 18 s with 8 threads,
+40 s with 2). 20 M points, radii 0.8/1.2/2/3: 53 s (previous GPU version 106 s). On this machine the remaining time is disk
+(distribution of the tiles, writing the output): the GPU waits for the disk.
 
 ---
 

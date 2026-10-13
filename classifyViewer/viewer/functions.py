@@ -251,12 +251,14 @@ def feature_extraction(input_filepath, output_filepath, feature_list, radius_lis
     radius_str = ','.join(str(x) for x in radius_list)
     feature_str = ','.join(feature_list)
 
-    binary = "/webapp/opt/feature_extraction_viewer_gpu" if use_gpu else "/webapp/opt/feature_extraction_viewer_cpu"
-    
-    if sampling == 0:
-        command = [binary, abs_input, temp_output, "--features", feature_str, "--radius", radius_str]
-    else :
-        command = [binary, abs_input, temp_output, "--features", feature_str, "--radius", radius_str, "--sampling_resolution", str(sampling)]
+    # One program with both backends. use_gpu is a preference: "auto" runs on the GPU when the machine has a usable CUDA
+    # device and falls back to the CPU otherwise (also when the GPU is unusable); "cpu" never touches the GPU.
+    binary = "/webapp/opt/feature_extraction_viewer"
+    backend = "auto" if use_gpu else "cpu"
+
+    command = [binary, abs_input, temp_output, "--features", feature_str, "--radius", radius_str, "--backend", backend]
+    if sampling != 0:
+        command += ["--sampling_resolution", str(sampling)]
     command += pipeline_args()
     
     try:

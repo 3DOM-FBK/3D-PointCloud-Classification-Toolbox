@@ -6,14 +6,13 @@
 #   * Python 3.10 + Django/gunicorn/whitenoise + numpy/scipy/scikit-learn/laspy/tqdm
 #   * opt/ binaries (prebuilt, x86-64):
 #       las2pc, split_las_by_binary, check_point_id   libgomp only (no PDAL, no Open3D)
-#       feature_extraction_viewer_cpu                 libpcl_common 1.12 (+ libgomp)
-#       feature_extraction_viewer_gpu                 libgomp; the CUDA runtime is linked statically and
-#                                                     the driver (libcuda) is injected by the NVIDIA
-#                                                     container toolkit (docker run --gpus all)
+#       feature_extraction_viewer                     libgomp; GPU and CPU backends in one program: the CUDA runtime is
+#                                                     linked statically and the driver (libcuda) is injected by the NVIDIA
+#                                                     container toolkit (docker run --gpus all); without a GPU it runs on the CPU
 #       ply2las, subsample_pc, mesh2pc                libOpen3D.so (+ libtbb, libc++, libGL, libX11);
 #                                                     mesh2pc also GMP/MPFR/libomp
 #   * the three BabylonJS bundles the page loads (the rest of the BabylonJS distribution is dev tooling)
-# Nothing is compiled here: no CUDA toolkit, GDAL, PDAL, LASzip, PCL/CGAL/Qt/VTK development packages,
+# Nothing is compiled here: no CUDA toolkit, GDAL, PDAL, LASzip, CGAL/Qt/VTK development packages,
 # torch or RAPIDS. GPU Random Forest (cuML) is an opt-in:  --build-arg WITH_RAPIDS=1
 # =============================================================================
 ARG BASE=ubuntu:22.04

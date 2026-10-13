@@ -1,0 +1,236 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1340" viewBox="0 0 1200 1340" font-family="'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5a6373"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1200" height="1340" fill="#ffffff"/>
+
+  <!-- header -->
+  <text x="44" y="40" font-size="22" font-weight="700" fill="#1c2430">3D Classify Viewer · point cloud data structure</text>
+  <text x="44" y="63" font-size="13" fill="#5a6373">How features.las becomes the chunked point cloud pc/ and how the browser reads it (Potree removed)</text>
+
+  <!-- legend -->
+  <rect x="660" y="30" width="14" height="14" rx="3" fill="#e7f0fb" stroke="#2563a8"/>
+  <text x="680" y="42" font-size="12.5" fill="#1c2430">Source of truth</text>
+  <rect x="800" y="30" width="14" height="14" rx="3" fill="#fdf1de" stroke="#b7701a"/>
+  <text x="820" y="42" font-size="12.5" fill="#1c2430">Build tools</text>
+  <rect x="905" y="30" width="14" height="14" rx="3" fill="#e9f7f2" stroke="#1f7a5f"/>
+  <text x="925" y="42" font-size="12.5" fill="#1c2430">Derived cache</text>
+  <rect x="1030" y="30" width="14" height="14" rx="3" fill="#efeafb" stroke="#6747b0"/>
+  <text x="1050" y="42" font-size="12.5" fill="#1c2430">Browser</text>
+
+  <!-- ============ 1. LIFECYCLE ============ -->
+  <rect x="24" y="96" width="1152" height="380" rx="10" fill="#f6f7f9" stroke="#dde1e8"/>
+  <text x="44" y="124" font-size="16" font-weight="700" fill="#1c2430">1 · Lifecycle: how pc/ is built and kept up to date</text>
+
+  <text x="44" y="160" font-size="11" font-weight="700" fill="#5a6373" letter-spacing="1">IMPORT · ONCE</text>
+  <text x="44" y="318" font-size="11" font-weight="700" fill="#5a6373" letter-spacing="1">UPDATES · COLUMNS ONLY</text>
+
+  <!-- import lane -->
+  <rect x="44" y="170" width="200" height="96" rx="8" fill="#e7f0fb" stroke="#2563a8" stroke-width="1.5"/>
+  <text x="144" y="200" text-anchor="middle" font-size="15" font-weight="700" fill="#1e4f86">features.las</text>
+  <text x="144" y="221" text-anchor="middle" font-size="12" fill="#1c2430">single source of truth</text>
+  <text x="144" y="240" text-anchor="middle" font-size="12" fill="#1c2430">features are Extra Bytes</text>
+
+  <line x1="244" y1="218" x2="289" y2="218" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="290" y="170" width="210" height="96" rx="8" fill="#fdf1de" stroke="#b7701a" stroke-width="1.5"/>
+  <text x="395" y="200" text-anchor="middle" font-size="15" font-weight="700" fill="#8a4f0e">las2pc (C++)</text>
+  <text x="395" y="221" text-anchor="middle" font-size="12" fill="#1c2430">memory or out-of-core</text>
+  <text x="395" y="240" text-anchor="middle" font-size="12" fill="#1c2430">+ canonical features.las</text>
+
+  <line x1="500" y1="218" x2="545" y2="218" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="546" y="170" width="190" height="96" rx="8" fill="#f4fbf8" stroke="#1f7a5f" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="641" y="200" text-anchor="middle" font-size="15" font-weight="700" fill="#155e48">pc_tmp/</text>
+  <text x="641" y="221" text-anchor="middle" font-size="12" fill="#1c2430">geometry + all columns</text>
+  <text x="641" y="240" text-anchor="middle" font-size="12" fill="#1c2430">built aside, not yet live</text>
+
+  <line x1="736" y1="218" x2="789" y2="218" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="763" y="160" text-anchor="middle" font-size="11" fill="#5a6373">atomic swap</text>
+
+  <rect x="790" y="170" width="370" height="250" rx="8" fill="#e9f7f2" stroke="#1f7a5f" stroke-width="2"/>
+  <text x="808" y="199" font-size="15" font-weight="700" fill="#155e48">working/pc/</text>
+  <text x="808" y="226" font-size="12.5"><tspan font-family="Consolas, 'Courier New', monospace" font-weight="600" fill="#155e48">meta.json</tspan><tspan x="935" fill="#1c2430">chunks, levels, columns, version</tspan></text>
+  <text x="808" y="248" font-size="12.5"><tspan font-family="Consolas, 'Courier New', monospace" font-weight="600" fill="#155e48">geom.bin</tspan><tspan x="935" fill="#1c2430">20 B per point: XYZ, RGB, POINT_ID</tspan></text>
+  <text x="808" y="270" font-size="12.5"><tspan font-family="Consolas, 'Courier New', monospace" font-weight="600" fill="#155e48">point_order.bin</tspan><tspan x="935" fill="#1c2430">POINT_ID in geom.bin order</tspan></text>
+  <text x="808" y="292" font-size="12.5"><tspan font-family="Consolas, 'Courier New', monospace" font-weight="600" fill="#155e48">col/&lt;name&gt;.bin</tspan><tspan x="935" fill="#1c2430">one file per attribute</tspan></text>
+  <line x1="808" y1="306" x2="1142" y2="306" stroke="#b9dccf"/>
+  <text x="808" y="326" font-size="12" font-style="italic" fill="#5a6373">derived cache, disposable: rebuilt from features.las</text>
+  <text x="808" y="344" font-size="12" font-style="italic" fill="#5a6373">geometry from las2pc, columns from pc_columns.py</text>
+
+  <line x1="500" y1="404" x2="789" y2="404" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="645" y="397" text-anchor="middle" font-size="11.5" fill="#5a6373">col/*.bin + meta.json</text>
+  <text x="790" y="442" font-size="12" font-style="italic" fill="#5a6373">Geometry is rebuilt only if the point count or build changes.</text>
+
+  <!-- update lane -->
+  <rect x="44" y="336" width="200" height="40" rx="6" fill="#fdf1de" stroke="#b7701a"/>
+  <text x="144" y="361" text-anchor="middle" font-size="13" fill="#1c2430">Feature extraction</text>
+  <rect x="44" y="384" width="200" height="40" rx="6" fill="#fdf1de" stroke="#b7701a"/>
+  <text x="144" y="409" text-anchor="middle" font-size="13" fill="#1c2430">RF classification</text>
+  <rect x="44" y="432" width="200" height="40" rx="6" fill="#fdf1de" stroke="#b7701a"/>
+  <text x="144" y="457" text-anchor="middle" font-size="13" fill="#1c2430">Backup restore</text>
+
+  <line x1="244" y1="356" x2="289" y2="376" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="244" y1="404" x2="289" y2="404" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="244" y1="452" x2="289" y2="432" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="290" y="350" width="210" height="108" rx="8" fill="#fdf1de" stroke="#b7701a" stroke-width="1.5"/>
+  <text x="395" y="381" text-anchor="middle" font-size="14" font-weight="700" fill="#8a4f0e">pc_columns.py</text>
+  <text x="395" y="401" text-anchor="middle" font-size="12" fill="#1c2430">writes only the changed columns</text>
+  <text x="395" y="420" text-anchor="middle" font-size="12" fill="#1c2430">fast · merge · join paths</text>
+
+  <!-- ============ 2. ANATOMY ============ -->
+  <rect x="24" y="500" width="1152" height="356" rx="10" fill="#f6f7f9" stroke="#dde1e8"/>
+  <text x="44" y="528" font-size="16" font-weight="700" fill="#1c2430">2 · Anatomy of the pc/ folder</text>
+
+  <text x="44" y="556" font-size="12.5" font-weight="700" fill="#1c2430">geom.bin · one 20-byte record per point, little endian</text>
+
+  <rect x="44" y="566" width="215" height="46" fill="#e7f0fb" stroke="#2563a8"/>
+  <text x="151.5" y="593" text-anchor="middle" font-size="13" fill="#1c2430">x · int32</text>
+  <rect x="259" y="566" width="215" height="46" fill="#e7f0fb" stroke="#2563a8"/>
+  <text x="366.5" y="593" text-anchor="middle" font-size="13" fill="#1c2430">y · int32</text>
+  <rect x="474" y="566" width="215" height="46" fill="#e7f0fb" stroke="#2563a8"/>
+  <text x="581.5" y="593" text-anchor="middle" font-size="13" fill="#1c2430">z · int32</text>
+  <rect x="689" y="566" width="53.67" height="46" fill="#fbf3e6" stroke="#b7701a"/>
+  <text x="715.8" y="593" text-anchor="middle" font-size="13" font-weight="700" fill="#8a4f0e">r</text>
+  <rect x="742.67" y="566" width="53.67" height="46" fill="#fbf3e6" stroke="#b7701a"/>
+  <text x="769.5" y="593" text-anchor="middle" font-size="13" font-weight="700" fill="#8a4f0e">g</text>
+  <rect x="796.33" y="566" width="53.67" height="46" fill="#fbf3e6" stroke="#b7701a"/>
+  <text x="823.2" y="593" text-anchor="middle" font-size="13" font-weight="700" fill="#8a4f0e">b</text>
+  <rect x="850" y="566" width="54" height="46" fill="#f1f2f4" stroke="#9aa3b2"/>
+  <text x="877" y="593" text-anchor="middle" font-size="13" fill="#5a6373">pad</text>
+  <rect x="904" y="566" width="216" height="46" fill="#e9f7f2" stroke="#1f7a5f" stroke-width="2"/>
+  <text x="1012" y="593" text-anchor="middle" font-size="13" font-weight="700" fill="#155e48">POINT_ID · uint32</text>
+
+  <g font-size="11" fill="#5a6373" text-anchor="middle">
+    <text x="151.5" y="630">bytes 0–3</text>
+    <text x="366.5" y="630">bytes 4–7</text>
+    <text x="581.5" y="630">bytes 8–11</text>
+    <text x="715.8" y="630">12</text>
+    <text x="769.5" y="630">13</text>
+    <text x="823.2" y="630">14</text>
+    <text x="877" y="630">15</text>
+    <text x="1012" y="630">bytes 16–19</text>
+  </g>
+  <text x="44" y="654" font-size="12" fill="#5a6373">Real coordinate = (q + qMin) × scale + offset, with q = stored int32 · r, g, b: uint8 (255, 255, 255 when the LAS has no colour)</text>
+
+  <!-- chunks and levels -->
+  <text x="44" y="688" font-size="13" font-weight="700" fill="#1c2430">Chunks and levels</text>
+  <text x="44" y="706" font-size="12" fill="#1c2430">A chunk is an octree leaf of at most 250 000 points. Its points are shuffled</text>
+  <text x="44" y="722" font-size="12" fill="#1c2430">(fixed seed) and split into stratified levels; the last one is the remainder.</text>
+
+  <rect x="44" y="736" width="40" height="38" fill="#e3f5ee" stroke="#1f7a5f"/>
+  <text x="64" y="760" text-anchor="middle" font-size="12" fill="#155e48">L0</text>
+  <rect x="84" y="736" width="60" height="38" fill="#d2efe5" stroke="#1f7a5f"/>
+  <text x="114" y="760" text-anchor="middle" font-size="12" fill="#155e48">L1</text>
+  <rect x="144" y="736" width="80" height="38" fill="#bfe6d7" stroke="#1f7a5f"/>
+  <text x="184" y="760" text-anchor="middle" font-size="12" fill="#155e48">L2</text>
+  <rect x="224" y="736" width="100" height="38" fill="#a9dccb" stroke="#1f7a5f"/>
+  <text x="274" y="760" text-anchor="middle" font-size="12" fill="#155e48">L3</text>
+  <rect x="324" y="736" width="60" height="38" fill="#a9dccb" stroke="#1f7a5f"/>
+  <text x="354" y="760" text-anchor="middle" font-size="12" fill="#155e48">…</text>
+  <rect x="384" y="736" width="110" height="38" fill="#8fd0ba" stroke="#1f7a5f"/>
+  <text x="439" y="760" text-anchor="middle" font-size="12" fill="#155e48">L n−1</text>
+  <rect x="494" y="736" width="86" height="38" fill="#eef0f3" stroke="#9aa3b2"/>
+  <text x="537" y="760" text-anchor="middle" font-size="12" fill="#5a6373">remainder</text>
+
+  <text x="44" y="790" font-size="11.5" fill="#5a6373">Level l has spacing size / 2^(base+l). Any prefix of a chunk's points is a uniform sample.</text>
+
+  <!-- geom.bin file layout -->
+  <text x="610" y="688" font-size="13" font-weight="700" fill="#1c2430">geom.bin layout (file order)</text>
+  <rect x="610" y="700" width="250" height="44" rx="4" fill="#d2efe5" stroke="#1f7a5f"/>
+  <text x="735" y="719" text-anchor="middle" font-size="12.5" font-weight="700" fill="#155e48">head block</text>
+  <text x="735" y="736" text-anchor="middle" font-size="11" fill="#1c2430">levels 0…H−1 of all chunks</text>
+  <rect x="866" y="700" width="72" height="44" fill="#f4fbf8" stroke="#1f7a5f"/>
+  <text x="902" y="726" text-anchor="middle" font-size="12" fill="#155e48">body 0</text>
+  <rect x="938" y="700" width="72" height="44" fill="#f4fbf8" stroke="#1f7a5f"/>
+  <text x="974" y="726" text-anchor="middle" font-size="12" fill="#155e48">body 1</text>
+  <rect x="1010" y="700" width="72" height="44" fill="#f4fbf8" stroke="#1f7a5f"/>
+  <text x="1046" y="726" text-anchor="middle" font-size="12" fill="#155e48">…</text>
+  <rect x="1082" y="700" width="74" height="44" fill="#f4fbf8" stroke="#1f7a5f"/>
+  <text x="1119" y="726" text-anchor="middle" font-size="12" fill="#155e48">body N</text>
+  <text x="610" y="764" font-size="11.5" fill="#5a6373">Each chunk's body is contiguous: one chunk's points are one Range request.</text>
+  <text x="610" y="780" font-size="11.5" fill="#5a6373">headOffset and bodyOffset in meta.json count points, not bytes.</text>
+
+  <!-- column types -->
+  <rect x="44" y="800" width="536" height="40" rx="6" fill="#ffffff" stroke="#cfd5df"/>
+  <text x="60" y="825" font-size="12.5" fill="#1c2430"><tspan font-weight="700">float32</tspan> · features and Extra Bytes (incl. NormalX/Y/Z) · missing: NaN</text>
+  <rect x="610" y="800" width="546" height="40" rx="6" fill="#ffffff" stroke="#cfd5df"/>
+  <text x="626" y="825" font-size="12.5" fill="#1c2430"><tspan font-weight="700">uint8</tspan> · prediction (RF class) · missing: 255 (class ids must stay below 255)</text>
+
+  <!-- ============ 3. BROWSER READ PATH AND WRITE-BACK ============ -->
+  <rect x="24" y="884" width="1152" height="240" rx="10" fill="#f6f7f9" stroke="#dde1e8"/>
+  <text x="44" y="912" font-size="16" font-weight="700" fill="#1c2430">3 · Browser read path and write-back</text>
+
+  <text x="44" y="940" font-size="11" font-weight="700" fill="#5a6373" letter-spacing="1">READ · BROWSER</text>
+
+  <rect x="44" y="948" width="220" height="72" rx="8" fill="#e9f7f2" stroke="#1f7a5f" stroke-width="1.5"/>
+  <text x="154" y="974" text-anchor="middle" font-size="14" font-weight="700" fill="#155e48">pc/ files</text>
+  <text x="154" y="992" text-anchor="middle" font-size="11.5" fill="#1c2430">/pointcloud-data/ · HTTP Range</text>
+  <text x="154" y="1008" text-anchor="middle" font-size="11.5" fill="#1c2430">versioned URLs (?v=…)</text>
+
+  <line x1="264" y1="984" x2="288" y2="984" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="289" y="948" width="255" height="72" rx="8" fill="#efeafb" stroke="#6747b0" stroke-width="1.5"/>
+  <text x="416.5" y="974" text-anchor="middle" font-size="13" font-weight="700" fill="#4a2f8f">ChunkedPointCloudLoader</text>
+  <text x="416.5" y="992" text-anchor="middle" font-size="11.5" fill="#1c2430">frustum culling · LOD budget · LRU</text>
+  <text x="416.5" y="1008" text-anchor="middle" font-size="11.5" fill="#1c2430">refreshColumns() after an update</text>
+
+  <line x1="544" y1="984" x2="568" y2="984" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="569" y="948" width="240" height="72" rx="8" fill="#efeafb" stroke="#6747b0" stroke-width="1.5"/>
+  <text x="689" y="974" text-anchor="middle" font-size="13" font-weight="700" fill="#4a2f8f">pointcloud-worker.js</text>
+  <text x="689" y="992" text-anchor="middle" font-size="11.5" fill="#1c2430">decodes geom.bin and columns</text>
+  <text x="689" y="1008" text-anchor="middle" font-size="11.5" fill="#1c2430">pool of module workers</text>
+
+  <line x1="809" y1="984" x2="833" y2="984" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="834" y="948" width="322" height="72" rx="8" fill="#efeafb" stroke="#6747b0" stroke-width="1.5"/>
+  <text x="995" y="974" text-anchor="middle" font-size="13" font-weight="700" fill="#4a2f8f">GPU vertex shader</text>
+  <text x="995" y="992" text-anchor="middle" font-size="11.5" fill="#1c2430">continuous LOD: each point is kept or dropped per point</text>
+  <text x="995" y="1008" text-anchor="middle" font-size="11.5" fill="#1c2430">selections and classes act on every loaded point</text>
+
+  <text x="44" y="1048" font-size="11" font-weight="700" fill="#5a6373" letter-spacing="1">WRITE-BACK · ANNOTATIONS</text>
+
+  <line x1="416.5" y1="1020" x2="416.5" y2="1054" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="426" y="1040" font-size="11" fill="#5a6373">exportAnnotations()</text>
+
+  <rect x="289" y="1056" width="255" height="56" rx="8" fill="#efeafb" stroke="#6747b0" stroke-width="1.5"/>
+  <text x="416.5" y="1080" text-anchor="middle" font-size="12.5" font-weight="700" fill="#4a2f8f">annotations in the browser</text>
+  <text x="416.5" y="1098" text-anchor="middle" font-size="11.5" fill="#1c2430">segment + class per POINT_ID</text>
+
+  <line x1="544" y1="1084" x2="568" y2="1084" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="569" y="1056" width="240" height="56" rx="8" fill="#e7f0fb" stroke="#2563a8" stroke-width="1.5"/>
+  <text x="689" y="1080" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e4f86">working/annotations.bin</text>
+  <text x="689" y="1098" text-anchor="middle" font-size="11.5" fill="#1c2430">2 bytes per POINT_ID, gzip</text>
+
+  <line x1="809" y1="1084" x2="833" y2="1084" stroke="#5a6373" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect x="834" y="1056" width="322" height="56" rx="8" fill="#fdf1de" stroke="#b7701a" stroke-width="1.5"/>
+  <text x="995" y="1080" text-anchor="middle" font-size="12.5" font-weight="700" fill="#8a4f0e">RF training and classification</text>
+  <text x="995" y="1098" text-anchor="middle" font-size="11.5" fill="#1c2430">prediction column written via pc_columns.py</text>
+
+  <!-- ============ 4. RULES ============ -->
+  <rect x="24" y="1148" width="1152" height="150" rx="10" fill="#f6f7f9" stroke="#dde1e8"/>
+  <text x="44" y="1176" font-size="16" font-weight="700" fill="#1c2430">4 · Rules that keep the structure consistent</text>
+
+  <text x="44" y="1204" font-size="13" font-weight="700" fill="#1c2430">POINT_ID is the only join key</text>
+  <text x="44" y="1222" font-size="12" fill="#5a6373">features.las, pc/ and annotations.bin are matched by POINT_ID, never by file position.</text>
+
+  <text x="620" y="1204" font-size="13" font-weight="700" fill="#1c2430">features.las is the source of truth</text>
+  <text x="620" y="1222" font-size="12" fill="#5a6373">pc/ is a derived cache: it can always be rebuilt from features.las.</text>
+
+  <text x="44" y="1262" font-size="13" font-weight="700" fill="#1c2430">Canonical order</text>
+  <text x="44" y="1280" font-size="12" fill="#5a6373">features.las is rewritten in geom.bin order, so column updates are sequential.</text>
+
+  <text x="620" y="1262" font-size="13" font-weight="700" fill="#1c2430">Atomic updates</text>
+  <text x="620" y="1280" font-size="12" fill="#5a6373">pc_tmp/ replaces pc/ only on success; columns are written to .tmp, then renamed.</text>
+
+  <!-- footer -->
+  <text x="24" y="1322" font-size="11.5" fill="#5a6373">Replaces the former Potree 2.0 octree (PotreeConverter, removed). Details: docs/POINTCLOUD_FORMAT.md · docs/ARCHITECTURE.md</text>
+</svg>
