@@ -1370,7 +1370,7 @@ export class ChunkedPointCloudLoader {
                 return false;
             }
             float keep = clamp((ratio - ${DRAW_MIN_RATIO.toFixed(2)}) / ${(1 - DRAW_MIN_RATIO).toFixed(2)}, 0.0, 1.0);
-            float size = pcLod.w;   // the point size of the UI; the LOD threshold T only decides which points are kept
+            float size = pcLod.w;   // the point size of the UI, the LOD threshold T only decides which points are kept
             // Adaptive size: where even the full data is sparser than the point size, grow the points
             if (pcLod2.x > 0.5) size = max(size, lodInfo.y * ppu);
             size *= 0.5 + 0.5 * keep;
