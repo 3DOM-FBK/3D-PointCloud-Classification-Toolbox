@@ -139,8 +139,11 @@ export class ChunkedPointCloudLoader {
         this.activeNodes = new Set();   // names of the meshes currently shown
         this.loadingNodes = new Set();  // names of the virtual nodes being fetched
 
-        // Fixed point size for all nodes — same value regardless of LOD level
+        // Size of the drawn points in pixels (UI slider). It does NOT decide which points are drawn.
         this.pointSize = options.pointSize ?? 2;
+        // Pixel threshold of the continuous LOD: a point is kept while the spacing of its level projects to at least this many
+        // pixels. Fixed, so that changing the point size changes how big the points are, never which ones are shown.
+        this.lodThreshold = options.lodThreshold ?? 2;
         // Multiplier applied on top of the auto-computed size (controlled by the UI slider)
         this.pointSizeMultiplier = options.pointSizeMultiplier ?? 1.0;
         this.maxVisibleNodes = options.maxVisibleNodes || 4000;
@@ -651,7 +654,7 @@ export class ChunkedPointCloudLoader {
         const k = this._computeScreenK(camera);
         this._screenK = k;
         this._persp = persp;
-        const T0 = Math.max(1, this.pointSize);
+        const T0 = this.lodThreshold;
 
         const world = this.rootTransform.getWorldMatrix();
         this._refreshChunkBoxes(world);
@@ -902,14 +905,12 @@ export class ChunkedPointCloudLoader {
     }
 
     /**
-     * Sets the point size in pixels (UI slider). It is also the pixel threshold of the continuous LOD
-     * (a point is kept while the spacing of its level projects to at least this many pixels), so
-     * changing it changes how many points are needed: the LOD is re-evaluated.
+     * Sets the size of the drawn points in pixels (UI slider). The set of points drawn does not depend on it (that is
+     * decided by lodThreshold), so nothing has to be re-evaluated or fetched: only the uniform changes.
      */
     setPointSize(size) {
         this.pointSize = Math.max(1, size);
         this._updateLodUniforms();
-        if (this._lastCamera) this._requestUpdate();
     }
 
     /** Point size grows where the data is coarser than the screen (zoomed in beyond the resolution). */
@@ -976,14 +977,15 @@ export class ChunkedPointCloudLoader {
     }
 
     _updateLodUniforms() {
-        const T = Math.max(1, this.pointSize) * this.budgetFactor;
+        const T = this.lodThreshold * this.budgetFactor;          // LOD threshold (px)
+        const S = Math.max(1, this.pointSize) * this.budgetFactor;  // size of the drawn points (px)
         const mode = this.lodDebug === 'chunk' || this.lodDebug === 'level' ? 1 : (this.lodDebug === 'spacing' ? 2 : 0);
         const u = this._lodU, adaptive = this.adaptivePointSize ? 1 : 0, persp = this._persp ? 1 : 0;
-        if (u && u[0] === this._screenK && u[1] === persp && u[2] === T && u[3] === adaptive && u[4] === this.maxPointSizePx && u[5] === mode) return;
-        this._lodU = [this._screenK, persp, T, adaptive, this.maxPointSizePx, mode];
+        if (u && u[0] === this._screenK && u[1] === persp && u[2] === T && u[3] === adaptive && u[4] === this.maxPointSizePx && u[5] === mode && u[6] === S) return;
+        this._lodU = [this._screenK, persp, T, adaptive, this.maxPointSizePx, mode, S];
         for (const mat of [this._baseMat, this._featureShaderMat]) {
             if (!mat) continue;
-            mat.setVector4('pcLod', new BABYLON.Vector4(this._screenK, persp, T, 0));
+            mat.setVector4('pcLod', new BABYLON.Vector4(this._screenK, persp, T, S));
             mat.setVector4('pcLod2', new BABYLON.Vector4(adaptive, this.maxPointSizePx, mode, 0));
         }
     }
@@ -992,7 +994,7 @@ export class ChunkedPointCloudLoader {
     getDrawParams() {
         return {
             k: this._screenK, perspective: this._persp,
-            threshold: Math.max(1, this.pointSize) * this.budgetFactor,
+            threshold: this.lodThreshold * this.budgetFactor,
             minRatio: DRAW_MIN_RATIO
         };
     }
@@ -1339,12 +1341,12 @@ export class ChunkedPointCloudLoader {
 
     /**
      * Shared by the colour and the feature vertex shaders. The point is kept while the spacing of its
-     * level (lodInfo.x, world units) projects to >= DRAW_MIN * T pixels, T = pcLod.z (point size x
+     * level (lodInfo.x, world units) projects to >= DRAW_MIN * T pixels, T = pcLod.z (LOD threshold x
      * budget factor); between DRAW_MIN*T and T it is drawn smaller. Pixels per unit:
      *   perspective  ppu = k / w   (w = view depth),   orthographic  ppu = k       (k = P[1][1] * H / 2)
      * which is exactly what the loader uses to decide what to fetch. NaN positions (hidden points) give
      * a NaN ratio, which fails the test and is dropped.
-     *   pcLod  = (k, perspective flag, threshold px, -)
+     *   pcLod  = (k, perspective flag, LOD threshold px, size of the drawn points px)
      *   pcLod2 = (adaptive point size flag, max point size px, debug mode, -)
      */
     static _lodVertexCommon = `
@@ -1368,12 +1370,12 @@ export class ChunkedPointCloudLoader {
                 return false;
             }
             float keep = clamp((ratio - ${DRAW_MIN_RATIO.toFixed(2)}) / ${(1 - DRAW_MIN_RATIO).toFixed(2)}, 0.0, 1.0);
-            float size = T;
+            float size = pcLod.w;   // the point size of the UI; the LOD threshold T only decides which points are kept
             // Adaptive size: where even the full data is sparser than the point size, grow the points
             if (pcLod2.x > 0.5) size = max(size, lodInfo.y * ppu);
             size *= 0.5 + 0.5 * keep;
             gl_Position = p;
-            gl_PointSize = clamp(size, 1.0, max(pcLod2.y, 1.0));
+            gl_PointSize = clamp(size, 1.0, max(pcLod2.y, max(pcLod.w, 1.0)));   // the adaptive growth is capped, the size asked for is not
             return true;
         }
 

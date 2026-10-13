@@ -369,20 +369,15 @@
 
                     <h2 id="view-mode">Different view modes  
                         <img src="{% static 'viewer/icons/camera_prosp.png' %}" alt="Perspective view" style="width:17px; height:17px;"> 
-                        <img src="{% static 'viewer/icons/camera_ortho.png' %}" alt="Orthographic view" style="width:17px; height:17px;"> 
-                        <img src="{% static 'viewer/icons/camera_top.png' %}" alt="Top view" style="width:17px; height:17px;"> 
-                        <img src="{% static 'viewer/icons/camera_right.png' %}" alt="Right view" style="width:17px; height:17px;"> 
-                        <img src="{% static 'viewer/icons/camera_front.png' %}" alt="Front view" style="width:17px; height:17px;"> 
-                        <img src="{% static 'viewer/icons/camera_left.png' %}" alt="Left view" style="width:17px; height:17px;"> 
+                        <img src="{% static 'viewer/icons/camera_ortho.png' %}" alt="Orthographic view" style="width:17px; height:17px;">
                     </h2>
                     <p>There are different view modes available:</p>
                     <ul>
                         <li>Perspective view: shows the point cloud with a perspective projection, simulating how the human eye perceives depth;</li>
                         <li>Orthographic view: shows the point cloud with an orthographic projection, where all lines remain parallel;</li>
-                        <li>Top view (<code>1 / Numpad 1</code>): shows the point cloud from a top-down perspective;</li>
-                        <li>Right view (<code>2 / Numpad 2</code>): shows the point cloud from a right-side perspective;</li>
-                        <li>Front view (<code>3 / Numpad 3</code>): shows the point cloud from a front-facing perspective;</li>
-                        <li>Left view (<code>4 / Numpad 4</code>): shows the point cloud from a left-side perspective;</li>
+                        <li>Standard views (Top, Right, Front, Left): click an axis sphere of the orientation gizmo in the bottom left corner
+                            to move smoothly to that view; click the opposite sphere to view from the other side. Keyboard shortcuts also work:
+                            Top (<code>1 / Numpad 1</code>), Right (<code>2 / Numpad 2</code>), Front (<code>3 / Numpad 3</code>), Left (<code>4 / Numpad 4</code>);</li>
                         <li>Color view: displays the point cloud with colors based on intensity or other attributes;</li>
                         <li>Classification view: shows the point cloud with colors based on classification labels;</li>
                         <li>Scalar field view: displays the point cloud with colors based on scalar field values;</li>
@@ -472,8 +467,8 @@
                     <p>On the right panel you can adjust the viewport settings:
                         <ul>
                             <li>Show Grid: toggle the visibility of the grid on the ground plane (<code>default ON</code>);</li>
-                            <li>Light Background: toggle the light background color (<code>default OFF</code>);</li>
-                            <li>Point Size: adjust the size of the points in the point cloud;</li>
+                            <li>Background: click the colour circle to open the colour picker and choose the viewport background colour (the grid adapts to it);</li>
+                            <li>Point Size: adjust the size of the points in the point cloud with the slider; the value is shown on its left;</li>
                            </ul>
                     </p>
 

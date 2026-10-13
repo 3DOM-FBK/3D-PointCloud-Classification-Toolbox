@@ -73,7 +73,7 @@ viewer uses it instead of whole levels (`static/viewer/js/pointcloud-lod.js`, sh
 
 The worker writes `lodSpacing` and `fullSpacing` (the spacing with every point of the chunk loaded) as the vertex
 attribute `lodInfo`; the vertex shader drops the points whose spacing projects to less than the pixel threshold
-(point size × a budget factor) and enlarges the points where even the full data is sparser than the screen.
+(`lodThreshold`, 2 px by default, × a budget factor; it does not depend on the point size of the UI, which only sets how big the kept points are) and enlarges the points where even the full data is sparser than the screen.
 The loader fetches, for every chunk in view, `need` points: those whose spacing at the chunk's nearest point
 still projects to the threshold. All the screen decisions use one metric, `ppu = P[1][1]·H/2 / z` (perspective) or
 `P[1][1]·H/2` (orthographic), computed from the camera projection matrix.

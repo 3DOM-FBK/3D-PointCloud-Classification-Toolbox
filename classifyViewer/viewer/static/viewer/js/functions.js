@@ -1020,6 +1020,103 @@ export function createSlider(label, min, max, initial, step, parent) {
 }
 
 /**
+ * Viewport Settings row: label in the first column, value in the second one.
+ * Returns the value cell, which the caller fills (swatch, slider, ...).
+ */
+export function createViewportRow(label, parent) {
+    const row = document.createElement('div');
+    row.classList.add('property-row', 'viewport-row');
+
+    const labelSpan = document.createElement('span');
+    labelSpan.classList.add('property-label');
+    labelSpan.textContent = label + ":";
+
+    const valueCell = document.createElement('div');
+    valueCell.classList.add('viewport-value');
+
+    row.appendChild(labelSpan);
+    row.appendChild(valueCell);
+    parent.appendChild(row);
+
+    return valueCell;
+}
+
+const VIEWPORT_LABEL_WIDTH_VAR = '--viewport-label-width';
+const VIEWPORT_LABEL_WIDTH_KEY = 'viewer.viewportLabelWidth';
+const VIEWPORT_LABEL_MIN = 70;   // px: smallest label column that still fits "Background:"
+const VIEWPORT_VALUE_MIN = 80;   // px: smallest value column (switch, swatch, value box + slider)
+const VIEWPORT_PADDING = 15;     // px: horizontal padding of the accordion content
+
+/**
+ * Adds a draggable divider between the label and value columns of a Viewport Settings
+ * panel. The width is kept in the `--viewport-label-width` variable of `container`
+ * and remembered in localStorage; double-clicking the divider restores the default.
+ */
+export function makeViewportColumnsResizable(container) {
+    const maxWidth = () => container.clientWidth
+        ? container.clientWidth - 2 * VIEWPORT_PADDING - VIEWPORT_VALUE_MIN
+        : Infinity;
+    const setLabelWidth = (px) => {
+        const clamped = Math.min(Math.max(px, VIEWPORT_LABEL_MIN), Math.max(maxWidth(), VIEWPORT_LABEL_MIN));
+        container.style.setProperty(VIEWPORT_LABEL_WIDTH_VAR, `${clamped}px`);
+    };
+    const currentLabelWidth = () =>
+        parseFloat(getComputedStyle(container).getPropertyValue(VIEWPORT_LABEL_WIDTH_VAR));
+
+    try {
+        const saved = parseFloat(localStorage.getItem(VIEWPORT_LABEL_WIDTH_KEY));
+        if (Number.isFinite(saved)) setLabelWidth(saved);
+    } catch (err) {
+        // storage unavailable: keep the default width
+    }
+
+    const handle = document.createElement('div');
+    handle.classList.add('viewport-col-resizer');
+    handle.title = 'Drag to resize the columns (double-click to reset)';
+    container.appendChild(handle);
+
+    let startX = 0;
+    let startWidth = 0;
+
+    handle.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        startX = e.clientX;
+        startWidth = currentLabelWidth();
+        handle.classList.add('dragging');
+    });
+
+    handle.addEventListener('pointermove', (e) => {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        setLabelWidth(startWidth + (e.clientX - startX));
+    });
+
+    const endDrag = (e) => {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        handle.releasePointerCapture(e.pointerId);
+        handle.classList.remove('dragging');
+        const width = parseFloat(container.style.getPropertyValue(VIEWPORT_LABEL_WIDTH_VAR));
+        try {
+            if (Number.isFinite(width)) localStorage.setItem(VIEWPORT_LABEL_WIDTH_KEY, String(width));
+        } catch (err) {
+            // storage unavailable: the width still applies for this session
+        }
+    };
+    handle.addEventListener('pointerup', endDrag);
+    handle.addEventListener('pointercancel', endDrag);
+
+    handle.addEventListener('dblclick', () => {
+        container.style.removeProperty(VIEWPORT_LABEL_WIDTH_VAR);
+        try {
+            localStorage.removeItem(VIEWPORT_LABEL_WIDTH_KEY);
+        } catch (err) {
+            // storage unavailable
+        }
+    });
+}
+
+/**
  * @param {string} name
  * @param {string} iconSrc
  * @param {HTMLElement} parent

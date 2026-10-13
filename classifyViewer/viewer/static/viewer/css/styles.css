@@ -239,14 +239,15 @@ textarea,
     max-width: 500px;
 }
 
+/* No border on the side facing the 3D viewer: the .resizer strip is the only visible edge */
 #sidebar-left {
     width: calc(var(--side-panel-width) - 50px);
-    border-right: 1px solid var(--border-color);
+    border-right: 0;
 }
 
 #sidebar-right {
     width: var(--side-panel-width);
-    border-left: 1px solid var(--border-color);
+    border-left: 0;
 }
 
 .panel-header {
@@ -264,12 +265,11 @@ textarea,
 
 .panel-content {
     flex: 1;
-    padding: 15px;
+    padding: 8px;
     overflow-y: auto;
     overflow-x: hidden;
     display: flex;
     flex-direction: column;
-    gap: 10px;
 }
 
 /* Viewport Centrale */
@@ -290,11 +290,23 @@ textarea,
 
 /* Resizer Handles */
 .resizer {
-    width: 4px;
-    background-color: transparent;
+    position: relative;
+    width: 1px;
+    /* Same colour as the side panels, so the strip does not show as a dark line */
+    background-color: var(--panel-bg);
     cursor: col-resize;
     z-index: 10;
     transition: background-color 0.2s;
+}
+
+/* Invisible grab area wider than the 1px strip, so the divider is still easy to hit */
+.resizer::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -2px;
+    right: -2px;
 }
 
 .resizer:hover,
@@ -725,8 +737,17 @@ textarea,
 /* Sezioni Accordion */
 .accordion-section {
     border-bottom: 1px solid var(--border-color);
-    margin: -15px -15px 15px -15px;
+    margin: 0px -15px 15px -15px;
     /* Compensa il padding del parent */
+}
+
+/* Card: sezione staccata dai bordi del pannello, con angoli arrotondati */
+.accordion-section.accordion-card {
+    margin: 0 12px 0;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.02);
+    overflow: hidden;
 }
 
 .accordion-header {
@@ -1010,6 +1031,201 @@ select.property-input option {
 
 .switch input:checked+.switch-slider:before {
     transform: translateX(16px);
+}
+
+/* Viewport Settings: label column, then the value column left-aligned next to it */
+.viewport-settings {
+    --viewport-label-width: 104px;
+    --viewport-value-indent: 8px;
+    position: relative;
+}
+
+.viewport-settings .property-row {
+    display: grid;
+    grid-template-columns: var(--viewport-label-width) minmax(0, 1fr);
+    align-items: center;
+    min-height: var(--property-row-height);
+}
+
+.viewport-value {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding-left: var(--viewport-value-indent);
+}
+
+/* The switch sits directly in the value column: same indent as the other values */
+.viewport-settings .property-row > .switch {
+    margin-left: var(--viewport-value-indent);
+}
+
+/* Draggable divider between the label and value columns */
+.viewport-col-resizer {
+    position: absolute;
+    top: 15px;
+    bottom: 15px;
+    left: calc(15px + var(--viewport-label-width) - 4px);
+    width: 8px;
+    cursor: col-resize;
+    touch-action: none;
+    z-index: 1;
+}
+
+.viewport-col-resizer::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 1px;
+    transform: translateX(-50%);
+    background-color: var(--border-color);
+    transition: background-color 0.15s, width 0.15s;
+}
+
+.viewport-col-resizer:hover::after,
+.viewport-col-resizer.dragging::after {
+    width: 2px;
+    background-color: var(--accent-blue);
+}
+
+/* Background colour swatch: opens the colour picker */
+.viewport-swatch {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    cursor: pointer;
+    transition: transform 0.15s;
+}
+
+.viewport-swatch:hover {
+    transform: scale(1.12);
+}
+
+.viewport-swatch:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+}
+
+/* Numeric value shown on the left of the Point Size slider */
+.viewport-value-box {
+    flex-shrink: 0;
+    min-width: 44px;
+    padding: 3px 6px;
+    text-align: center;
+    background-color: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.viewport-value .property-slider {
+    flex: 1;
+    min-width: 0;
+}
+
+/* Colour picker popover (color-picker.js) */
+.color-picker {
+    position: fixed;
+    z-index: 1000;
+    width: 232px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background-color: var(--panel-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+}
+
+.color-picker-sv {
+    position: relative;
+    height: 140px;
+    border-radius: 6px;
+    cursor: crosshair;
+    touch-action: none;
+}
+
+.color-picker-thumb {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid #ffffff;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+}
+
+.color-picker-hue {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 10px;
+    margin: 0;
+    border-radius: 5px;
+    outline: none;
+    background: linear-gradient(to right, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000);
+}
+
+.color-picker-hue::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #ffffff;
+    border: 2px solid var(--border-color);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    cursor: pointer;
+}
+
+.color-picker-footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.color-picker-preview {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+}
+
+.color-picker-footer .color-picker-hex {
+    width: 100%;
+    min-width: 0;
+    text-transform: lowercase;
+}
+
+.color-picker-presets {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 6px;
+}
+
+.color-picker-preset {
+    aspect-ratio: 1;
+    padding: 0;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    cursor: pointer;
+    transition: transform 0.15s;
+}
+
+.color-picker-preset:hover {
+    transform: scale(1.12);
 }
 
 /* Outline Items */

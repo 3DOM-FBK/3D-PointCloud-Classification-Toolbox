@@ -86,6 +86,8 @@ Django REST API (Python 3.10, Gunicorn)
   colour); `getLodStats()` returns, per chunk, the points needed / loaded and the projected spacing,
   plus the budget factor; `setAdaptivePointSize(false)` turns off the growth of the points where the
   data is sparser than the screen.
+- **Point size vs. LOD threshold:** the slider (`setPointSize`) only changes the size of the drawn points (uniform `pcLod.w`); which points
+  are drawn and fetched is decided by `lodThreshold` (fixed, 2 px), so changing the size never adds or removes points.
 
 **State management:** Application state (class registry, segment map, active mode,
 annotation buffer) is held in the global scope and ES6 module exports. There is no

@@ -4,7 +4,8 @@ import {
     createAccordionSection,
     createPropertyRow,
     createCheckbox,
-    createSlider,
+    createViewportRow,
+    makeViewportColumnsResizable,
     createOutlineItem,
     createClassItem,
     loadPointCloud,
@@ -29,6 +30,7 @@ import {
     refreshPointCloudColumns,
     PC_DIR
 } from "./functions.js";
+import { openColorPicker, hexToRgb, rgbToHex } from "./color-picker.js";
 
 // --- Runtime path helpers (read from Django-injected config) ---
 const _runtimeUrl = (...parts) => {
@@ -386,20 +388,9 @@ function initViewMenu() {
         { name: "Orthographic", icon: "camera_ortho.png", action: () => setCameraMode(BABYLON.Camera.ORTHOGRAPHIC_CAMERA) }
     ];
 
-    const directionalViews = [
-        { name: "Top View", icon: "camera_top.png", action: () => setCameraView(0, -Math.PI / 2) },
-        { name: "Right View", icon: "camera_right.png", action: () => setCameraView(0, Math.PI / 2) },
-        { name: "Front View", icon: "camera_front.png", action: () => setCameraView(Math.PI / 2, Math.PI / 2) },
-        { name: "Left View", icon: "camera_left.png", action: () => setCameraView(Math.PI, Math.PI / 2) }
-    ];
-
+    // Standard views (Top/Right/Front/Left) are chosen by clicking the axes of the gizmo.
     const projectionGroup = document.createElement('div');
     projectionGroup.classList.add('camera-btn-group');
-
-    const directionGroup = document.createElement('div');
-    directionGroup.classList.add('camera-btn-group');
-
-    const allGroups = [projectionGroup, directionGroup];
 
     const appendViewButton = (container, v, keepsActiveState = false) => {
         const btn = document.createElement('button');
@@ -423,10 +414,8 @@ function initViewMenu() {
     };
 
     projectionModes.forEach(v => appendViewButton(projectionGroup, v, true));
-    directionalViews.forEach(v => appendViewButton(directionGroup, v, false));
 
     viewMenu.appendChild(projectionGroup);
-    viewMenu.appendChild(directionGroup);
 
     const predictionLegend = document.createElement('div');
     predictionLegend.classList.add('prediction-legend');
@@ -895,12 +884,50 @@ function updateOrthoCamera() {
     syncOrthoCamera(true);
 }
 
+// --- Standard views: animated camera moves (gizmo axes, keys 1-4) ---
+const VIEW_ANIMATION_MS = 350;
+const VIEW_BETA_EPSILON = 0.001; // Babylon's up vector is undefined exactly at the poles
+let viewAnimation = null;
+
+/**
+ * ArcRotateCamera angles that look at the target from a direction (Babylon, Y up):
+ * position = target + r * (sin(beta) cos(alpha), cos(beta), sin(beta) sin(alpha)).
+ * E.g. +X -> alpha 0, beta PI/2 (Right); +Z -> alpha PI/2, beta PI/2 (Front); +Y -> beta 0 (Top).
+ */
+function viewAnglesForDirection([x, y, z]) {
+    const len = Math.hypot(x, y, z) || 1;
+    return {
+        alpha: Math.atan2(z / len, x / len),
+        beta: Math.acos(Math.max(-1, Math.min(1, y / len))),
+    };
+}
+
+/** Moves the camera to (alpha, beta) with an eased animation, keeping radius and target. */
 function setCameraView(alpha, beta) {
-    // Ensure we are in perspective if moving to standard views for better feel, 
-    // or keep current mode.
-    camera.alpha = alpha;
-    camera.beta = beta;
-    // Animate would be better, but let's keep it simple for now
+    const toBeta = Math.min(Math.max(beta, VIEW_BETA_EPSILON), Math.PI - VIEW_BETA_EPSILON);
+    // Take the shortest way round the circle
+    let deltaAlpha = (alpha - camera.alpha) % (2 * Math.PI);
+    if (deltaAlpha > Math.PI) deltaAlpha -= 2 * Math.PI;
+    if (deltaAlpha < -Math.PI) deltaAlpha += 2 * Math.PI;
+
+    camera.inertialAlphaOffset = 0;
+    camera.inertialBetaOffset = 0;
+    viewAnimation = {
+        fromAlpha: camera.alpha,
+        deltaAlpha,
+        fromBeta: camera.beta,
+        toBeta,
+        start: performance.now(),
+    };
+}
+
+function updateViewAnimation() {
+    if (!viewAnimation) return;
+    const t = Math.min((performance.now() - viewAnimation.start) / VIEW_ANIMATION_MS, 1);
+    const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+    camera.alpha = viewAnimation.fromAlpha + viewAnimation.deltaAlpha * eased;
+    camera.beta = viewAnimation.fromBeta + (viewAnimation.toBeta - viewAnimation.fromBeta) * eased;
+    if (t >= 1) viewAnimation = null;
 }
 
 // --- Layout mode tool-button references (set inside initToolbar) ---
@@ -1146,6 +1173,7 @@ const iconBase = "static/viewer/icons/";
 // 1. Classes
 const classesSection = createAccordionSection("Classes", "sidebar-left-content");
 const classesContent = classesSection.content;
+classesContent.closest('.accordion-section').classList.add('accordion-card');
 const classesHeaderActions = classesSection.headerActions;
 
 // Add Class button in the header
@@ -1166,6 +1194,7 @@ createClassItem("Ground", `${iconBase}cluster.png`, classesContent);
 // 2. Outline
 const outlineSection = createAccordionSection("Outline", "sidebar-left-content");
 const outlineContent = outlineSection.content;
+outlineContent.closest('.accordion-section').classList.add('accordion-card');
 
 // The main point cloud outline item is created lazily when data is actually loaded.
 let outlineItem = null;
@@ -1407,6 +1436,7 @@ export const sceneObjects = {
 // 1. Features Computation
 const featuresSection = createAccordionSection("FEATURES COMPUTATION", "sidebar-right-content");
 const featuresContent = featuresSection.content;
+featuresContent.closest('.accordion-section').classList.add('accordion-card');
 
 const featuresInfo = document.createElement('div');
 featuresInfo.style.fontSize = "0.75rem";
@@ -1428,6 +1458,7 @@ calculateButton.onclick = () => {
 // 3. Training
 const trainingSection = createAccordionSection("TRAINING", "sidebar-right-content");
 const trainingContent = trainingSection.content;
+trainingContent.closest('.accordion-section').classList.add('accordion-card');
 
 const trainingInfo = document.createElement('div');
 trainingInfo.style.fontSize = "0.75rem";
@@ -1456,10 +1487,39 @@ const startClassifyButton = createButton("Start Classify", "startClassify", clas
 // 5. Viewport Settings
 const viewportSection = createAccordionSection("Viewport Settings", "sidebar-right-content");
 const viewportContent = viewportSection.content;
+viewportContent.classList.add('viewport-settings');
+viewportContent.closest('.accordion-section').classList.add('accordion-card');
 
 const gridToggle = createCheckbox("Show Grid", true, viewportContent);
-const lightModeToggle = createCheckbox("Light Background", false, viewportContent);
-const pointSizeSlider = createSlider("Point Size", 0.1, 5.0, 1.0, 0.05, viewportContent);
+
+// Background: a colour swatch that opens the colour picker (applied to scene and grid)
+const backgroundValueCell = createViewportRow("Background", viewportContent);
+const backgroundSwatch = document.createElement('button');
+backgroundSwatch.type = 'button';
+backgroundSwatch.classList.add('viewport-swatch');
+backgroundSwatch.title = 'Change background colour';
+let viewportBackgroundHex = getComputedStyle(document.documentElement).getPropertyValue('--bg-dark').trim() || '#121214';
+backgroundSwatch.style.backgroundColor = viewportBackgroundHex;
+backgroundValueCell.appendChild(backgroundSwatch);
+
+// Point Size: numeric box on the left of the slider; the slider fills the rest of the column
+const pointSizeValueCell = createViewportRow("Point Size", viewportContent);
+const pointSizeBox = document.createElement('span');
+pointSizeBox.classList.add('viewport-value-box');
+pointSizeBox.textContent = (1.0).toFixed(2);
+const pointSizeSlider = document.createElement('input');
+pointSizeSlider.type = 'range';
+pointSizeSlider.min = 0.1;
+pointSizeSlider.max = 5.0;
+pointSizeSlider.step = 0.05;
+pointSizeSlider.value = 1.0;
+pointSizeSlider.classList.add('property-slider');
+pointSizeSlider.addEventListener('input', () => {
+    pointSizeBox.textContent = Number(pointSizeSlider.value).toFixed(2);
+});
+pointSizeValueCell.append(pointSizeBox, pointSizeSlider);
+
+makeViewportColumnsResizable(viewportContent);
 
 // Rotation controls moved to toolbar gizmo tool (tool-7).
 
@@ -1529,6 +1589,9 @@ camera.inertia = 0.8;
 camera.panningSensibility = 250;
 // Blender-like pan feel: no momentum/lag while dragging.
 camera.panningInertia = 0;
+scene.onBeforeRenderObservable.add(updateViewAnimation);
+// A drag on the scene takes over from a view animation still in progress
+canvas.addEventListener('pointerdown', () => { viewAnimation = null; });
 
 const ORTHO_NEAR_MIN = 0.0001;
 const ORTHO_FAR_MIN = 100;
@@ -2623,6 +2686,8 @@ const GIZMO_AXES = [
 ];
 
 const CX = 60, CY = 60, ARM = 40, R_POS = 11, R_NEG = 7;
+// Screen positions of the axis spheres of the last frame (used to hit-test clicks)
+let gizmoHitTargets = [];
 
 scene.registerBeforeRender(() => {
     const m = camera.getViewMatrix().m;
@@ -2630,6 +2695,7 @@ scene.registerBeforeRender(() => {
     for (let i = 0; i < 16; i++) {
         if (!Number.isFinite(m[i])) {
             gizmoSvg.innerHTML = '';
+            gizmoHitTargets = [];
             return;
         }
     }
@@ -2638,7 +2704,7 @@ scene.registerBeforeRender(() => {
         const vx = dir[0] * m[0] + dir[1] * m[4] + dir[2] * m[8];
         const vy = -(dir[0] * m[1] + dir[1] * m[5] + dir[2] * m[9]);
         const depth = -(dir[0] * m[2] + dir[1] * m[6] + dir[2] * m[10]);
-        return { sx: CX + vx * ARM, sy: CY + vy * ARM, depth, color, label };
+        return { sx: CX + vx * ARM, sy: CY + vy * ARM, depth, color, label, dir };
     }).filter(({ sx, sy, depth }) =>
         Number.isFinite(sx) &&
         Number.isFinite(sy) &&
@@ -2647,10 +2713,14 @@ scene.registerBeforeRender(() => {
 
     if (projected.length !== GIZMO_AXES.length) {
         gizmoSvg.innerHTML = '';
+        gizmoHitTargets = [];
         return;
     }
 
     projected.sort((a, b) => a.depth - b.depth);
+    gizmoHitTargets = projected.map(({ sx, sy, depth, label, dir }) => ({
+        sx, sy, depth, dir, r: label !== '' ? R_POS : R_NEG,
+    }));
 
     gizmoSvg.innerHTML = '';
 
@@ -2700,6 +2770,49 @@ scene.registerBeforeRender(() => {
     });
 });
 
+// Clicking an axis sphere moves to that view (Blender-style). The gizmo SVG takes the
+// pointer events itself, so a press on it never reaches the canvas.
+gizmoSvg.style.pointerEvents = 'auto';
+const GIZMO_CLICK_MAX_MOVE = 4; // px: a larger move is a drag, not a click
+let gizmoPress = null;
+
+function gizmoLocalPoint(e) {
+    const rect = gizmoSvg.getBoundingClientRect();
+    const k = 120 / rect.width; // the SVG viewBox is 120 units wide
+    return { x: (e.clientX - rect.left) * k, y: (e.clientY - rect.top) * k };
+}
+
+function gizmoAxisAt(e) {
+    if (!gizmoSvg.getBoundingClientRect().width) return null;
+    const p = gizmoLocalPoint(e);
+    let hit = null;
+    for (const t of gizmoHitTargets) {
+        if (Math.hypot(p.x - t.sx, p.y - t.sy) <= t.r + 3 && (!hit || t.depth > hit.depth)) hit = t;
+    }
+    return hit;
+}
+
+gizmoSvg.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    gizmoPress = { x: e.clientX, y: e.clientY };
+});
+
+// Released anywhere: the pointer may leave the gizmo while dragging
+window.addEventListener('pointerup', (e) => {
+    if (!gizmoPress) return;
+    const moved = Math.hypot(e.clientX - gizmoPress.x, e.clientY - gizmoPress.y);
+    gizmoPress = null;
+    if (moved > GIZMO_CLICK_MAX_MOVE) return;
+    const hit = gizmoAxisAt(e);
+    if (!hit) return;
+    const { alpha, beta } = viewAnglesForDirection(hit.dir);
+    setCameraView(alpha, beta);
+});
+
+gizmoSvg.addEventListener('pointermove', (e) => {
+    gizmoSvg.style.cursor = gizmoAxisAt(e) ? 'pointer' : 'default';
+});
+
 // --- Actions Logic ---
 
 // Toggle Grid
@@ -2709,30 +2822,33 @@ gridToggle.addEventListener('change', (e) => {
     }
 });
 
-// Toggle Light Mode
-lightModeToggle.addEventListener('change', (e) => {
-    const isLight = e.target.checked;
-    const style = getComputedStyle(document.documentElement);
-
-    if (isLight) {
-        const lightBg = style.getPropertyValue('--bg-light').trim() || "#f5f5f7";
-        const lightGrid = style.getPropertyValue('--grid-lines-light').trim() || "#d1d1d6";
-
-        scene.clearColor = BABYLON.Color4.FromHexString(lightBg + "FF");
-        if (gridMaterial) {
-            gridMaterial.mainColor = BABYLON.Color4.FromHexString(lightBg + "FF");
-            gridMaterial.lineColor = BABYLON.Color4.FromHexString(lightGrid + "FF");
-        }
-    } else {
-        const darkBg = style.getPropertyValue('--bg-dark').trim() || "#121214";
-        const darkGrid = style.getPropertyValue('--grid-lines').trim() || "#8d8d99";
-
-        scene.clearColor = BABYLON.Color4.FromHexString(darkBg + "FF");
-        if (gridMaterial) {
-            gridMaterial.mainColor = BABYLON.Color4.FromHexString(darkBg + "FF");
-            gridMaterial.lineColor = BABYLON.Color4.FromHexString(darkGrid + "FF");
-        }
+// Viewport background: the swatch opens the colour picker; scene and grid follow it
+function setViewportBackground(hex) {
+    viewportBackgroundHex = hex;
+    backgroundSwatch.style.backgroundColor = hex;
+    scene.clearColor = BABYLON.Color4.FromHexString(hex + "FF");
+    if (gridMaterial) {
+        gridMaterial.mainColor = BABYLON.Color4.FromHexString(hex + "FF");
+        gridMaterial.lineColor = BABYLON.Color4.FromHexString(gridLineColorFor(hex) + "FF");
     }
+}
+
+// Grid lines: darker on light backgrounds, lighter on dark ones
+function gridLineColorFor(hex) {
+    const { r, g, b } = hexToRgb(hex);
+    const luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    const isLight = luminance > 0.5;
+    const target = isLight ? 0 : 255;
+    const amount = isLight ? 0.15 : 0.45;
+    return rgbToHex({
+        r: r + (target - r) * amount,
+        g: g + (target - g) * amount,
+        b: b + (target - b) * amount,
+    });
+}
+
+backgroundSwatch.addEventListener('click', () => {
+    openColorPicker(backgroundSwatch, viewportBackgroundHex, setViewportBackground);
 });
 
 // Slider Point Size — works as a multiplier for the auto spacing-based size.
