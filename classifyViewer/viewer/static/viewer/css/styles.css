@@ -294,8 +294,8 @@ textarea,
 .resizer {
     position: relative;
     width: 1px;
-    /* Same colour as the side panels, so the strip does not show as a dark line */
-    background-color: var(--panel-bg);
+    /* Thin light-grey edge between each sidebar and the viewer */
+    background-color: var(--border-color);
     cursor: col-resize;
     z-index: 10;
     transition: background-color 0.2s;

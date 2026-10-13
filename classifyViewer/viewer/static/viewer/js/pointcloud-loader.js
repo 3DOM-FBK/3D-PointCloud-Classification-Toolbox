@@ -2105,8 +2105,7 @@ export class ChunkedPointCloudLoader {
         return false;
     }
 
-    _matchesSelectionEntry(localVector, selections, deselections = EMPTY_LIST, inverted = false) {
-        const world = this.rootTransform.getWorldMatrix();
+    _matchesSelectionEntry(localVector, selections, deselections = EMPTY_LIST, inverted = false, world = this.rootTransform.getWorldMatrix()) {
         if (!this._matcherCache) this._matcherCache = new WeakMap();
         // the history arrays are mutated in place (push): the length and the last entry are part of the key
         let c = this._matcherCache.get(selections);
@@ -2163,7 +2162,7 @@ export class ChunkedPointCloudLoader {
                 z < entry.minZ || z > entry.maxZ) continue;
 
             // 2. Accurate region check, including deselections and inverted selection state.
-            if (this._matchesSelectionEntry(localVector, entry.selections, entry.deselections, entry.inverted)) {
+            if (this._matchesSelectionEntry(localVector, entry.selections, entry.deselections, entry.inverted, entry.world ?? worldMatrix)) {
                 finalCls = { classId: entry.classId, r: entry.r, g: entry.g, b: entry.b };
             }
         }
@@ -2291,6 +2290,9 @@ export class ChunkedPointCloudLoader {
             const margin = this._getAabbMargin();
             this.classificationHistory.push({
                 classId, r, g, b,
+                // The regions were drawn with the cloud in this pose: keep it, so that later rotations or
+                // moves of the cloud do not change which points the class covers
+                world: worldMatrix.clone(),
                 inverted: this.selectionInverted,
                 visibleSegmentIds,
                 cutCreationOrderAtClassification: this._cutCreationCounter,
@@ -2442,7 +2444,7 @@ export class ChunkedPointCloudLoader {
         const tmpVec = new BABYLON.Vector3();
 
         this.loadedNodes.forEach((mesh) => {
-            if (!mesh.metadata) return;
+            if (!mesh.metadata || !mesh.metadata.classIds) return;   // no class assigned on this node
 
             const positions = mesh.getVerticesData(BABYLON.VertexBuffer.PositionKind);
             const colors = mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
@@ -2450,37 +2452,45 @@ export class ChunkedPointCloudLoader {
             const originalPositions = mesh.metadata.originalPositions;
             if (!positions || !colors || !originalColors) return;
 
+            const classIds = mesh.metadata.classIds;
+            const classColors = mesh.metadata.classColors;
             const numPoints = positions.length / 3;
-            const newClassIds = new Int32Array(numPoints);
-            const newClassColors = new Float32Array(numPoints * 4);
 
+            // Only the points of the removed class are recomputed. Every other point keeps its class and
+            // colour as they are: re-deriving them from the history could change classes that were not touched.
             for (let i = 0; i < numPoints; i++) {
+                if (classIds[i] !== classId) continue;
+                affected++;
+
                 const x = originalPositions ? originalPositions[i * 3] : positions[i * 3];
                 const y = originalPositions ? originalPositions[i * 3 + 1] : positions[i * 3 + 1];
                 const z = originalPositions ? originalPositions[i * 3 + 2] : positions[i * 3 + 2];
 
+                // Another remaining class that covers the point (points under an overlap fall back to it), or none
                 tmpVec.set(x, y, z);
                 const cls = this._getPointClassification(tmpVec);
+                const newId = cls ? cls.classId : 0;
+                classIds[i] = newId;
                 if (cls) {
-                    newClassIds[i] = cls.classId;
-                    newClassColors[i * 4] = cls.r;
-                    newClassColors[i * 4 + 1] = cls.g;
-                    newClassColors[i * 4 + 2] = cls.b;
-                    newClassColors[i * 4 + 3] = 1.0;
-
-                    // Sync to canonical map
-                    const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
-                    if (this._pointClassMap && pid >= 0 && pid < this._pointClassMap.length) {
-                        this._pointClassMap[pid] = cls.classId;
-                    }
+                    classColors[i * 4] = cls.r;
+                    classColors[i * 4 + 1] = cls.g;
+                    classColors[i * 4 + 2] = cls.b;
+                    classColors[i * 4 + 3] = 1.0;
+                } else {
+                    classColors[i * 4] = 0;
+                    classColors[i * 4 + 1] = 0;
+                    classColors[i * 4 + 2] = 0;
+                    classColors[i * 4 + 3] = 0;
                 }
 
-                const hadRemovedClass = mesh.metadata.classIds && mesh.metadata.classIds[i] === classId;
-                if (hadRemovedClass) affected++;
+                // Sync to canonical map
+                const pid = mesh.metadata.pointIds ? mesh.metadata.pointIds[i] : -1;
+                if (this._pointClassMap && pid >= 0 && pid < this._pointClassMap.length) {
+                    this._pointClassMap[pid] = newId;
+                }
 
-                const hasClassNow = newClassIds[i] > 0;
-                if (this.colorMode === "classification" && hasClassNow) {
-                    this._writeBlendedClassColor(colors, i, originalColors, newClassColors);
+                if (this.colorMode === "classification" && newId > 0) {
+                    this._writeBlendedClassColor(colors, i, originalColors, classColors);
                 } else {
                     colors[i * 4] = originalColors[i * 4];
                     colors[i * 4 + 1] = originalColors[i * 4 + 1];
@@ -2489,8 +2499,6 @@ export class ChunkedPointCloudLoader {
                 }
             }
 
-            mesh.metadata.classIds = newClassIds;
-            mesh.metadata.classColors = newClassColors;
             mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, colors);
         });
 
