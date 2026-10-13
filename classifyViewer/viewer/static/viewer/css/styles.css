@@ -263,13 +263,15 @@ textarea,
     border-bottom: 1px solid var(--border-color);
 }
 
+/* Sidebar contents: every section is 6px away from the panel edges and from the next section */
 .panel-content {
     flex: 1;
-    padding: 8px;
+    padding: 6px;
     overflow-y: auto;
     overflow-x: hidden;
     display: flex;
     flex-direction: column;
+    gap: 6px;
 }
 
 /* Viewport Centrale */
@@ -737,13 +739,13 @@ textarea,
 /* Sezioni Accordion */
 .accordion-section {
     border-bottom: 1px solid var(--border-color);
-    margin: 0px -15px 15px -15px;
-    /* Compensa il padding del parent */
+    margin: 0;
 }
 
-/* Card: sezione staccata dai bordi del pannello, con angoli arrotondati */
+/* Card: sezione staccata dai bordi del pannello, con angoli arrotondati.
+   Spacing comes from the .panel-content padding and gap (6px), not from margins. */
 .accordion-section.accordion-card {
-    margin: 0 12px 0;
+    margin: 0;
     border: 1px solid var(--border-color);
     border-radius: 10px;
     background-color: rgba(255, 255, 255, 0.02);

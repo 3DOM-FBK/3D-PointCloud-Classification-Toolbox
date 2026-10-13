@@ -1231,6 +1231,7 @@ window.__registerPointCloudInOutline = registerPointCloudInOutline;
 // --- Sidebar Left: Models Section (visible only in Classify mode) ---
 const modelsSection = createAccordionSection("Models", "sidebar-left-content");
 const modelsSectionEl = modelsSection.content.closest('.accordion-section');
+modelsSectionEl.classList.add('accordion-card');
 const modelsContent = modelsSection.content;
 modelsContent.style.padding = "6px 0";
 modelsSectionEl.style.display = 'none'; // hidden until Classify mode
@@ -1473,6 +1474,7 @@ const startTrainingButton = createButton("Start Training", "startTraining", trai
 const classifySection = createAccordionSection("CLASSIFY", "sidebar-right-content");
 const classifyContent = classifySection.content;
 const classifySectionEl = classifySection.content.closest('.accordion-section');
+classifySectionEl.classList.add('accordion-card');
 classifySectionEl.style.display = 'none';
 
 const classifyInfo = document.createElement('div');
