@@ -2728,7 +2728,7 @@ scene.registerBeforeRender(() => {
 
     const bg = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
     bg.setAttribute('cx', CX); bg.setAttribute('cy', CY); bg.setAttribute('r', 57);
-    bg.setAttribute('fill', 'rgba(0,0,0,0.28)');
+    bg.setAttribute('fill', 'rgba(0,0,0,0.6)');
     gizmoSvg.appendChild(bg);
 
     projected.forEach(({ sx, sy, depth, color, label }) => {
