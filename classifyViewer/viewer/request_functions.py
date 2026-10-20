@@ -3,6 +3,8 @@ from django.http import HttpResponse, StreamingHttpResponse, FileResponse, Http4
 from django.views.decorators.csrf import csrf_exempt
 from .functions import launch_training_RF, launch_classify_RF, subsampling_point_cloud, stop_processes, get_voxel_size, check_point_id, inspect_las_header
 from .functions import mesh_to_point_cloud, ply_to_las, feature_extraction, build_pointcloud, update_pointcloud_columns, PointCloudMismatch, split_las_by_store, extract_segment_las, job_progress
+from .gs_detect import gaussian_kind, GS_MESSAGE
+from .gs_import import splat_kind, convert_to_working, GS_DIR
 import base64
 import os
 import json
@@ -113,15 +115,44 @@ def launch_RF_classify(request):
     return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
 
 @csrf_exempt
+def gs_import_view(request):
+    """Converts a Gaussian splat file (PLY with splat properties, or SOG) into the working gs folder.
+    Answers {'kind': 'gs', 'path': 'working/gs'} for splats and {'kind': 'pc'} for anything else."""
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+            abs_path = os.path.abspath(os.path.join(settings.BASE_DIR, data['file_path']))
+            if not splat_kind(abs_path):
+                return JsonResponse({'status': 'ok', 'kind': 'pc'})
+            convert_to_working(abs_path)
+            return JsonResponse({'status': 'ok', 'kind': 'gs', 'path': f'working/{GS_DIR}'})
+        except Exception as e:
+            print("\n[REQUEST FUNCTION] GS IMPORT ERROR " + str(e))
+            print(traceback.format_exc())
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+    return JsonResponse({'status': 'error', 'message': 'Method not allowed'}, status=405)
+
+def _reject_gaussian_ply(file_path):
+    """Refuses a Gaussian splat PLY before it is read as a point cloud. Returns a response or None."""
+    if gaussian_kind(os.path.abspath(os.path.join(settings.BASE_DIR, file_path))):
+        print("\n[REQUEST FUNCTION] Gaussian splat PLY refused:", file_path)
+        return JsonResponse({'status': 'error', 'message': GS_MESSAGE}, status=400)
+    return None
+
+@csrf_exempt
 def subsample_pc(request):
     if request.method == 'POST':
         try:
-            print("\n[REQUEST FUNCTION] Subsample Point Cloud:", request.body[:200]) 
+            print("\n[REQUEST FUNCTION] Subsample Point Cloud:", request.body[:200])
             data = json.loads(request.body)
 
             file_path = data['file_path']
             out_path = data['out_path']
-            voxel_size = data['voxel_size'] 
+            voxel_size = data['voxel_size']
+            rejected = _reject_gaussian_ply(file_path)
+            if rejected:
+                return rejected
 
             output_file_path = subsampling_point_cloud(file_path, out_path, voxel_size)
             print("\n")
@@ -233,6 +264,9 @@ def ply2las(request):
 
             file_path = data['file_path']
             out_path = data['out_path']
+            rejected = _reject_gaussian_ply(file_path)
+            if rejected:
+                return rejected
 
             ply_to_las(file_path, out_path=out_path)
             print("\n")

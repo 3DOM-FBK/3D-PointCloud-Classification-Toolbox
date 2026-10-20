@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gs test renderer</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #16181c; color: #d8dce2; font: 13px system-ui, sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { position: fixed; left: 8px; top: 8px; background: rgba(0,0,0,.45); padding: 6px 8px; border-radius: 4px; white-space: pre; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">loading…</div>
+<script>
+// Test renderer for the `gs` v2 folder (see docs/GAUSSIAN_SPLAT_FORMAT.md).
+// Not the production renderer: it fetches a whole folder, decodes it on the main thread, sorts the view depth
+// in sort-worker.js (radix sort) and draws one instanced quad per splat with alpha blending, back to front.
+//   3DGS: EWA projection of the 3D covariance, splat footprint from the 2D covariance (3 sigma).
+//   2DGS: each splat is a disc; the fragment shader intersects the view ray with the disc plane.
+// Query parameters: set=<folder under /data>, yaw, pitch, dist (radians / scene units), w, h, and
+// nosort=1 (debug). window.__viewer exposes stats and a decode checksum for the tests.
+
+const params = new URLSearchParams(location.search);
+const setName = params.get('set') || '3dgs_gs';
+const hud = document.getElementById('hud');
+const canvas = document.getElementById('c');
+
+// ----------------------------------------------------------------------------- decoding
+
+const SMALL = 1 / Math.SQRT2;
+
+function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
+
+// Quaternion normalised w, x, y, z from the smallest-three packing (same as gs_quant.decode_quat).
+function decodeQuat(p0, p1, p2, idx, out, o) {
+  const a = (p0 / 65535 * 2 - 1) * SMALL;
+  const b = (p1 / 65535 * 2 - 1) * SMALL;
+  const c = (p2 / 65535 * 2 - 1) * SMALL;
+  const w = Math.sqrt(Math.max(0, 1 - (a * a + b * b + c * c)));
+  // QUAT_IDX: index of the first stored component for each dropped index
+  const q = [0, 0, 0, 0];
+  if (idx === 0) { q[1] = a; q[2] = b; q[3] = c; q[0] = w; }
+  else if (idx === 1) { q[0] = a; q[2] = b; q[3] = c; q[1] = w; }
+  else if (idx === 2) { q[0] = a; q[1] = b; q[3] = c; q[2] = w; }
+  else { q[0] = a; q[1] = b; q[2] = c; q[3] = w; }
+  const n = Math.hypot(q[0], q[1], q[2], q[3]) || 1;
+  out[o] = q[0] / n; out[o + 1] = q[1] / n; out[o + 2] = q[2] / n; out[o + 3] = q[3] / n;
+}
+
+// Layout of the GPU data: 15 RGBA32F texels per splat.
+//   0: x y z (origin-relative), opacity (linear)
+//   1: 3DGS covariance xx xy xz yy  | 2DGS: U.xyz (axis 0 times its sigma)
+//   2: 3DGS covariance yz zz 0 0    | 2DGS: V.xyz (axis 1 times its sigma)
+//   3..14: SH per channel R, G, B: 16 values each (DC, then f_rest 0..14), 4 texels per channel
+const TEXELS = 15;
+const TEX_W = 4096;
+
+async function loadFolder(name, stride = 1) {
+  const base = `/data/${name}`;
+  const meta = await (await fetch(`${base}/meta.json`, { cache: 'no-store' })).json();
+  if (meta.format !== 'gs' || meta.formatVersion !== 2) throw new Error(`${name}: needs gs formatVersion 2`);
+  const n = meta.count;
+  const col = async (key) => new Uint8Array(await (await fetch(`${base}/${meta.columns[key].file}`)).arrayBuffer());
+  const xyzB = await col('xyz');
+  const rotB = await col('rot');
+  const scaleB = await col('scale');
+  const opB = await col('opacity');
+  const dcB = await col('dc');
+  const shB = meta.columns.sh ? await col('sh') : null;
+  const rot16 = new Uint16Array(rotB.buffer, rotB.byteOffset, n * 4);
+  const sc16 = new Uint16Array(scaleB.buffer, scaleB.byteOffset, n * meta.columns.scale.components);
+  const op16 = new Uint16Array(opB.buffer, opB.byteOffset, n);
+  const dc16 = new Uint16Array(dcB.buffer, dcB.byteOffset, n * 3);
+  const K = meta.columns.scale.components;               // 3 (3DGS) or 2 (2DGS)
+  const is2d = meta.kind === '2dgs';
+
+  // every stride-th splat is kept (uniform thinning, for software rendering in the tests)
+  const nk = Math.ceil(n / stride);
+  const rows = Math.ceil(nk * TEXELS / TEX_W);
+  const tex = new Float32Array(TEX_W * rows * 4);        // texel t is at float offset 4 * t
+  const q4 = new Float64Array(4);
+  const sums = { alpha: 0, dc0: 0, logs0: 0, w: 0 };
+  let m = 0;                                             // output row
+
+  for (const ch of meta.chunks) {
+    const lo = ch.xyz.min, hi = ch.xyz.max;
+    const sMin = ch.scale.min, sMax = ch.scale.max;
+    const oMin = ch.opacity.min, oMax = ch.opacity.max;
+    const dMin = ch.dc.min, dMax = ch.dc.max;
+    const shMin = ch.sh ? ch.sh.min : null, shMax = ch.sh ? ch.sh.max : null;
+    const shMaxQ = ch.sh ? (1 << ch.sh.bits) - 1 : 255;
+    const sp = [0, 1, 2].map(j => (hi[j] - lo[j]) || 1);
+    const sSpan = [0, 1, 2].map(j => (sMax[j] - sMin[j]) || 1);
+    const dSpan = [0, 1, 2].map(j => (dMax[j] - dMin[j]) || 1);
+    const shSpan = shMin ? shMin.map((m, k) => (shMax[k] - m) || 1) : null;
+    const oSpan = (oMax - oMin) || 1;
+    for (let r = 0; r < ch.count; r++) {
+      const i = ch.start + r;
+      if (i % stride !== 0) continue;
+      const base = m * TEXELS;
+      m++;
+      const at = (k) => (base + k) * 4;      // float offset of texel k of this output splat (texels are linear)
+
+      // position: 24 bit per axis
+      const px = [0, 0, 0];
+      for (let j = 0; j < 3; j++) {
+        const o = i * 9 + j * 3;
+        const q = xyzB[o] | (xyzB[o + 1] << 8) | (xyzB[o + 2] << 16);
+        px[j] = lo[j] + sp[j] * (q / 16777215);
+      }
+      // rotation (smallest-three) and scales
+      const idx = rot16[i * 4 + 3];
+      decodeQuat(rot16[i * 4], rot16[i * 4 + 1], rot16[i * 4 + 2], idx, q4, 0);
+      const s = [0, 0, 0];
+      for (let j = 0; j < K; j++) s[j] = sMin[j] + sSpan[j] * (sc16[i * K + j] / 65535);
+      const opacity = oMin + oSpan * (op16[i] / 65535);
+      const dc = [0, 1, 2].map(j => dMin[j] + dSpan[j] * (dc16[i * 3 + j] / 65535));
+
+      // store centre (origin shift applied later, see recentre)
+      const o0 = at(0);
+      tex[o0] = px[0]; tex[o0 + 1] = px[1]; tex[o0 + 2] = px[2]; tex[o0 + 3] = sigmoid(opacity);
+      sums.alpha += sigmoid(opacity); sums.dc0 += dc[0]; sums.logs0 += s[0]; sums.w += q4[0];
+
+      const [qw, qx, qy, qz] = q4;
+      // columns of R
+      const c0 = [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy + qw * qz), 2 * (qx * qz - qw * qy)];
+      const c1 = [2 * (qx * qy - qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz + qw * qx)];
+      const c2 = [2 * (qx * qz + qw * qy), 2 * (qy * qz - qw * qx), 1 - 2 * (qx * qx + qy * qy)];
+      if (is2d) {
+        const U = c0.map(v => v * Math.exp(s[0]));
+        const V = c1.map(v => v * Math.exp(s[1]));
+        tex[at(1)] = U[0]; tex[at(1) + 1] = U[1]; tex[at(1) + 2] = U[2];
+        tex[at(2)] = V[0]; tex[at(2) + 1] = V[1]; tex[at(2) + 2] = V[2];
+      } else {
+        // Sigma = sum_j (R_j s_j)(R_j s_j)^T
+        const M = [c0, c1, c2].map((c, j) => c.map(v => v * Math.exp(s[j])));
+        let xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+        for (const m of M) {
+          xx += m[0] * m[0]; xy += m[0] * m[1]; xz += m[0] * m[2];
+          yy += m[1] * m[1]; yz += m[1] * m[2]; zz += m[2] * m[2];
+        }
+        tex[at(1)] = xx; tex[at(1) + 1] = xy; tex[at(1) + 2] = xz; tex[at(1) + 3] = yy;
+        tex[at(2)] = yz; tex[at(2) + 1] = zz;
+      }
+
+      // SH: channel c has 16 values, DC first, then the 15 f_rest of that channel (channel-major in the file)
+      for (let c = 0; c < 3; c++) {
+        const base16 = at(3 + c * 4);
+        tex[base16] = dc[c];
+        for (let k = 0; k < 15; k++) {
+          let v = 0;
+          if (shB) {
+            const kk = c * 15 + k;
+            const qv = shB[i * 45 + kk];
+            v = shMin[kk] + shSpan[kk] * (qv / shMaxQ);
+          }
+          tex[base16 + 1 + k] = v;
+        }
+      }
+    }
+  }
+  // recentre on the median position so that float32 keeps precision for far-away floaters
+  const xs = [];
+  for (let i = 0; i < nk; i += Math.max(1, Math.floor(nk / 20000))) {
+    const o = i * TEXELS * 4;
+    xs.push([tex[o], tex[o + 1], tex[o + 2]]);
+  }
+  const median = [0, 1, 2].map(j => { const v = xs.map(p => p[j]).sort((a, b) => a - b); return v[v.length >> 1]; });
+  for (let i = 0; i < nk; i++) {
+    const o = i * TEXELS * 4;
+    tex[o] -= median[0]; tex[o + 1] -= median[1]; tex[o + 2] -= median[2];
+  }
+  // robust radius for the initial camera distance
+  const dists = [];
+  for (let i = 0; i < nk; i += Math.max(1, Math.floor(nk / 20000))) {
+    const o = i * TEXELS * 4;
+    dists.push(Math.hypot(tex[o], tex[o + 1], tex[o + 2]));
+  }
+  dists.sort((a, b) => a - b);
+  const radius = dists[Math.floor(dists.length * 0.9)] || 1;
+
+  return { meta, tex, rows, n: nk, is2d, median, radius, checksum: sums };
+}
+
+// ----------------------------------------------------------------------------- matrices
+
+function perspective(fovy, aspect, near, far) {
+  const f = 1 / Math.tan(fovy / 2);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1,
+    0, 0, 2 * far * near / (near - far), 0]);
+}
+function lookAt(e, t, u) {
+  const z = norm([e[0] - t[0], e[1] - t[1], e[2] - t[2]]);
+  const x = norm(cross(u, z));
+  const y = cross(z, x);
+  return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0,
+    -dot(x, e), -dot(y, e), -dot(z, e), 1]);
+}
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = (a) => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+
+// ----------------------------------------------------------------------------- GL
+
+const VS = `#version 300 es
+precision highp float;
+precision highp int;
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in uint aIndex;
+uniform sampler2D uData;
+uniform int uTexW;
+uniform mat4 uView;
+uniform mat4 uProj;
+uniform vec2 uViewport;
+uniform float uFocal;
+uniform vec3 uCam;
+uniform int uKind;
+out vec4 vColor;
+out vec2 vOff;
+out vec3 vConic;
+out vec3 vWorld;
+out vec3 vC;
+out vec3 vU;
+out vec3 vV;
+
+vec4 tex(uint idx, int k) {
+  int t = int(idx) * ${TEXELS} + k;
+  return texelFetch(uData, ivec2(t % uTexW, t / uTexW), 0);
+}
+void loadCh(uint idx, int base, out float s[16]) {
+  vec4 a = tex(idx, base);
+  vec4 b = tex(idx, base + 1);
+  vec4 c = tex(idx, base + 2);
+  vec4 d = tex(idx, base + 3);
+  s[0] = a.x; s[1] = a.y; s[2] = a.z; s[3] = a.w;
+  s[4] = b.x; s[5] = b.y; s[6] = b.z; s[7] = b.w;
+  s[8] = c.x; s[9] = c.y; s[10] = c.z; s[11] = c.w;
+  s[12] = d.x; s[13] = d.y; s[14] = d.z; s[15] = d.w;
+}
+float evalChannel(float s[16], vec3 d) {
+  float x = d.x, y = d.y, z = d.z;
+  float r = 0.28209479177387814 * s[0];
+  r += -0.4886025119029199 * y * s[1] + 0.4886025119029199 * z * s[2] - 0.4886025119029199 * x * s[3];
+  float xx = x * x, yy = y * y, zz = z * z, xy = x * y, yz = y * z, xz = x * z;
+  r += 1.0925484305920792 * xy * s[4] - 1.0925484305920792 * yz * s[5]
+     + 0.31539156525252005 * (2.0 * zz - xx - yy) * s[6]
+     - 1.0925484305920792 * xz * s[7] + 0.5462742152960396 * (xx - yy) * s[8];
+  r += -0.5900435899266435 * y * (3.0 * xx - yy) * s[9] + 2.890611442640554 * xy * z * s[10]
+     - 0.4570457994644658 * y * (4.0 * zz - xx - yy) * s[11]
+     + 0.3731763325901154 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * s[12]
+     - 0.4570457994644658 * x * (4.0 * zz - xx - yy) * s[13]
+     + 1.445305721320277 * z * (xx - yy) * s[14] - 0.5900435899266435 * x * (xx - 3.0 * yy) * s[15];
+  return r;
+}
+
+void main() {
+  vec4 p0 = tex(aIndex, 0);
+  vec3 c = p0.xyz;
+  vec3 tv = (uView * vec4(c, 1.0)).xyz;
+  if (tv.z > -0.05) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vColor = vec4(0.0); return; }
+
+  // colour from SH, view direction from the camera to the splat
+  vec3 dir = normalize(c - uCam);
+  float s[16];
+  loadCh(aIndex, 3, s);  float cr = evalChannel(s, dir);
+  loadCh(aIndex, 7, s);  float cg = evalChannel(s, dir);
+  loadCh(aIndex, 11, s); float cb = evalChannel(s, dir);
+  vColor = vec4(max(vec3(cr, cg, cb) + 0.5, 0.0), p0.w);
+  vC = c;
+
+  if (uKind == 0) {
+    vec4 c1 = tex(aIndex, 1);
+    vec4 c2 = tex(aIndex, 2);
+    mat3 Vrk = mat3(c1.x, c1.y, c1.z, c1.y, c1.w, c2.x, c1.z, c2.x, c2.y);
+    float tz = tv.z;
+    float limx = 1.3 * 0.5 * uViewport.x / uFocal;
+    float limy = 1.3 * 0.5 * uViewport.y / uFocal;
+    float tx = clamp(tv.x / tz, -limx, limx) * tz;
+    float ty = clamp(tv.y / tz, -limy, limy) * tz;
+    mat3 J = mat3(uFocal / tz, 0.0, -uFocal * tx / (tz * tz),
+                  0.0, uFocal / tz, -uFocal * ty / (tz * tz),
+                  0.0, 0.0, 0.0);
+    // Standard EWA: Sigma' = J W Sigma W^T J^T. J is stored transposed (J_std = transpose(J)).
+    mat3 W = mat3(uView);
+    mat3 Sc = W * Vrk * transpose(W);       // covariance in camera space
+    mat3 cov = transpose(J) * Sc * J;
+    float a = cov[0][0] + 0.3;
+    float b = cov[0][1];
+    float cc = cov[1][1] + 0.3;
+    float det = a * cc - b * b;
+    if (det <= 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vColor = vec4(0.0); return; }
+    float mid = 0.5 * (a + cc);
+    float disc = sqrt(max(0.1, mid * mid - det));
+    float l1 = mid + disc;
+    float l2 = mid - disc;
+    vec2 v1 = (abs(b) < 1e-6) ? ((a >= cc) ? vec2(1.0, 0.0) : vec2(0.0, 1.0))
+                              : normalize(vec2(b, l1 - a));
+    vec2 v2 = vec2(-v1.y, v1.x);
+    float r1 = 3.0 * sqrt(l1);
+    float r2 = 3.0 * sqrt(max(l2, 0.0));
+    vec2 off = aCorner.x * v1 * r1 + aCorner.y * v2 * r2;
+    vOff = off;
+    vConic = vec3(cc, -b, a) / det;
+    vec4 clip = uProj * vec4(tv, 1.0);
+    gl_Position = vec4(clip.xy + off * 2.0 / uViewport * clip.w, clip.z, clip.w);
+  } else {
+    vec3 U = tex(aIndex, 1).xyz;
+    vec3 V = tex(aIndex, 2).xyz;
+    vec3 wpos = c + aCorner.x * 3.0 * U + aCorner.y * 3.0 * V;
+    vWorld = wpos;
+    vU = U;
+    vV = V;
+    gl_Position = uProj * uView * vec4(wpos, 1.0);
+  }
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+precision highp int;
+uniform int uKind;
+uniform vec3 uCam;
+in vec4 vColor;
+in vec2 vOff;
+in vec3 vConic;
+in vec3 vWorld;
+in vec3 vC;
+in vec3 vU;
+in vec3 vV;
+out vec4 fragColor;
+void main() {
+  float alpha;
+  if (uKind == 0) {
+    vec2 d = vOff;
+    float power = -0.5 * (vConic.x * d.x * d.x + vConic.z * d.y * d.y) - vConic.y * d.x * d.y;
+    if (power > 0.0) discard;
+    alpha = min(0.99, vColor.a * exp(power));
+  } else {
+    // the fragment lies on the disc plane: vWorld is the exact ray / disc intersection for this pixel
+    vec3 p = vWorld - vC;
+    float su = dot(p, vU) / dot(vU, vU);
+    float sv = dot(p, vV) / dot(vV, vV);
+    float g = -0.5 * (su * su + sv * sv);
+    if (g < -9.0 * 0.5) discard;   // 3 sigma
+    alpha = min(0.99, vColor.a * exp(g));
+  }
+  if (alpha < 1.0 / 255.0) discard;
+  fragColor = vec4(vColor.rgb * alpha, alpha);
+}`;
+
+function compile(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function setupGL() {
+  const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: true });
+  if (!gl) throw new Error('WebGL2 not available');
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  const idx = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, idx);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_INT, 0, 0);
+  gl.vertexAttribDivisor(1, 1);
+  return { gl, prog, vao, idx };
+}
+
+function uploadTexture(gl, tex, rows) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, TEX_W, rows, 0, gl.RGBA, gl.FLOAT, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+// ----------------------------------------------------------------------------- main
+
+(async () => {
+  const t0 = performance.now();
+  const scene = await loadFolder(setName, Math.max(1, +(params.get('stride') || 1)));
+  const loadMs = performance.now() - t0;
+  const { gl, prog, vao, idx } = setupGL();
+  const texture = uploadTexture(gl, scene.tex, scene.rows);
+  const n = scene.n;
+  const uni = (name) => gl.getUniformLocation(prog, name);
+  const U = { data: uni('uData'), texW: uni('uTexW'), view: uni('uView'), proj: uni('uProj'), vp: uni('uViewport'),
+    focal: uni('uFocal'), cam: uni('uCam'), kind: uni('uKind') };
+
+  // orbit camera
+  let yaw = params.has('yaw') ? +params.get('yaw') : 0.6;
+  let pitch = params.has('pitch') ? +params.get('pitch') : 0.35;
+  let dist = params.has('dist') ? +params.get('dist') : scene.radius * 2.6;
+  const target = [0, 0, 0];
+  let drawMs = 0, frames = 0, dirty = true;
+
+  // Sorting runs in sort-worker.js. The draw uses the newest order received; a new sort is requested
+  // whenever the view changed since the last request, and only one is in flight at a time.
+  const worker = new Worker('sort-worker.js');
+  const noSort = params.has('nosort');
+  const xyzCopy = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    const o = i * TEXELS * 4;
+    xyzCopy[3 * i] = scene.tex[o]; xyzCopy[3 * i + 1] = scene.tex[o + 1]; xyzCopy[3 * i + 2] = scene.tex[o + 2];
+  }
+  let orderReady = false;
+  let sortPending = false, sortId = 0, sortRequestedAt = 0;
+  let sortedView = null;                  // view matrix of the order in use
+  let requestedView = null;               // view matrix of the request in flight
+  let sortMs = 0, sortLatencyMs = 0, sortCount = 0;
+  let benchWaiter = null;
+
+  const uploadOrder = (order) => {
+    gl.bindBuffer(gl.ARRAY_BUFFER, idx);
+    gl.bufferData(gl.ARRAY_BUFFER, order, gl.DYNAMIC_DRAW);
+    orderReady = true;
+  };
+  const sameView = (a, b) => {
+    if (!a || !b) return false;
+    for (let k = 0; k < 16; k++) if (a[k] !== b[k]) return false;
+    return true;
+  };
+  worker.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'ready') {
+      uploadOrder(m.order);
+      dirty = true;
+    } else if (m.type === 'order') {
+      if (m.id < 0) { if (benchWaiter) benchWaiter(m); return; }   // benchmark requests
+      sortPending = false;
+      sortMs = m.ms;
+      sortLatencyMs = performance.now() - sortRequestedAt;
+      sortCount++;
+      sortedView = requestedView;
+      uploadOrder(m.order);
+      dirty = true;                       // draw with it; draw requests the next sort if the view moved
+    }
+  };
+  worker.postMessage({ type: 'init', n, xyz: xyzCopy }, [xyzCopy.buffer]);
+
+  const size = () => {
+    const w = params.has('w') ? +params.get('w') : Math.round(window.innerWidth * devicePixelRatio);
+    const h = params.has('h') ? +params.get('h') : Math.round(window.innerHeight * devicePixelRatio);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    canvas.style.width = params.has('w') ? w + 'px' : '100%';
+    canvas.style.height = params.has('h') ? h + 'px' : '100%';
+  };
+
+  function draw() {
+    size();
+    const W = canvas.width, H = canvas.height;
+    const eye = [target[0] + dist * Math.cos(pitch) * Math.sin(yaw), target[1] + dist * Math.sin(pitch),
+      target[2] + dist * Math.cos(pitch) * Math.cos(yaw)];
+    const view = lookAt(eye, target, [0, 1, 0]);
+    const near = dist * 0.002, far = dist * 200;
+    const fovy = 50 * Math.PI / 180;
+    const proj = perspective(fovy, W / H, near, far);
+    const focal = (H / 2) / Math.tan(fovy / 2);
+
+    if (!noSort && !sortPending && orderReady && !sameView(view, sortedView)) {
+      sortPending = true;
+      sortId++;
+      requestedView = view.slice();
+      sortRequestedAt = performance.now();
+      worker.postMessage({ type: 'sort', id: sortId, view: requestedView });
+    }
+
+    let t1 = performance.now();
+    gl.viewport(0, 0, W, H);
+    gl.clearColor(0.09, 0.094, 0.11, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(prog);
+    gl.bindVertexArray(vao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(U.data, 0);
+    gl.uniform1i(U.texW, TEX_W);
+    gl.uniformMatrix4fv(U.view, false, view);
+    gl.uniformMatrix4fv(U.proj, false, proj);
+    gl.uniform2f(U.vp, W, H);
+    gl.uniform1f(U.focal, focal);
+    gl.uniform3f(U.cam, eye[0], eye[1], eye[2]);
+    gl.uniform1i(U.kind, scene.is2d ? 1 : 0);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    gl.finish();
+    drawMs = performance.now() - t1;
+    frames++;
+    hud.textContent = `${setName}  ${scene.meta.kind}  ${n.toLocaleString('en-US')} splats  sh${scene.meta.shDegree}\n` +
+      `load ${loadMs.toFixed(0)} ms  sort ${sortMs.toFixed(1)} ms (worker, latency ${sortLatencyMs.toFixed(0)} ms)  ` +
+      `draw ${drawMs.toFixed(1)} ms  frames ${frames}  sorts ${sortCount}\n` +
+      `yaw ${yaw.toFixed(2)} pitch ${pitch.toFixed(2)} dist ${dist.toPrecision(3)}`;
+  }
+
+  // spin=N: the camera turns by a fixed step for N frames; the frame intervals (rAF timestamps), the
+  // draw time (CPU side, includes gl.finish) and the sort count are reported in spinResult.
+  const spinFrames = +(params.get('spin') || 0);
+  let spin = spinFrames > 0 ? { left: spinFrames, last: 0, intervals: [], draws: [], sorts0: 0 } : null;
+  const pct = (a, p) => { const s = [...a].sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : 0; };
+  const mean = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+
+  function loop(now) {
+    if (spin) {
+      if (spin.last) spin.intervals.push(now - spin.last);
+      else spin.sorts0 = sortCount;
+      spin.last = now;
+      if (spin.left-- <= 0 || spin.intervals.length >= spinFrames) {
+        const result = {
+          frames: spin.intervals.length, meanIntervalMs: mean(spin.intervals), p95IntervalMs: pct(spin.intervals, 0.95),
+          worstIntervalMs: Math.max(...spin.intervals), meanDrawMs: mean(spin.draws), p95DrawMs: pct(spin.draws, 0.95),
+          sorts: sortCount - spin.sorts0,
+        };
+        window.__viewer.spinResult = result;
+        console.log('spinResult ' + JSON.stringify(result));
+        spin = null;
+      } else {
+        yaw += 0.01;
+        dirty = true;
+      }
+    }
+    if (dirty) { dirty = false; if (!params.has('nodraw')) { draw(); if (spin) spin.draws.push(drawMs); } }
+    requestAnimationFrame(loop);
+  }
+
+  let drag = null;
+  canvas.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    yaw -= (e.clientX - drag.x) * 0.005;
+    pitch = Math.max(-1.5, Math.min(1.5, pitch + (e.clientY - drag.y) * 0.005));
+    drag = { x: e.clientX, y: e.clientY };
+    dirty = true;
+  });
+  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('wheel', (e) => { e.preventDefault(); dist *= Math.exp(e.deltaY * 0.001); dirty = true; }, { passive: false });
+  window.addEventListener('resize', () => { dirty = true; });
+
+  // Benchmark: sorts the scene `runs` times with the worker, for the given views (no drawing).
+  const bench = async (runs) => {
+    const times = [];
+    const checks = [];
+    for (let r = 0; r < runs; r++) {
+      const eye = [dist * Math.cos(pitch) * Math.sin(yaw + r * 0.7), dist * Math.sin(pitch),
+        dist * Math.cos(pitch) * Math.cos(yaw + r * 0.7)];
+      const view = lookAt(eye, target, [0, 1, 0]);
+      const reply = await new Promise((resolve) => {
+        benchWaiter = (m) => { benchWaiter = null; resolve(m); };
+        worker.postMessage({ type: 'sort', id: -1, view });
+      });
+      times.push(reply.ms);
+      // check: depth (main thread, same formula) must not decrease along the returned order
+      const t = scene.tex, o = reply.order;
+      // inversions larger than 1e-4 (smaller ones are float32 rounding of the depth in the worker)
+      let bad = 0, worst = 0, prev = -Infinity;
+      for (let k = 0; k < n; k++) {
+        const s = o[k] * TEXELS * 4;
+        const d = view[2] * t[s] + view[6] * t[s + 1] + view[10] * t[s + 2] + view[14];
+        if (d < prev - 1e-4) { bad++; worst = Math.max(worst, prev - d); }
+        prev = Math.max(prev, d);
+      }
+      checks.push({ bad, worst });
+    }
+    times.sort((a, b) => a - b);
+    return { runs, minMs: times[0], medianMs: times[times.length >> 1], maxMs: times[times.length - 1],
+      outOfOrderPerRun: checks };
+  };
+
+  window.__viewer = {
+    ready: true, n, loadMs, checksum: scene.checksum, median: scene.median, radius: scene.radius,
+    kind: scene.meta.kind, shDegree: scene.meta.shDegree,
+    redraw: () => { dirty = true; },
+    stats: () => ({ sortMs, sortLatencyMs, sortCount, drawMs, frames }),
+    bench,
+  };
+  dirty = true;
+  requestAnimationFrame(loop);
+  if (params.has('bench')) {
+    bench(+params.get('bench')).then((r) => {
+      window.__viewer.benchResult = r;
+      console.log('benchResult ' + JSON.stringify(r));
+    });
+  }
+})().catch((e) => {
+  window.__viewer = { ready: true, error: String(e && e.stack || e) };
+  hud.textContent = 'error: ' + e;
+  console.error(e);
+});
+</script>
+</body>
+</html>

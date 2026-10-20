@@ -11,3 +11,4 @@ joblib==1.5.3
 threadpoolctl==3.6.0
 laspy==2.7.0
 tqdm==4.70.0
+pillow==11.3.0

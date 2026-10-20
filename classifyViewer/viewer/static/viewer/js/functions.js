@@ -2,6 +2,7 @@ import {
     loadPointCloud,
     getPointCloudLoader
 } from "./pointcloud-loader.js";
+import { loadGaussianSplats } from "./gs-splat.js";
 
 export { loadPointCloud };
 
@@ -2096,13 +2097,13 @@ export function showLoadModal() {
             fileCustom.classList.add('file-input-custom');
             fileCustom.innerHTML = `
                 <b>Click to select file</b>
-                <span>Supports .ply, .las, .glb</span>
+                <span>Supports .ply, .las, .glb, .sog (Gaussian splats)</span>
             `;
 
             const fileInput = document.createElement('input');
             fileInput.type = 'file';
             fileInput.classList.add('file-input-hidden');
-            fileInput.accept = ".ply,.las,.glb";
+            fileInput.accept = ".ply,.las,.glb,.sog";
             fileInputEl = fileInput;
 
             fileInput.onchange = (e) => {
@@ -2128,7 +2129,7 @@ export function showLoadModal() {
                 } else {
                     fileCustom.innerHTML = `
                 <b>Click to select file</b>
-                <span>Supports .ply, .las, .glb</span>
+                <span>Supports .ply, .las, .glb, .sog (Gaussian splats)</span>
             `;
                     if (subSection) {
                         subSection.style.display = 'none';
@@ -2381,7 +2382,29 @@ export function showLoadModal() {
                     const rawVoxel = parseFloat(voxelInput?.value || '0.05');
                     const voxelSize = Number.isFinite(rawVoxel) && rawVoxel > 0 ? rawVoxel : 0.05;
 
-                    if (extension === 'ply') {
+                    // Gaussian splats (PLY with splat properties, or SOG) are converted to the gs folder and shown as
+                    // splats. Everything else keeps the point cloud path below.
+                    let gsPath = null;
+                    if (extension === 'ply' || extension === 'sog') {
+                        const gsResponse = await fetch('/api/gs-import/', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCSRFToken() },
+                            body: JSON.stringify({ file_path: inputPath })
+                        });
+                        if (!gsResponse.ok) {
+                            const errData = await gsResponse.json().catch(() => ({}));
+                            throw new Error(errData.message || errData.error || 'Gaussian splat import failed');
+                        }
+                        const gsData = await gsResponse.json();
+                        if (gsData.kind === 'gs') {
+                            gsPath = gsData.path;
+                            console.log('✅ Gaussian splat file converted to the gs folder');
+                        }
+                    }
+
+                    if (gsPath) {
+                        // splats: no point cloud conversion
+                    } else if (extension === 'ply') {
                         let plyInputPath = inputPath;
                         if (subsampleEnabled) {
                             console.log(`🔧 Step 3: Subsampling PLY (voxel ${voxelSize} m)...`);
@@ -2490,8 +2513,10 @@ export function showLoadModal() {
                     checkCancelled();
                     currentStepIdx = 3;
                     activateStep(3);
+                    let pcVersion = null;
+                    if (!gsPath) {
                     console.log("🧠 Step 4: Building the point cloud...");
-                    const pcVersion = await buildPointCloud(lasPath);
+                    pcVersion = await buildPointCloud(lasPath);
                     // The backup is taken AFTER the build: las2pc rewrites features.las in the order of the point cloud
                     // (canonical order), and the backup must share it so that a restore only rewrites the columns.
                     console.log("💾 Step 3: Saving backup copy of features.las...");
@@ -2504,8 +2529,9 @@ export function showLoadModal() {
                         throw new Error(errData.message || errData.error || 'Failed to create point cloud backup');
                     }
                     console.log("✅ Point cloud backup saved");
-                    completeStep(3);
                     console.log("✅ Point cloud built");
+                    }
+                    completeStep(3);
 
                     // STEP 5: Final Loading in Babylon
                     checkCancelled();
@@ -2537,7 +2563,12 @@ export function showLoadModal() {
                     window.dispatchEvent(new CustomEvent('scene-reset'));
 
                     const pcPath = _runtimeUrl('working', PC_DIR);
-                    const pc = await loadPointCloud(pcPath, scene, { version: pcVersion });
+                    let pc = null;
+                    if (gsPath) {
+                        await loadGaussianSplats(_runtimeUrl(gsPath), scene);
+                    } else {
+                        pc = await loadPointCloud(pcPath, scene, { version: pcVersion });
+                    }
                     if (pc) {
                         if (sceneObjects) sceneObjects.currentPointCloud = pc;
                         const pcLabel = filename || "Point Cloud";

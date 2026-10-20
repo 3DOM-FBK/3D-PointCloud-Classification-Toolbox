@@ -2,6 +2,7 @@ from django.urls import path
 from .views import main_viewer, documentation
 from .request_functions import save_file, launch_RF_training, launch_RF_classify, subsample_pc, stop_process, get_model_voxel_size, checking_point_id, inspect_las_input, job_progress_view
 from .request_functions import mesh2pc, ply2las, feat_extraction, build_pointcloud_view, update_pointcloud_columns_view, _split_las_by_binary, read_text_file, model_exists, models_list, delete_model, extract_segment_las_view
+from .request_functions import gs_import_view
 from .request_functions import serve_range_file, serve_runtime_file, clear_data, upload_data, export_mapping, package_download_view, upload_model, backup_pointcloud, restore_pointcloud_backup
 
 urlpatterns = [
@@ -23,6 +24,7 @@ urlpatterns = [
     path("get_model_voxel_size/", get_model_voxel_size),
     path("mesh2pc/", mesh2pc),
     path("ply2las/", ply2las),
+    path("api/gs-import/", gs_import_view),
     path("check_point_id/", checking_point_id),
     path("inspect_las_input/", inspect_las_input),
     path("feature_extraction/", feat_extraction), 
