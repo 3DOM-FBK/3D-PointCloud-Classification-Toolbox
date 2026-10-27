@@ -141,6 +141,8 @@ Once sufficient annotated points exist for at least two distinct classes:
    `runtime_data/models/<model_name>/`.
 4. Training metrics (accuracy, F1 score, confusion matrix) are displayed on completion.
 
+For a more detailed explanation, refer to [Random Forest Training Configuration and Metrics](docs/RF_CONFIGURATION_AND_METRICS.md).
+
 ---
 
 ## Classification Mode
