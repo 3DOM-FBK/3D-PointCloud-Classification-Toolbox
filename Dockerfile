@@ -91,11 +91,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # with dpkg --force-depends instead; apt is not used afterwards.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.10 \
+        ca-certificates \
         libgomp1 \
         libpcl-common1.12 \
         libomp5 libc++1 libc++abi1 \
         libgmp10 libgmpxx4ldbl libmpfr6 \
         libx11-6 \
+    && update-ca-certificates \
     && cd /tmp && apt-get download libglvnd0 libgl1 libglx0 \
     && dpkg -i --force-depends ./libglvnd0_*.deb ./libgl1_*.deb ./libglx0_*.deb \
     && rm -rf /tmp/*.deb /var/lib/apt/lists/*
