@@ -159,6 +159,7 @@ docker run -d -p 8000:8000 --gpus all --memory 8g --memory-swap 8g \n  -e PIPELI
 | [API Reference](docs/API_REFERENCE.md) | All REST endpoints with request and response schemas |
 | [C++ Binaries Reference](docs/BINARIES.md) | CLI reference for all processing binaries in `opt/` |
 | [Point Cloud Format](docs/POINTCLOUD_FORMAT.md) | Chunked point cloud format (`geom.bin`, columns, `meta.json`) and its tools |
+| [Random Forest Training configuration and Metrics](docs/RF_CONFIGURATION_AND_METRICS.md) | Show the Random Forest configuration for training the model and the results (such as metrics, feature importance and processing time) |
 
 ## Python Dependencies
 
