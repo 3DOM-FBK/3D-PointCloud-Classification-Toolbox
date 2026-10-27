@@ -23,23 +23,22 @@ This viewer window explain the report with different sections: model evaluation 
 ### Model Evaluation Metrics
 
 The following metrics are used to evaluate the performance of the model:
-The following metrics are used to evaluate the performance of the model:
 
-- [Overall Accuracy](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.accuracy_score.html): measures the proportion of correctly classified samples over the total number of samples.
+- <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.accuracy_score.html" target="_blank" rel="noopener noreferrer">Overall Accuracy</a>: measures the proportion of correctly classified samples over the total number of samples.
 
-- [Precision](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.precision_score.html):
+- <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.precision_score.html" target="_blank" rel="noopener noreferrer">Precision</a>:
 
   $\displaystyle\text{Precision} = \frac{TP}{TP + FP}$
 
-- [Recall](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.recall_score.html):
+- <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.recall_score.html" target="_blank" rel="noopener noreferrer">Recall</a>:
 
   $\displaystyle\text{Recall} = \frac{TP}{TP + FN}$
 
-- [F1-score](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html):
+- <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html" target="_blank" rel="noopener noreferrer">F1-score</a>:
 
   $\displaystyle\text{F1-Score} = \frac{2 \cdot TP}{2 \cdot TP + FP + FN}$
 
-- [Intersection over Union (IoU)](https://scikit-learn.org/stable/modules/generated/sklearn.metrics.jaccard_score.html)
+- <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.jaccard_score.html" target="_blank" rel="noopener noreferrer">Intersection over Union (IoU)</a>
 
 The accuracy metrics computed for each class represent the performance of the model in classifying samples belonging to that specific class.
 
