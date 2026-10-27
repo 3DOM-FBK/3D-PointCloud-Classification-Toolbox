@@ -310,17 +310,76 @@
                             </div>
                         </figure>
                     </div>
-
-                    <p> This viewer window explain the report with different sections: </p>
+                    <p> This viewer window explain the report with different sections: model evaluation metrics, sorted feature importance, and different processing time for each steps. </p>
+                    <h3 id="metrics-accuracy"> Model Evaluation Metrics </h3>
+                    
+                    <p> The following metrics are used to evaluate the performance of the model: </p>
                     <ul>
-                        <li>metrics accuracy: overall accuracy of the model, precision, recall, F1-score, and IoU;</li>
-                        <li>metrics accuracy per class: all metrics accuracy for each class</li>
-                        <li>sorted feature importance: features ranked by their importance in the model; 
-                            the sum of all the features should equal to 1.0. For instance, if you have 5 features, each feature will have a value 
-                            between 0 and 1 (that represent the percentage of importance of that feature), and the sum of all 5 features will be 1.0.
-                            For simplicity, the report will visualize the most important features arriving to 0.91 and the other will be hidden, 
-                            but the overall sum remain 1.0;</li>
-                        <li>different processing time for each steps: loading data, training the model, computing metrics, and overall time;</li>
+                        <li> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.accuracy_score.html" target="_blank" rel="noopener noreferrer">Overall accuracy</a> of the model</li>
+                        <li> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.precision_score.html" target="_blank" rel="noopener noreferrer">Precision</a></li> 
+                        <div class="formula-container">
+                            <math display="block">
+                                <mtext>Precision</mtext>
+                                <mo>=</mo>
+                                <mfrac>
+                                    <mi>TP</mi>
+                                    <mrow>
+                                        <mi>TP</mi>
+                                        <mo>+</mo>
+                                        <mi>FP</mi>
+                                    </mrow>
+                                </mfrac>
+                            </math>
+                        </div>
+                        <li> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.recall_score.html" target="_blank" rel="noopener noreferrer">Recall</a></li>
+                        <div class="formula-container">
+                            <math display="block">
+                                <mtext>Recall</mtext>
+                                <mo>=</mo>
+                                <mfrac>
+                                    <mi>TP</mi>
+                                    <mrow>
+                                        <mi>TP</mi>
+                                        <mo>+</mo>
+                                        <mi>FN</mi>
+                                    </mrow>
+                                </mfrac>
+                            </math>
+                        </div>
+                        <li> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.f1_score.html" target="_blank" rel="noopener noreferrer">F1-score</a></li>
+                        <div class="formula-container">
+                            <math display="block">
+                                <mtext>F1-Score</mtext>
+                                <mo>=</mo>
+                                <mfrac>
+                                    <mi>2*TP</mi>
+                                    <mrow>
+                                        <mi>2*TP</mi>
+                                        <mo>+</mo>
+                                        <mi>FP</mi>
+                                        <mo>+</mo>
+                                        <mi>FN</mi>
+                                    </mrow>
+                                </mfrac>
+                            </math>
+                        </div>
+                        <li> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.jaccard_score.html" target="_blank" rel="noopener noreferrer">IoU</a></li>
+                    </ul>
+
+                    <p> The accuracy metrics computed for each class represent the performance of the model in classifying samples belonging to that specific class. </p>
+                                       
+                    <h3 id="feature-importance"> Feature Importance </h3>
+                    <p>The sorted feature importance are features ranked by their importance in the model. The sum of all the features should equal to <code>1.0</code>. 
+                        For instance, if you have 5 features, each feature will have a value between 0 and 1 (that represent the percentage of importance 
+                        of that feature), and the sum of all 5 features will be <code>1.0</code>. For simplicity, the report will visualize the most important 
+                        features arriving to <code>0.91</code> and the other will be hidden, but the overall sum remain <code>1.0</code>.</p>
+                    <h3 id="processing-time"> Processing Time </h3>
+                    <p>The different processing time for each steps are: </p>
+                    <ul>
+                        <li>loading data: the time it takes to load the data into memory.</li>
+                        <li>training the model: the time it takes to train the model.</li>
+                        <li>computing metrics: the time it takes to compute the metrics.</li>
+                        <li>overall time: the total time for all steps.</li>
                     </ul>
                    
                     <!-- Video placeholder -->

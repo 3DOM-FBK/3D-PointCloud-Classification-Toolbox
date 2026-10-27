@@ -234,6 +234,32 @@ html, body {
 /* ══════════════════════════════════════
    TYPOGRAPHY
 ══════════════════════════════════════ */
+
+/* Colors of the links */
+a {
+    color: var(--accent-blue); 
+    text-decoration: underline;
+}
+
+a:visited {
+    color: var(--accent-blue);
+    text-decoration: underline;
+}
+
+a:hover {
+    color: var(--accent-blue); 
+    text-decoration: underline; 
+}
+
+.formula-container {
+    display: flex;
+    justify-content: flex-start;
+    font-size: 0.95rem;
+    margin: 20px 0;
+    padding-left: 10px; 
+}
+
+
 .doc-page h1 {
     font-size: 2rem;
     font-weight: 800;
